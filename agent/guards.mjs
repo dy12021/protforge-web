@@ -153,14 +153,50 @@ const bad = (reason) => Object.freeze({ allowed: false, reason });
 
 // ------------------------------------------------------------------ 路径
 
-/** 把 Windows 与 WSL 路径统一成可比较的 `/mnt/x/...` 小写形式。 */
-function canonPath(p) {
+/**
+ * 消解 `.` 与 `..`，把路径压成**没有上跳**的形式。
+ *
+ * 这一步不是可有可无的洁癖：不做的话 `../protforge\..\..\Users\<user>\.ssh\id_rsa`
+ * 规范化后是 `/mnt/e/oih/../../users/...`，`startsWith('/mnt/e/oih/')` 为真 ->
+ * 直接放行，L1 守卫形同虚设。Python 侧的 `guards.py` 用 `Path.resolve()` 做了同一件事，
+ * 两边行为**必须一致**，否则同一个路径在一个进程里被拦、在另一个进程里放行。
+ *
+ * 用手写消解而不是 node:path.posix.normalize：这里已经统一成 `/mnt/x/...` 的
+ * POSIX 形式，`path.posix.normalize` 会把 `/mnt/e/oih/../../x` 正确压成 `/mnt/x`，
+ * 但对 `//server/share` 这类 UNC 归一后的路径会额外动刀，行为不如显式可控。
+ */
+function normalizeDots(p) {
+  const parts = p.split('/');
+  const out = [];
+  for (const seg of parts) {
+    if (seg === '.') continue;
+    if (seg === '..') {
+      // 弹不动的 ..（根之上）就丢掉：posix 里 /.. === /
+      if (out.length && out[out.length - 1] !== '..') out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  let s = out.join('/');
+  if (!s.startsWith('/')) s = `/${s}`;
+  if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+  return s;
+}
+
+/**
+ * 把 Windows 与 WSL 路径统一成可比较的 `/mnt/x/...` 小写形式。
+ *
+ * 导出仅供测试断言规范化结果本身（`guards.dotdot.test.mjs`）——
+ * 只测"某条命令放不放行"的话，消解前后的差异会被允许根的字面前缀吃掉，看不出来。
+ */
+export function canonPath(p) {
   let s = String(p).replace(/\\/g, '/');
   const drive = /^([A-Za-z]):\//.exec(s);
   if (drive) s = `/mnt/${drive[1].toLowerCase()}/${s.slice(3)}`;
   const gitStyle = /^\/([A-Za-z])\//.exec(s);
   if (gitStyle) s = `/mnt/${gitStyle[1].toLowerCase()}/${s.slice(3)}`;
-  if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+  // 消解必须在盘符映射**之后**：映射前的 `../protforge\..\..` 消解结果和映射后不一样。
+  s = normalizeDots(s);
   return s.toLowerCase();
 }
 
