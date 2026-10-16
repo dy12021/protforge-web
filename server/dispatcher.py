@@ -95,6 +95,9 @@ RECOVER_BUDGET = 20.0               # 恢复一轮的总时限（秒）。杀进
                                     # taskkill 上，不能让 N 个孤儿把启动拖成 N×15 秒。
 PID_REUSE_SLACK = 2.0               # 进程创建时间允许的误差（秒）
 
+#: _abort_signal 回看末尾多少条事件去找"进终态那条"。见那里的说明。
+_ABORT_LOOKBACK = 200
+
 _INTERNAL_ENV = "PROTFORGE_WEB_INTERNAL"
 _MAX_CONCURRENCY_ENV = "PROTFORGE_WEB_MAX_CONCURRENCY"
 _NODE_ENV = "PROTFORGE_WEB_NODE"
@@ -571,6 +574,60 @@ def _db_status(task_id: int) -> str:
         return ""
 
 
+#: 只有**人**按下的中止会在终态事件上留这个 actor。全库仅 public app 的
+#: ``/api/tasks/{id}/abort`` 写它（打包失败 app._fail_task、调度器收尾
+#: :meth:`Dispatcher._mark_failed` 都是 system）。见 :func:`_abort_signal`。
+_ABORT_ACTOR = "human"
+
+#: 中止事件没有文案时的兜底原因。不能留空：空字符串会让详情页显示不出失败原因。
+ABORT_FALLBACK_REASON = "用户中止了任务"
+
+
+def _abort_signal(task_id: int, status: str) -> str | None:
+    """这个终态**是不是人按的**？是则返回中止文案，不是则返回 ``None``。
+
+    跨进程中止的唯一信道是数据库（用户点中止跑在 public app 那个进程里，
+    改得到库、改不到这里的进程）。但**库里的状态本身不能当中止的判据**：
+    ``failed`` 是个笼统终态，打包失败、agent 异常、磁盘满都会写它，早年的
+    :meth:`Dispatcher._reap` 靠 ``status == "failed"`` 猜，结果是"算到一半崩了"
+    被当成用户中止，:meth:`Dispatcher._settle` 写出"任务已被中止"这种张冠李戴
+    的原因。
+
+    判据因此落在**进终态的那条 status 事件的 actor 上**，理由有三条：
+
+    1. **不用改 schema**：``events.actor`` 的 CHECK 本来就含 human，时间线又是
+       只增不改的，改判据不需要迁移表结构（db.py / store.py 都不在本模块的改动
+       范围里，判据复制一份 SQL 过去也只会和真正的事件类型漂移）。
+    2. **语义正交**：actor 说的是"谁干的"，status 说的是"干到哪一步了"。中止是
+       人的动作，不是某一步的失败，用 actor 表达才不会和别的失败路径混淆。
+    3. **不写死 failed**：这里只问"最后一条进**这个**终态的事件是谁写的"，所以将来
+       新增 ``cancelled`` 之类表示中止的终态（写它的那个端点同样会用
+       actor=human），判据照样成立，不必再改这一行。
+
+    向后兼容：老任务就是"已经 failed + 带一条 actor=human 的终态事件"，走的是同
+    一条路径，能被认出来。
+
+    文案取那条事件的 message（public app 写的是"用户中止了任务"），用作收尾原因，
+    用户在详情页看到的就是自己按下中止时的那句话。
+    """
+    if status not in db.TERMINAL_STATUSES:
+        return None                      # 还没进终态，谈不上中止
+    try:
+        # 只看末尾一段事件：状态迁移每任务至多 6 次，末尾 200 条必然含最后那次迁移，
+        # 而 list_events 是从头取 limit 条的，长任务必须先定位到游标附近。
+        cursor = max(0, store.latest_event_id(task_id) - _ABORT_LOOKBACK)
+        rows = store.list_events(task_id, after_id=cursor, limit=_ABORT_LOOKBACK)
+    except Exception:                     # noqa: BLE001 - 判不出来就当没中止，别误杀进程
+        log.exception("读任务 %s 的事件失败，无法判断是否中止", task_id)
+        return None
+    for row in reversed(rows):
+        if row.get("kind") != "status" or row.get("to_status") != status:
+            continue
+        if str(row.get("actor") or "") != _ABORT_ACTOR:
+            return None                  # 进终态的是系统，不是人 → 不是中止
+        return str(row.get("message") or "")
+    return None                          # 压根没有进终态这条事件 → 不是中止
+
 
 def _restart_reason(pid: int, cleaned: bool) -> str:
     """服务重启后收尾遗留任务的失败原因。**不许静默改状态。**
@@ -957,12 +1014,18 @@ class Dispatcher:
     def _reap(self) -> None:
         for ap in list(self.running.values()):
             # 用户中止发生在 public app，那是**另一个进程**：那边改得到数据库，改不到
-            # 这里的进程。所以中止要靠库里的状态传导过来——发现它已经是 failed 就把
-            # 进程杀掉，否则用户点了中止之后计算还会接着跑完，白烧一轮 GPU。
-            # 调度器自己 abort 的 ap.aborted 已置位，跳过以免重复收尾。
-            if not ap.aborted and _db_status(ap.task_id) == "failed":
-                self.abort(ap.task_id, reason="任务已被中止")
-                continue
+            # 这里的进程。所以中止要靠库里的状态传导过来。
+            #
+            # 但**不能只看状态是不是 failed**：failed 是笼统终态，打包失败、agent 异常
+            # 都会写它。靠它猜中止，结果是"算到一半崩了"被当成用户中止，_settle 写出
+            # "任务已被中止"这种张冠李戴的原因（缺陷 B）。判据是进终态那条事件的
+            # actor，见 _abort_signal 的三条理由。调度器自己 abort 的 ap.aborted 已置位，
+            # 跳过以免重复收尾。
+            if not ap.aborted:
+                reason = _abort_signal(ap.task_id, _db_status(ap.task_id))
+                if reason is not None:
+                    self.abort(ap.task_id, reason=reason or ABORT_FALLBACK_REASON)
+                    continue
             try:
                 code = ap.proc.poll()
             except OSError:
