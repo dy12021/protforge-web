@@ -158,39 +158,39 @@ def test_terminal_task_work_dir_is_reclaimed(root):
 
 
 def test_log_older_than_14_days_deleted(root):
-    old = mkfile(root / "logs" / "1.log", when=ago(days=15))
+    old = mkfile(root / "logs" / "agent-1.log", when=ago(days=15))
     janitor.sweep(root, NOW)
     assert not old.exists()
 
 
 def test_log_within_14_days_kept(root):
-    fresh = mkfile(root / "logs" / "1.log", when=ago(days=13))
+    fresh = mkfile(root / "logs" / "agent-1.log", when=ago(days=13))
     janitor.sweep(root, NOW)
     assert fresh.exists()
 
 
 def test_rotated_log_also_expires(root):
-    rot = mkfile(root / "logs" / "1.log.1", when=ago(days=15))
+    rot = mkfile(root / "logs" / "agent-1.log.1", when=ago(days=15))
     janitor.sweep(root, NOW)
     assert not rot.exists()
 
 
 def test_oversized_log_truncated_and_rotated(root, monkeypatch):
     monkeypatch.setattr(janitor, "LOG_MAX_BYTES", 1000)
-    log = mkfile(root / "logs" / "2.log", size=4000)
+    log = mkfile(root / "logs" / "agent-2.log", size=4000)
     raw = log.read_bytes()
     janitor.sweep(root, NOW)
     assert log.exists() and log.stat().st_size == 0          # 原位置开新文件
-    rot = root / "logs" / "2.log.1"
+    rot = root / "logs" / "agent-2.log.1"
     assert rot.exists() and rot.stat().st_size <= 1000       # 截断到上限内
     assert raw.endswith(rot.read_bytes())                   # 留存的是最新的尾部
 
 
 def test_small_log_is_not_rotated(root, monkeypatch):
     monkeypatch.setattr(janitor, "LOG_MAX_BYTES", 1000)
-    log = mkfile(root / "logs" / "3.log", size=10)
+    log = mkfile(root / "logs" / "agent-3.log", size=10)
     janitor.sweep(root, NOW)
-    assert not (root / "logs" / "3.log.1").exists()
+    assert not (root / "logs" / "agent-3.log.1").exists()
     assert log.stat().st_size == 10
 
 
@@ -205,13 +205,13 @@ def test_logs_manual_file_kept(root):
 
 
 def test_package_older_than_30_days_deleted(root):
-    old = mkfile(root / "packages" / "1.zip", when=ago(days=31))
+    old = mkfile(root / "packages" / "task_1.zip", when=ago(days=31))
     janitor.sweep(root, NOW)
     assert not old.exists()
 
 
 def test_package_within_30_days_kept(root):
-    fresh = mkfile(root / "packages" / "1.zip", when=ago(days=29))
+    fresh = mkfile(root / "packages" / "task_1.zip", when=ago(days=29))
     janitor.sweep(root, NOW)
     assert fresh.exists()
 
@@ -222,9 +222,9 @@ def test_reclaim_packages_oldest_first_when_disk_tight(root, monkeypatch):
     空闲空间是打桩的：本机 13 个 worker 并行写盘，真实 disk_usage 一直在动，
     拿它做断言就是随机失败。这里只桩掉「剩多少空间」，回收顺序仍走真实逻辑。
     """
-    old = mkfile(root / "packages" / "100.zip", size=100, when=ago(days=5))
-    mid = mkfile(root / "packages" / "101.zip", size=200, when=ago(days=3))
-    new = mkfile(root / "packages" / "102.zip", size=300, when=ago(days=1))
+    old = mkfile(root / "packages" / "task_100.zip", size=100, when=ago(days=5))
+    mid = mkfile(root / "packages" / "task_101.zip", size=200, when=ago(days=3))
+    new = mkfile(root / "packages" / "task_102.zip", size=300, when=ago(days=1))
     monkeypatch.setattr(janitor, "_free_bytes", lambda p: 0)   # 假装一个字节都不剩
 
     janitor.sweep(root, NOW, target_free_bytes=150)
@@ -235,7 +235,7 @@ def test_reclaim_packages_oldest_first_when_disk_tight(root, monkeypatch):
 
 
 def test_reclaim_does_nothing_when_already_free_enough(root, monkeypatch):
-    pkg = mkfile(root / "packages" / "100.zip", when=ago(days=1))
+    pkg = mkfile(root / "packages" / "task_100.zip", when=ago(days=1))
     monkeypatch.setattr(janitor, "_free_bytes", lambda p: 10 ** 12)
     janitor.sweep(root, NOW, target_free_bytes=100)
     assert pkg.exists()
@@ -352,8 +352,8 @@ def test_sweep_on_bare_root_creates_nothing(tmp_path):
 def test_sweep_is_idempotent(root):
     """第二轮必须是空操作——重复跑不会二次删除，也不会把统计算乱。"""
     stamp(mkdir(root / "work" / "1"), ago(days=8))
-    stamp(mkfile(root / "logs" / "1.log"), ago(days=20))
-    stamp(mkfile(root / "packages" / "1.zip"), ago(days=40))
+    stamp(mkfile(root / "logs" / "agent-1.log"), ago(days=20))
+    stamp(mkfile(root / "packages" / "task_1.zip"), ago(days=40))
     first = janitor.sweep(root, NOW)
     second = janitor.sweep(root, NOW)
     assert first["work_dirs"] == first["log_files"] == first["packages"] == 1
@@ -363,8 +363,8 @@ def test_sweep_is_idempotent(root):
 
 def test_stats_report_counts(root):
     stamp(mkdir(root / "work" / "1"), ago(days=8))
-    stamp(mkfile(root / "logs" / "1.log"), ago(days=20))
-    stamp(mkfile(root / "packages" / "1.zip"), ago(days=40))
+    stamp(mkfile(root / "logs" / "agent-1.log"), ago(days=20))
+    stamp(mkfile(root / "packages" / "task_1.zip"), ago(days=40))
     s = janitor.sweep(root, NOW)
     assert s["work_dirs"] == 1
     assert s["log_files"] == 1

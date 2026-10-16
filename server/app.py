@@ -21,6 +21,7 @@ store.py 属于别的 worker，数据层不该知道有没有人在听，所以�
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -769,6 +770,44 @@ def create_internal_app() -> FastAPI:
     # 白名单与 admin/app_admin.py 的 RPC_COMMANDS 保持一致，但**独立**：面板那边
     # 是它自己的边界，这里是内网通道的边界，两道闸不合并。
     _RPC_COMMANDS = ("steer", "follow_up", "abort", "set_model", "set_thinking_level")
+
+    @app.get("/api/internal/admin/stream/{task_id}")
+    async def admin_stream(task_id: int, request: Request,
+                           user=Depends(auth.require_admin)):
+        """把计算进程 stdout 里的事件流转成 SSE，给值班台看。
+
+        游标用的是 agent 那条 stdout 自己的 ``seq``，**不是** ``events.id``：
+        那是两套不同的流，游标语义不能互换——换过去要么重连丢事件，要么重复。
+        """
+        store.get_task(task_id, is_admin=True)
+        disp = getattr(app.state, "dispatcher", None)
+        if disp is None:
+            raise PreciseHTTPException(503, "调度器没有运行，看不到实时流")
+        if int(task_id) not in disp.running:
+            # 任务没在跑就别开长连接：面板会拿着 409 当成"流断了"然后无限重连。
+            raise PreciseHTTPException(409, "这个任务的计算进程不在运行，没有实时流")
+        raw_after = (request.headers.get("Last-Event-ID")
+                     or request.query_params.get("after") or 0)
+        try:
+            after = int(raw_after)
+        except (TypeError, ValueError):
+            after = 0
+
+        def _gen():
+            try:
+                for obj in disp.stream(int(task_id), after=after):
+                    seq = obj.get("seq", 0)
+                    data = json.dumps(obj, ensure_ascii=False)
+                    yield f"id: {seq}\nevent: agent\ndata: {data}\n\n"
+            except Exception:                       # noqa: BLE001
+                log.exception("任务 %s 的实时流出错", task_id)
+                yield 'event: error\ndata: {"detail": "实时流中断"}\n\n'
+            # 明确收尾：面板靠它停止重连，而不是等超时
+            yield "event: end\ndata: {}\n\n"
+
+        return StreamingResponse(
+            _gen(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
     @app.post("/api/internal/admin/rpc/{task_id}")
     def admin_rpc(task_id: int, body: RpcCmdIn, user=Depends(auth.require_admin)):

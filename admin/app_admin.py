@@ -491,6 +491,10 @@ def create_admin_app() -> FastAPI:
             raise PanelError(422, "任务还在进行中，不需要重跑")
         store.update_task(task_id, done_at=None, step="", error="",
                           package_path="", summary="")
+        # 收口标记也必须清：它的语义是「**本轮**已收口」。不清的话第二轮 agent 调
+        # finish 会被 422 拒掉，而调度器 _settle 读到的是上一轮的标记，会把第二轮
+        # 任何退出（包括直接崩溃）判成"正常收口"，最后打出一份与本次运行无关的旧包。
+        store.clear_finished(task_id)
         updated = store.set_status(task_id, "queued", actor="admin",
                                    message="管理员把任务放回队列")
         return _task_view(updated)

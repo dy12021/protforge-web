@@ -182,34 +182,72 @@ xcopy data D:\backup\protforge-web-data\ /E /I
   `<数字>_<slug>` 的路径，有测试覆盖。
 - **agent 端**：AST 命令守卫 + pi RPC 模式 + 步骤回传可用，有单测。
 
-### 尚未验证 / 未接线（**当前实现的真实状态**）
+### 端到端实测（2026-10-16，本机，真实数据盘 `data`）
 
-这几条不是「待优化」，是**还没连上**，照着做会撞上：
+真实 freesasa 计算走完全程，**61 秒**：
 
-1. **调度器没有接进任何进程** —— `dispatcher.py` 没有 `main()`，
-   `create_public_app()` / `create_internal_app()` 里也没有任何 lifespan 去调
-   `Dispatcher.start()`；全仓库只有测试在实例化它。
-   **后果：三个服务起来后，提交任务不会有 agent 被 spawn，任务会一直停着。**
-   调度器也没有独立启动入口，所以 `start.bat` 里也没有（更没有）替它单起一个进程。
-2. **清理器没有被调度** —— `janitor.sweep()` 只有测试调用，没有「每小时扫一次」的循环。
-   保留策略目前是「函数写好了但没人定时调」。
-3. **用户面板前端没被主服务发出来** —— public app 没有 `/` 路由也没挂静态目录
-   （只有管理员面板自己发 `admin-ui/`）。**所以 `http://127.0.0.1:8473/` 现在是 404**，
-   `start.bat` 自动打开浏览器会看到 404，这是预期内的当前状态。
-4. **没有初始管理员** —— `db.init_db()` 不建用户，而管理员面板要登录才能建用户。
-   第一个管理员需要手工建一次：
-   ```bat
-   cd /d .\server
-   "C:\ProgramData\anaconda3\python.exe" -c "import auth; print(auth.create_user('你的用户名', '至少10位的密码', 'admin'))"
-   ```
-5. **模型凭据经 spawn 的传递方式待确认** —— 仓库里**没有任何代码读 LLM 相关环境变量**。
-   模型与密钥走 pi 自己的 agent 目录（本机 `%USERPROFILE%\.pi\agent\` 下已有 `auth.json`
-   与 `models-store.json`）。`agent/run.mjs` 里只把 `MINIMAX_API_KEY` 用于 MCP 搜索，
-   **模型本身**（预期 `https://api.minimax.cn/v1` + `MiniMax-M3.1-Flash-Preview`）
-   是否能被调度器 spawn 出来的 agent 用上，**尚未联调验证**。
-6. **产物回传未闭环** —— agent 的 `finish` 会带 `artifacts` 字段，但服务端 `FinishIn`
-   只有 `summary` / `error`，多余的 `artifacts` 会被 pydantic 静默丢弃；
-   `package_path` 得走产物发现/确认那条路。产物能否真正出现并可下载，**待联调验证**。
+```
+提交 → queued → running → 拉起 agent → 换模型 → 读 SKILL.md
+     → 定位 /e/oih/data/inputs/1ubq.pdb → 找到 venv → 跑 protforge-freesasa.sh
+     → 76 残基 / 602 原子，总 SASA 4804.06 Å²（与 Result.totalArea() 交叉校验一致）
+     → 按原子类型统计 → finish(summary, artifacts) → done
+```
+
+打包另用这次的真实产物验过：zip 4493 字节 / 5 个文件，且确认 `.pi-agent/`、
+`models.json`、`brief.md` 一个都没混进去。
+
+单技能实测耗时（用于定时档位）：
+
+| 技能 | 输入 | 耗时 | 结果 |
+|---|---|---|---|
+| protforge-freesasa | 1ubq.pdb | 61 秒（含 agent 全流程） | OK |
+| protforge-pesto | 1ubq.pdb（76 残基） | **16.6 s** | 11 hotspots |
+| protforge-esm | 1ubq 序列（73 残基）embed | **36.9 s** | dim=1280 |
+
+### 曾经「还没连上」的六条，现在全是绿的
+
+这六条不是被优化掉的，是**接上了**。记录一下它们错在哪，因为这才是本项目
+最值得记住的一课：
+
+> 13 个 task 各自交付、各自测试全绿，接起来之后仍然什么都不发生。
+> 真跑一次才连着挖出 9 处断点，**每一处都是静默的**——不报错、不退出、
+> 任务看起来活着却什么都不干。
+
+1. ~~调度器没有接进任何进程~~ → 现在随内部 app(8475) 的 lifespan 启动，
+   由 `PROTFORGE_WEB_WORKERS=1` 统一控制（调度器 + 打包器 + 清理器三个一起）。
+   **必须与内部 app 同进程**：agent 令牌和管理员 RPC 都在那边，跨进程共享不到那张
+   内存令牌表，症状是 agent 每一步回调都 401。
+2. ~~清理器没有被调度~~ → 与调度器同一个开关，后台线程每 30 分钟扫一次。
+3. ~~用户面板前端没被主服务发出来~~ → `http://127.0.0.1:8473/` 返回 200，
+   `/app.js` `/style.css` 同样 200。
+   **不要**改成 `app.mount("/", StaticFiles(...))`：那会把整棵树接管，
+   `POST /api/tasks/1/advance` 从 404 变 405、detail 不再是中文，
+   「用户侧没有 /advance」这条设计被悄悄改掉。现在是三个文件的单段白名单路由。
+4. ~~没有初始管理员~~ → `.env` 里设 `PROTFORGE_ADMIN_USER` / `PROTFORGE_ADMIN_PASSWORD`
+   自动创建；**同名用户已存在时绝不覆盖**（覆盖等于用一次重启把现有人踢出系统）。
+5. ~~模型凭据的传递方式待确认~~ → 调度器为**每个任务**物化一份
+   `work/<id>/.pi-agent/models.json`，`apiKey` 写成 `$MINIMAX_API_KEY` 由 pi 运行时插值，
+   **密钥不落盘**。不去改 `%USERPROFILE%\.pi\agent`——那是全机器 pi 的配置，
+   平台的行为不该依赖操作者的家目录状态。
+   另外：`createAgentSessionServices({model})` **不会**传到 runtime，agent 会悄悄
+   用内置 catalog 的第一个可用模型（本机是 minimax/M2.7，打到 `api.minimaxi.com`
+   于是 401）。所以派活时先发一条 RPC `set_model`，它带回应、成功与否能验。
+6. ~~产物回传未闭环~~ → `FinishIn` 现在收下 `artifacts`（pydantic 对未声明的键是
+   **静默丢弃**的，agent 以为报了、后端当没收到）。产物发现扫**两处**：
+   ProtForge outputs 根（前缀/时间窗，verified=0 待管理员确认）**与任务工作目录**
+   （任务独占，一律 verified=1）。只扫前者是不够的——实测 agent 把结果全写在
+   工作目录里，outputs 根是空的，于是任务 done 却没有 zip。
+
+### 仍然未验证 / 未接线
+
+1. **管理员面板的干预动作没做过真机联调** —— 内部 RPC 转发端点
+   `/api/internal/admin/rpc/{task_id}` 已实现并有测试（含形状翻译、白名单、
+   409/504 故障路径），但**没有对着真实运行中的 agent 按过按钮**。
+   abort 走「直接杀进程树」而不是透传给 agent（面板上那个按钮的意思是"停掉这个
+   计算"，不是"让当前这轮回答先说完"），这一点尤其值得在真机上确认一次。
+2. **超时档位只实测了 pesto / esm 两个** —— 其余技能仍按「秒级 / 对接类 / 生成类」
+   三档的归类给值。生成类那档（`TIMEOUT_SLOW_S` 8h）是给 rfdiffusion / bindcraft /
+   gromacs / proteinmpnn 的，**未实测**。
 
 ---
 

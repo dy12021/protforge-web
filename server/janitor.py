@@ -38,7 +38,24 @@ import db
 import guards
 
 # task_id 是纯数字，所以「以数字开头」既够用又不会误伤用户自建目录。
-TASK_DIR_RE = re.compile(r"^\d+")
+TASK_DIR_RE = re.compile(r"^\d+$")
+
+# 形态闸**按区域**取形状。曾经只有一条 ^\d+（那是任务目录的形状），结果
+# logs/agent-12.log 与 packages/task_12.zip 全部被挡在门外——保留策略一次都没执行过，
+# 而测试用的是纯数字名，于是断言恒真、假安全感。形状必须跟**生产者**对齐。
+_SHAPES = {
+    "work": re.compile(r"^\d+$"),
+    "uploads": re.compile(r"^\d+$"),
+    # dispatcher._spawn 产出的三个名字，外加日志轮转的 .log.1
+    "logs": re.compile(r"^agent-\d+(\.err)?\.log(\.\d+)?$"),
+    # artifacts.default_package_path 产出的名字
+    "packages": re.compile(r"^task_\d+\.zip$"),
+}
+
+
+def _shape_for(base: Path) -> re.Pattern:
+    """取该区域的形态。区域不在表里就退回任务目录的形状（最保守）。"""
+    return _SHAPES.get(base.name, TASK_DIR_RE)
 
 WORK_KEEP_DAYS = 7
 UPLOAD_KEEP_DAYS = 7
@@ -67,12 +84,12 @@ def _within(cand: Path, base: Path) -> bool:
 
 
 def _eligible(root: Path, base: Path, entry: Path) -> bool:
-    """三道闸：形态（^\\d+）、位置（resolve 后在 base 且 base 在 root 内）、同体（不能等于 base）。
+    """三道闸：形态（按区域）、位置（resolve 后在 base 且 base 在 root 内）、同体（不能等于 base）。
 
     位置闸的语义是「解析后的真实路径必须落在数据根内」——落在根外的条目**完全不处理**，
     连它自己都不摘：留着比动它安全。
     """
-    if not TASK_DIR_RE.match(entry.name):
+    if not _shape_for(base).match(entry.name):
         return False
     real = _resolve(entry)
     base_real = _resolve(base)
@@ -331,6 +348,26 @@ def _sweep_db(stats: dict, now: datetime):
 # --- 入口 --------------------------------------------------------------------------
 
 
+def _check_naming_drift(root: Path, stats: dict) -> None:
+    """扫到"看着像产物却一个都删不掉"时记进 errors。
+
+    这条自检是给形态闸加的哨兵：闸门的形状一旦又和生产者对不上，这里就会响。
+    宁可日志吵，也不要像这次一样**静默失效几个月**都没人发现。
+    """
+    base = root / "packages"
+    if not base.is_dir():
+        return
+    zippy = [e for e in _iterdir(base) if e.name.endswith(".zip")]
+    if not zippy:
+        return
+    matched = [e for e in zippy if _shape_for(base).match(e.name)]
+    if not matched:
+        stats["errors"].append(
+            f"packages/ 下有 {len(zippy)} 个 zip，但没有一个符合形态闸 "
+            f"{_shape_for(base).pattern}——产物包将永远不被回收。"
+            f"样例：{zippy[0].name}。生产者的命名与 janitor 的形态闸对不上了。")
+
+
 def _empty_stats(errors=None) -> dict:
     return {
         "work_dirs": 0,
@@ -366,6 +403,7 @@ def sweep(data_root=None, now=None, *, target_free_bytes=None) -> dict:
     _sweep_task_dirs(root, "uploads", UPLOAD_KEEP_DAYS, "upload_dirs", stats, now, protected)
     _sweep_logs(root, stats, now)
     _sweep_packages(root, stats, now, target_free_bytes)
+    _check_naming_drift(root, stats)
     _sweep_db(stats, now)
     return stats
 

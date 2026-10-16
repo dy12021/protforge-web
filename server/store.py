@@ -319,6 +319,25 @@ def record_finished(task_id: int, actor: str = "system") -> None:
         c.close()
 
 
+def clear_finished(task_id: int) -> None:
+    """清掉本任务的收口标记。**只在"重跑"时调**。
+
+    ``finished`` 的语义是"**本轮**计算进程已收口"，不是"历史上曾经成功过"。
+    管理员点重跑就是开新一轮，标记必须跟着清——不清的话第二轮的 finish 回调
+    会被 422 拒掉，而调度器 _settle 读到的是上一轮的标记，会把第二轮任何退出
+    （包括直接崩溃）都判成"正常收口"，最后打出���一份与本次运行无关的旧结果包。
+
+    只删这一种 kind，其他事件一个不动：时间线是给人看的历史，不该被重跑抹掉。
+    """
+    c = db.connect()
+    try:
+        with c:
+            c.execute("DELETE FROM events WHERE task_id = ? AND kind = 'finished'",
+                      (int(task_id),))
+    finally:
+        c.close()
+
+
 def has_finished(task_id: int) -> bool:
     """计算进程是否已收口。调度器用它区分"重连"与"真的刚跑完"。"""
     c = db.connect()
