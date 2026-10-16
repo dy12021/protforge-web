@@ -13,6 +13,10 @@
 
 `detail` 恒为中文字符串，含 pydantic 框架层错误——数组透出去前端拿到
 "[object Object]"。做法抄 `D:\\coding\\creative-panel\\server\\app.py:74`。
+
+**凡是本文件写完事件的地方，后面都跟一句 `sse.notify()`。** 那是 SSE 内存总线
+的叫醒钩子，写漏了这条事件只能等 3 秒轮询才到用户眼前（不会丢，只是迟）。
+store.py 属于别的 worker，数据层不该知道有没有人在听，所以叫醒钩子放在 API 层。
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -30,6 +34,7 @@ import auth
 import db
 import guards
 import skills_index
+import sse
 import store
 
 VERSION = "0.1.0"
@@ -285,6 +290,7 @@ def create_public_app() -> FastAPI:
         # store.create_task 刻意不写 created 事件（事件流由 API 层负责），
         # 所以这一条得在这儿补，否则时间线是从"已排队"凭空开始的。
         store.add_event(task["id"], "created", "human", f"提交了任务：{task['title']}")
+        sse.notify()
         return _detail(task)
 
     @app.get("/api/tasks")
@@ -328,6 +334,7 @@ def create_public_app() -> FastAPI:
         # message 里放**原样的英文字段名**：这是 API 契约的一部分，翻译留给
         # 前端显示层（FIELD_CN 翻成「改了标题 / 需求」），服务端不写死中文结构名。
         store.add_event(task_id, "edited", "human", "修改了：" + "、".join(changed))
+        sse.notify()
         return _detail(updated)
 
     @app.delete("/api/tasks/{task_id}")
@@ -347,7 +354,42 @@ def create_public_app() -> FastAPI:
                 422, f"任务已经{db.STATUS_LABEL.get(task['status'])}了，不能再中止")
         updated = store.set_status(task_id, "failed", actor="human",
                                    message="用户中止了任务")
+        sse.notify()
         return _detail(updated)
+
+    @app.get("/api/tasks/{task_id}/stream")
+    async def stream_task(task_id: int, request: Request,
+                          user=Depends(auth.current_user)):
+        """任务时间线的 SSE 实时流。
+
+        **鉴权先做、流后开**：越权走 store.get_task → NotFound → 404（不返 403，
+        403 等于承认这个 id 存在）。前端 openDrawer 会在详情页里拉一次，这里
+        同样拦住，省得靠"连上了没数据"来暴露别人的任务。
+
+        游标优先取 `Last-Event-ID` 头（前端重连时带），退化到 `last_event_id`
+        查询参数（curl 手测方便）。两者都缺/是脏数据就是 0 = 从头补。
+
+        处理器是 `async def`：响应体是一条长连接，必须挂在事件循环上；
+        鉴权依赖 current_user 是同步函数，由 FastAPI 自己丢线程池，不影响。
+        """
+        store.get_task(task_id, owner_id=user["id"],
+                       is_admin=user["role"] == "admin")
+        raw = request.headers.get("Last-Event-ID")
+        if raw is None:
+            raw = request.query_params.get("last_event_id")
+        try:
+            last_seen = max(0, int(raw)) if raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            # 游标是脏数据就从头补：宁可重复（前端按事件 id 去重）也不丢
+            last_seen = 0
+        return StreamingResponse(
+            sse.stream(task_id, request, last_seen),
+            media_type="text/event-stream",
+            # X-Accel-Buffering: no —— 反代（nginx）默认会缓冲响应体，
+            # 不显式关掉，实时流会被攒成一块再吐给浏览器，退化成轮询。
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                     "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/tasks/{task_id}/package")
     def download(task_id: int, user=Depends(auth.current_user)):
@@ -384,6 +426,7 @@ def create_internal_app() -> FastAPI:
         store.get_task(task_id)
         step = store.set_step(task_id, body.text)      # 返回值已是截断后的
         store.add_event(task_id, "step", "agent", body.text)
+        sse.notify()
         return {"step": step}
 
     @app.post("/api/internal/agent/{task_id}/event")
@@ -391,6 +434,7 @@ def create_internal_app() -> FastAPI:
                     _tid: int = Depends(require_agent)):
         store.get_task(task_id)
         eid = store.add_event(task_id, body.kind, "agent", body.message)
+        sse.notify()
         return {"event_id": eid}
 
     @app.post("/api/internal/agent/{task_id}/finish")
@@ -412,6 +456,7 @@ def create_internal_app() -> FastAPI:
         # finished 事件放最后：调度器拿 has_finished() 区分"重连"与"真跑完"，
         # 它出现即代表本次计算已彻底收口。
         store.record_finished(task_id, actor="agent")
+        sse.notify()
         return _detail(updated)
 
     # 内部管理通道的第二套令牌：管理员 Bearer。它只负责发 agent_token，
