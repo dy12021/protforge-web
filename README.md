@@ -161,6 +161,13 @@ xcopy data D:\backup\protforge-web-data\ /E /I
 所以它是一层**防误操作**的护栏，不是安全边界。真要对外开放，必须换成真沙箱
 （容器 / 独立账号 / 资源限制），而不是继续加白名单。
 
+守卫只在**会改变文件系统或以文件为参数**的地方判路径，一共五处：删除/移动类
+命令的操作数、重定向的目标、被执行脚本的路径、docker 挂载的宿主路径、
+以及 read/write 工具。`cat` / `head` / `grep` 这类**只读**命令的操作数不判——
+agent 需要读允许根之外的输入文件，这是刻意留的口子。路径判定前会先消解
+`.` 与 `..`（且必须在盘符映射**之后**），否则 `../protforge\..\..\Users\x` 规范化后
+仍以 `/mnt/e/oih/` 开头，会被直接放行——这条 16 个用例在 `agent/guards.dotdot.test.mjs`。
+
 ---
 
 ## 已验证 / 尚未验证
@@ -178,8 +185,11 @@ xcopy data D:\backup\protforge-web-data\ /E /I
   拼出来的（`agent/tools.mjs`），写成带 `/api` 会得到双斜杠的 404。
 - **回传字段名**：agent 发 `{text}` / `{summary, artifacts}`，服务端 `StepIn.text`、
   `FinishIn.summary` / `.error` 对得上。
-- **保留策略**：`janitor.sweep()` 按 spec §3.05.2 实现，只删本项目数据盘下、目录名匹配
-  `<数字>_<slug>` 的路径，有测试覆盖。
+- **保留策略**：`janitor.sweep()` 按 spec §3.05.2 实现，所有删除动作都过三道闸
+  （本项目数据盘内 / 不碰活跃任务 / 名字符合该区域的生产形状）。形状**按区域**取：
+  `work` `uploads` 是 `^\d+$`，`logs` 是 `^agent-\d+(\.err)?\.log(\.\d+)?$`，
+  `packages` 是 `^task_\d+\.zip$`——都必须跟**生产者**写出来的名字对齐，
+  另有一条命名漂移哨兵，生产者一改名字就会在 `errors` 里报出来。
 - **agent 端**：AST 命令守卫 + pi RPC 模式 + 步骤回传可用，有单测。
 
 ### 端到端实测（2026-10-16，本机，真实数据盘 `data`）
@@ -247,15 +257,40 @@ xcopy data D:\backup\protforge-web-data\ /E /I
    计算"，不是"让当前这轮回答先说完"），这一点尤其值得在真机上确认一次。
 2. **超时档位只实测了 pesto / esm 两个** —— 其余技能仍按「秒级 / 对接类 / 生成类」
    三档的归类给值。生成类那档（`TIMEOUT_SLOW_S` 8h）是给 rfdiffusion / bindcraft /
-   gromacs / proteinmpnn 的，**未实测**。
+   gromacs / proteinmpnn 的，**未实测**。pesto / esm 那两次也是**热容器 + 小输入**，
+   冷启动没有单独计时。
+3. **调度器重启恢复只在测试里验过** —— 服务重启后会杀掉上一轮遗留的 node 进程树、
+   把 `running` 的任务收成带中文原因的终态。真机上没试过「跑着四个任务时直接重启」。
+
+### 全分支 review 修过一轮（2026-10-16）
+
+一次全分支审查找出 11 个缺陷 / 3 个高危，逐条修完并给每条配了围栏。
+两件事值得单独记下来，因为它们都不是「代码写错了」，而是**测试在替生产撒谎**：
+
+1. **清理器的形态闸与生产命名对不上** —— 闸门要求目录名 `^\d+$`，可生产写的是
+   `agent-N.log` / `task_N.zip`。结果是 `logs/` 与 `packages/` 的保留策略**一次都没执行过**，
+   而测试用的是纯数字名，断言恒真。现在形态按区域拆开，并加了命名漂移哨兵。
+2. **下载端点对每一个真实任务恒 409** —— 产物写到 `data\packages\`，而路径守卫的
+   区域表里**没有 packages**，于是真实产物一律被判越界，用户永远拿不到结果包。
+   391 个测试全绿，因为夹具把假 zip 写进了 `work\`——一个生产中不存在的布局。
+
+教训：**端到端路径的测试必须由生产的同一个函数/常量生成路径**。测试里手拼目录名，
+就是下一个"全绿但全废"的入口。详见 `.superpowers/sdd/2026-10-16-protforge-web/review-round-1.md`。
+
+下载端点现在走 `guards.resolve_package()`，只认一个文件：
+`<数据盘>\packages\task_<本任务号>.zip`。work/uploads/outputs/inputs 四个区里的文件、
+别的任务的包、`packages` 下的其它文件、子目录里的同名文件一律拒；越界仍是 409 且
+不回吐真实路径。
 
 ---
 
 ## 常见排查
 
 **浏览器打开 8473 是 404**
-不是你的问题。见上面「尚未验证」第 3 条：用户面板前端还没被主服务发出来。
-接口本身是活的，可以先探 `<http://127.0.0.1:8473/api/health>`，返回 `{"ok":true,...}` 就说明服务正常。
+现在的实现里用户面板前端是**已经接上**的：`/`、`/app.js`、`/style.css` 都返回 200。
+如果 404，先探 `<http://127.0.0.1:8473/api/health>`——它返回 `{"ok":true,...}` 说明
+后端活着，问题在前端那三个文件的单段白名单路由（`server/app.py` 末尾）上。
+404 也可能是端口被别的程序占了，见下一条。
 
 **提示端口被占 / 起来就退**
 先分清是谁占的：
@@ -277,8 +312,8 @@ Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 8473,8474,8
 - 技能目录读不到 → 看窗口里 `loadSkillsFromDir` 的诊断输出，用
   `PROTFORGE_WEB_SKILLS_DIR` / `PROTFORGE_SKILLS_DIR` 指到真实目录。
 
-不过在调度器接线之前（见「尚未验证」第 1 条），**根本不会有 agent 被 spawn**，
-所以这一类现象要先看第 1 条是不是还没解决。
+调度器已经接在内部 app 的 lifespan 上了（见上面「曾经还没连上的六条」第 1 条），
+所以 agent 起不来就是上面三种原因之一，不用再去别处找。
 
 **产物下载不了**
 按这个顺序看：
@@ -287,7 +322,9 @@ Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 8473,8474,8
 2. 任务记录里 `package_path` 是不是空的——空就是 409「这个任务没有产物包」。
    产物是 agent 跑完 + 发现 + 确认三步才落到 `data\packages\` 的。
 3. `data\packages\` 里有没有那个 zip，以及有没有被清理器回收（保留 30 天）。
-4. 路径是否越界——越界的 `package_path` 会被路径守卫拦掉，同样返回 409。
+4. 路径是否越界——`package_path` 必须是 `<数据盘>\packages\task_<本任务号>.zip` 这一个文件，
+   任何别的位置（work/uploads/outputs/inputs 区的文件、别的任务的包、子目录里的同名文件）
+   都会被守卫挡掉，同样返回 409。
 
 **网页上看不到实时的进度**
 事件流是 SSE。反代必须关掉 `proxy_buffering`（上面的 nginx 示例已经关了）；

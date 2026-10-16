@@ -71,22 +71,14 @@ STREAM_TIMEOUT = 60.0
 
 # ---------------------------------------------------------------- 错误消息
 
-# 与 server/app.py:validation_message 同一套规则。本面板多出的参数名在这里补，
-# 不去改那个文件（它属于主服务的 worker）。
-_PARAM_LABEL = {
-    "username": "用户名", "password": "密码", "title": "标题",
-    "brief": "需求说明", "text": "步骤文本", "kind": "事件类型",
-    "message": "内容", "summary": "结论", "task_id": "任务编号",
-    "status": "状态", "role": "角色", "ok": "确认结论",
-    "command": "干预命令", "model": "模型名", "thinking_level": "思考档位",
-    "limit": "条数", "after_id": "游标", "artifact_id": "产物编号",
-    "enabled": "停用状态",
-}
+# 错误文案的**单一来源**在 server/app.py（主服务）里，这里 import 过来用，
+# 不要在本文件里再抄一份：抄过一次就已经漂了——那时 `_HTTP_DETAIL` 两侧的键集合
+# 不同（app 侧有 422/503、这边没有）、`_PARAM_LABEL` 这边少了 `error`、
+# `brief` 两种译法各写各的、连注释都互相矛盾，于是同一个框架层错误在两个面板上
+# 显示成两句话。参数名与状态码都只在 server/app.py 里加。
+import app as svc               # noqa: E402
 
-# 错误文案的映射表与 `user_detail()` **只有一份**，在 server/app.py（主服务）里，
-# 这里 import 过来用。不要再抄一份：抄过一次就已经漂了——app 侧有 422/503、
-# 这边没有，两边的注释还互相矛盾，于是同一个框架层错误在两个面板上显示成两句话。
-import app as svc               # noqa: E402  server/app.py：错误文案的单一来源
+_PARAM_LABEL = svc.PARAM_LABEL
 
 
 class PanelError(HTTPException):

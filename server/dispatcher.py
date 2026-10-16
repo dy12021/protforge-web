@@ -1430,23 +1430,46 @@ class Dispatcher:
         self._close_handles(ap)
 
         try:
-            store.get_task(ap.task_id, is_admin=True)     # 确认任务还在库里
+            task = store.get_task(ap.task_id, is_admin=True)   # 确认任务还在库里
         except store.StoreError:
             return code                                    # 任务被删了，没什么可收尾的
         except Exception:                                 # noqa: BLE001
             log.exception("收尾 %s 时读任务失败", ap.task_id)
             return code
 
-        if store.has_finished(ap.task_id):
+        # 收尾要同时照顾两个**互相独立**的事实：
+        #   ap.aborted —— 进程是我们杀的（该如实记「已杀掉进程树」）
+        #   has_finished —— agent 自己报过收口（该走 packaging）
+        # 两者可以同时成立：agent 调完 /finish，用户在调度器收尾之前点了中止。
+        # 这时候既不该翻回「打包中」，也不该说成「计算进程异常结束」——
+        # 一次正常收口被解释成崩溃，用户在详情页看到的是一条不存在的事故。
+        # 所以四条分支是**互斥**的，不是一条 if/elif 链。
+        #
+        # store 层已经规定「system/agent 的自动回写不许离开终态」，这里是调用方
+        # 自己的第一道：不试比试了再被拒要有意义。
+        already_terminal = task.get("status") in db.TERMINAL_STATUSES
+        has_finished = store.has_finished(ap.task_id)
+
+        if has_finished and not already_terminal:
             store.set_status(ap.task_id, "packaging", actor="agent",
                              message="计算进程已收口，开始打包产物")
             store.add_event(ap.task_id, "step", "system",
                             f"计算进程正常退出（退出码 {code}）")
             _notify()
         elif ap.aborted:
+            # 进程确实被杀过，这是事实，跟收口标记没关系，照实记。
             self._mark_failed(ap.task_id, ap.abort_reason or "已由管理员中止")
             store.add_event(ap.task_id, "log", "admin",
                             f"中止：已杀掉进程树 pid={ap.pid}，stderr 见 {ap.stderr_path.name}")
+            _notify()
+        elif already_terminal:
+            # 没有中止也没有崩，任务却已是终态（管理员判失败之类）。
+            # 只如实记一句，**不要替没发生过的事编一个原因**，也不动 error 字段。
+            log.info("任务 %s 收尾时已是终态（%s）且已收口，不改写", ap.task_id,
+                     task.get("status"))
+            store.add_event(ap.task_id, "log", "system",
+                            f"计算进程已收口，但任务此前已进入终态"
+                            f"（{task.get('status')}），保持不变")
             _notify()
         else:
             self._mark_failed(

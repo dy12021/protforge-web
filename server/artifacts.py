@@ -442,10 +442,16 @@ def _run_pack_worker(task_id: int, spec_path: Path, out: Path, progress_cb,
     """
     cmd = [sys.executable, str(Path(__file__).resolve()), "--pack", str(spec_path)]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # **必须显式钉死子进程的输出编码。** 管道在 Windows 上默认按 ANSI（cp936）解码，
+    # 而父进程这边用 encoding="utf-8" 解码——子进程自己 print 的中文（出错时那一句
+    # 最有诊断价值的话）会整段变成 U+FFFD，用户看到的是一串替换符。
+    # 两个方向都要统一：PYTHONIOENCODING 管子进程往 stdout/stderr 写的编码，
+    # 父进程的 encoding="utf-8" 管读。两边都写死才闭合。
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
-        creationflags=creationflags,
+        creationflags=creationflags, env=env,
     )
     lines: "queue.Queue" = queue.Queue()      # stdout 逐行；EOF 放 None 作哨兵
     tail = _Tail(_STDERR_TAIL_CHARS)

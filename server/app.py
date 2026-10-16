@@ -59,11 +59,23 @@ INTERNAL_PORT = 8475
 
 # 参数名 -> 中文标签。pydantic 的 loc 里全是英文 key，不翻的话错误提示是
 # "title 不合法"这种夹生文案。
-_PARAM_LABEL = {
+#
+# **也是单一来源**：admin/app_admin.py import 下面这个名字，不要再抄一份。
+# 抄过一次就已经漂了——admin 侧那份少了 `error`，`brief` 还写成了「需求说明」
+# 而这边是「需求描述」，两边注释还互相矛盾。键集合一旦漂了两边就永远对不上，
+# 所以新加参数名只加这里。
+#
+# `brief` 的译法取「需求说明」：这是界面上真实叫的名字（`web/index.html`、
+# `web/app.js` 都是它），报错里换个说法等于让用户去找一个界面上不存在的字段。
+PARAM_LABEL = {
     "username": "用户名", "password": "密码", "title": "标题",
-    "brief": "需求描述", "text": "步骤文本", "kind": "事件类型",
+    "brief": "需求说明", "text": "步骤文本", "kind": "事件类型",
     "message": "内容", "summary": "结论", "error": "错误信息",
     "task_id": "任务编号", "status": "状态",
+    # 以下是管理员面板多出来的参数名
+    "role": "角色", "ok": "确认结论", "command": "干预命令", "model": "模型名",
+    "thinking_level": "思考档位", "limit": "条数", "after_id": "游标",
+    "artifact_id": "产物编号", "enabled": "停用状态",
 }
 
 # **错误文案的单一来源。** admin/app_admin.py import 下面这两个名字，不要再抄一份：
@@ -112,7 +124,7 @@ def validation_message(exc: RequestValidationError) -> str:
     for err in exc.errors():
         loc = tuple(err.get("loc") or ())
         kind = err.get("type") or ""
-        name = _PARAM_LABEL.get(loc[1], loc[1]) if len(loc) > 1 else ""
+        name = PARAM_LABEL.get(loc[1], loc[1]) if len(loc) > 1 else ""
         if loc[:1] == ("body",):
             if len(loc) == 1:
                 msg = "缺少请求体"
@@ -401,7 +413,7 @@ def create_public_app() -> FastAPI:
                               is_admin=user["role"] == "admin")
         if task["status"] in db.TERMINAL_STATUSES:
             raise PreciseHTTPException(
-                422, f"任务已经{db.STATUS_LABEL.get(task['status'])}了，不能再中止")
+                422, f"任务{db.STATUS_LABEL.get(task['status'])}了，不能再中止")
         updated = store.set_status(task_id, "failed", actor="human",
                                    message="用户中止了任务")
         # error 字段也补上：详情页读它展示失败原因，而调度器看到库里已经是 failed

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -138,6 +139,39 @@ while True:
     time.sleep(0.05)
 """
 
+# 会**自己退出**的假 agent。测 _settle 必须用它：死循环那个只在夹具 teardown 的
+# disp.stop() 里才被结算，而断言是在 teardown **之前**跑的——于是 _settle 里写没写
+# 事件、翻没翻状态，用例一律看不见，测的是空气。这条坑踩过一次。
+EXITING_AGENT = """import sys
+sys.stdout.write('{"kind":"note","message":"起来了"}\\n')
+sys.stdout.flush()
+sys.exit(0)
+"""
+
+
+def _spawn_with(tmp_path, agent_task, script_body):
+    script = tmp_path / "fake_agent.py"
+    script.write_text(script_body, encoding="utf-8")
+    disp = dispatcher.Dispatcher(
+        db, db.data_root(), node_exe=sys.executable, agent_script=script,
+        gpu_probe=lambda: 0, max_concurrency=1)
+    ap = disp._spawn(agent_task, "算一下", tmp_path / "work")
+    return disp, ap
+
+
+def _wait_exit(ap, timeout=20.0):
+    """等假 agent 真的退出。
+
+    自退的 agent 也要几十毫秒才结束（解释器启动）。不等就 tick 的话
+    `_reap` 里 `poll()` 还是 None，收尾根本不会发生——用例又变成测空气。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ap.proc.poll() is not None:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"假 agent {timeout}s 内没有退出")
+
 
 @pytest.fixture
 def running_agent(tmp_path, agent_task, monkeypatch):
@@ -191,6 +225,68 @@ def test_settle_does_not_overwrite_user_abort_reason(running_agent, agent_task):
     # 进程确实被杀这件事仍然要留在时间线上
     texts = [e["message"] for e in store.list_events(agent_task)]
     assert any("已杀掉进程树" in t for t in texts), texts
+
+
+# ---------------------------------------------- 收尾时已经终态：不得编造解释
+
+def test_finished_marker_on_aborted_task_does_not_restart_packaging(
+        tmp_path, agent_task):
+    """agent 报了收口、用户随后中止——收尾不能把任务翻回「打包中」。
+
+    这是真实会发生的时间差：agent 调完 /finish，用户在调度器收尾之前点了中止。
+    库里于是同时有 finished 标记和 failed 状态。原先按 if/elif 链写，
+    `has_finished` 会赢，把一个已被用户中止的任务推上 packaging。
+    """
+    disp, ap = _spawn_with(tmp_path, agent_task, FAKE_AGENT)
+    try:
+        store.record_finished(agent_task, actor="agent")    # agent 先报收口
+        store.set_status(agent_task, "failed", actor="human", message="用户中止了任务")
+
+        disp.tick()          # 认出中止信号，杀进程树，这一轮 continue 不结算
+        disp.tick()          # 这一轮才真正收尾
+
+        task = store.get_task(agent_task, is_admin=True)
+        assert task["status"] == "failed", "中止过的任务被翻成了别的状态"
+        texts = [e["message"] for e in store.list_events(agent_task)]
+        assert not any("开始打包" in t for t in texts), texts
+        # 中止过的任务**可以**说「已杀掉进程树」——进程确实被杀过，这是事实。
+        assert any("已杀掉进程树" in t for t in texts), texts
+    finally:
+        disp.stop()
+
+
+def test_finished_marker_on_failed_task_is_not_called_a_crash(
+        tmp_path, agent_task):
+    """终态 + 收口标记同时成立时，不得声称「计算进程异常结束」。
+
+    `already_terminal` 来自非中止路径时（管理员改判），原先那条 if/elif 链会一路
+    掉到 else 去解释那次收口——把一次正常收口说成崩溃，用户在详情页看到的是
+    一条不存在的事故，还顺手用 _mark_failed 覆盖掉管理员写的 error。
+    """
+    disp, ap = _spawn_with(tmp_path, agent_task, EXITING_AGENT)
+    try:
+        store.update_task(agent_task, error="管理员判失败")
+        store.record_finished(agent_task, actor="agent")
+        store.set_status(agent_task, "failed", actor="admin", message="管理员判失败")
+
+        _wait_exit(ap)      # 进程自己退了，才能进 _settle
+        disp.tick()
+
+        task = store.get_task(agent_task, is_admin=True)
+        assert task["status"] == "failed"
+        texts = [e["message"] for e in store.list_events(agent_task)]
+        assert not any("异常结束" in t for t in texts), texts
+        assert not any("已杀掉进程树" in t for t in texts), \
+            "这个任务没有被中止过，不该声称杀过进程树"
+        assert task["error"] == "管理员判失败", \
+            f"收尾不该覆盖管理员写的 error：{task['error']!r}"
+        # 上面三条断言 store 层的 actor 规则已经能挡住，所以它们单独看是恒真的——
+        # 真正只有「收尾时终态优先判定」才会产生的，是这条中性事实。
+        # 没断言它，这个用例就测不出修复有没有被撤掉（已实测撤掉后仍然全绿）。
+        assert any("保持不变" in t for t in texts), \
+            f"终态收尾应当如实记一句中性事实：{texts}"
+    finally:
+        disp.stop()
 
 
 # ---------------------------------------------------------------- 5+6. 打包器
