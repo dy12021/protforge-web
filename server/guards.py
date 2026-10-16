@@ -7,6 +7,9 @@
     ../protforge/data\\outputs\\     只读（仅对 agent 的文件工具）
     ../protforge/data\\inputs\\      只读
 
+**结果包（data\\packages\\task_<id>.zip）不在其中**，它是 `resolve_package()` 单独
+管的一条：那一区是用户的交付物，不是 agent 的工作面。理由见那个函数的 docstring。
+
 **这是尽力而为的防误操作层，不是强安全隔离。** 它只做两件事：挡掉明显的路径形态
 （UNC、驱动器相对、.. 上跳）和挡掉明显的越界目录。它挡不住刻意构造的绕过
 （TOCTOU 换链、WSL 内部、bash 子进程的写操作），spec §6.5 也明说了这一点。
@@ -27,6 +30,7 @@ DEFAULT_PROTFORGE_ROOT = r"../protforge/data"
 
 WORK = "work"
 READ_ONLY_REGIONS = ("uploads", "outputs", "inputs")
+PACKAGES = "packages"
 
 
 class Violation(Exception):
@@ -130,11 +134,77 @@ def resolve(path, task_id, write: bool = False) -> Path:
     raise Violation(f"越出所有允许区域：{path}")
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    """两个路径是不是同一个（Windows 下大小写与末尾分隔符都不算数）。"""
+    if a == b:
+        return True
+    return os.path.normcase(str(a)).rstrip("\\/") == os.path.normcase(str(b)).rstrip("\\/")
+
+
+def package_root() -> Path:
+    """结果包目录。**刻意不在 regions() 里**：那四个区是 agent 的文件边界。"""
+    return _data_root() / PACKAGES
+
+
+def package_file(task_id) -> Path:
+    """task_id 自己的结果包应该落在哪。与 artifacts.default_package_path 同一份布局。
+
+    artifacts 依赖 guards，所以这个"反向"的纯路径计算放在这里而不是那边：
+    谁算出什么不许各写一份，两个函数算出两个路径就是又一次"包在哪"的争议。
+    """
+    return package_root() / f"task_{_check_task_id(task_id)}.zip"
+
+
+def resolve_package(task_id, path) -> Path:
+    """把 tasks.package_path 解析成**本任务自己的那一个结果包**，否则抛 Violation。
+
+    为什么单独一个函数，而不是给 regions() 加第五个键：
+
+    - `regions()` 是 agent 能碰的文件边界（调度器起进程、打包取产物都走它）。
+      结果包是交给用户的交付物，一个 agent 读自己任务的 zip 没有任何正当理由；
+      塞进去等于给每个 agent 开一条"读别人任务几十 GB 压缩包"的路。
+    - 真按区域放行也不够。download 原来用的就是 `resolve(write=False)`，那等于
+      放行 work / uploads / outputs / **inputs** 里的任意文件——inputs 放的是别的
+      任务的输入结构文件。而 packages 又恰恰不在四区里，于是生产写出的包一律 409：
+      任务跑完、包生成、点下载永远是"结果包不在允许的目录里"。
+
+    判定因此比 resolve() 严得多：**只认这一个文件**——
+    ``<data_root>\\packages\\task_<task_id>.zip``，父目录必须正好是 packages、
+    文件名必须正好是本任务那一个。所以 work/uploads/outputs/inputs 里的文件、
+    packages 下的别的文件（别人的包、leftover.zip）、子目录里的同名文件一律拒。
+    比较发生在 resolve() 之后（短名、junction、上跳都先被展开），形态花招一样过不去。
+
+    文件名由 `_check_task_id` 校验过的纯数字拼出，不含分隔符、不含 `..`，
+    因此也不会撞上 `store.artifacts.add` 那条"名字里不能含 / \\ .."的约束。
+    """
+    tid = _check_task_id(task_id)
+    s = os.path.expandvars(str(path).strip())
+    if not s or "\x00" in s:
+        raise Violation(f"不允许的路径形态：{path}")
+
+    kind = _classify(s)
+    if kind in ("unc", "rooted", "drive_relative"):
+        raise Violation(f"不允许的路径形态：{path}")
+
+    # 绝对路径才是生产形态（package_path 存的就是 artifacts.default_package_path 的
+    # 绝对串）。相对路径按工作区解析，它必然落在 packages 之外，于是被拒。
+    cand = _resolve(Path(s) if kind == "absolute"
+                    else _data_root() / WORK / tid / s)
+    if not _same_path(cand.parent, _resolve(package_root())) or \
+            cand.name != f"task_{tid}.zip":
+        raise Violation("结果包不是本任务自己的那个文件")
+    return cand
+
+
 __all__ = [
     "Violation",
     "resolve",
+    "resolve_package",
     "regions",
+    "package_root",
+    "package_file",
     "WORK",
+    "PACKAGES",
     "READ_ONLY_REGIONS",
     "DEFAULT_DATA_ROOT",
     "DEFAULT_PROTFORGE_ROOT",

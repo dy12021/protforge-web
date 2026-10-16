@@ -427,10 +427,16 @@ def create_public_app() -> FastAPI:
         if not raw:
             raise HTTPException(409, "这个任务还没有可下载的结果包")
         try:
+            # **不能是 guards.resolve()**：生产打包写在 data\packages\task_<id>.zip，
+            # 而 resolve() 认的是 agent 的四个区域（work/uploads/outputs/inputs），
+            # packages 不在里面——于是每个真实任务点下载都恒 409，包生成了、用户
+            # 永远拿不到，测试全绿是因为夹具写的是 work 区里一个生产中不存在的布局。
+            # resolve_package() 只认本任务自己的那一个文件，顺带把 inputs/outputs/
+            # work 里的任意文件也堵了（原来 write=False 是放行它们的）。
+            real = guards.resolve_package(task_id, raw)
+        except guards.Violation:
             # 越界（package_path 被写坏或指向别处）一律当"没有包"，
             # 不把文件系统布局透出去。
-            real = guards.resolve(raw, task_id, write=False)
-        except guards.Violation:
             raise HTTPException(409, "结果包不在允许的目录里，无法下载")
         if not real.is_file():
             raise HTTPException(409, "结果包文件不见了")

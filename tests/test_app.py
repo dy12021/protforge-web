@@ -29,6 +29,7 @@ import pytest
 import uvicorn
 
 import auth
+import artifacts
 import db
 import store
 import app as svc
@@ -108,11 +109,20 @@ def create_task(client, token, title="分析 1ubq", brief="分析 1ubq 的折叠
     return r.json()["task"]
 
 
-def make_package(task_id, name="task-1.zip"):
-    """在 work 区里造一个真 zip，并写回 tasks.package_path。"""
-    root = db.data_root() / "work" / str(task_id)
+def make_package(task_id, name=None):
+    """造一个真 zip，并写回 tasks.package_path。
+
+    **位置由 artifacts.default_package_path 说了算**（`data\\packages\\task_<id>.zip`），
+    夹具不自己拼路径。原来这里写的是 `data\\work\\<id>\\task-1.zip`——生产里没有
+    任何一行代码那样写，于是"真实包点下载恒 409"这个高危缺陷全绿通过。
+    **夹具替生产撒谎，比没夹具更糟**：它把下载测成了一个生产中不存在的布局。
+
+    `name` 只给不关心生产命名的用例用（比如"删任务后磁盘文件还在"）。
+    """
+    root = db.data_root() / "packages"
     root.mkdir(parents=True, exist_ok=True)
-    path = root / name
+    path = (artifacts.default_package_path(int(task_id)) if name is None
+            else root / name)
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("summary.txt", "算完了")
     store.update_task(task_id, package_path=str(path))
