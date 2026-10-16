@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- SPEC 12：不做移动端适配，只保证桌面 1280px 以上。值班台比用户面板更宽，
+     审计表要一屏放下命令原文与耗时。 -->
+<meta name="viewport" content="width=1440">
+<title>自动化计算平台 · 值班台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 顶栏：身份 + 视图切换。值班台的四个区域用页签而不是折叠——
+       它是"随时要看"的东西，折叠起来等于藏起来。 -->
+  <header class="toolbar">
+    <h1>自动化计算平台 · 值班台</h1>
+    <span class="who" id="who"></span>
+    <span class="toolbar-gap"></span>
+    <span class="clock" id="clock"></span>
+    <button class="secondary" id="refresh-btn" type="button">刷新</button>
+    <button class="secondary" id="logout-btn" type="button">退出</button>
+  </header>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab is-on" data-tab="live" role="tab" type="button">在跑的</button>
+    <button class="tab" data-tab="pending" role="tab" type="button">
+      待确认产物<span class="badge" id="badge-pending" hidden>0</span>
+    </button>
+    <button class="tab" data-tab="tasks" role="tab" type="button">全部任务</button>
+    <button class="tab" data-tab="audit" role="tab" type="button">审计日志</button>
+    <button class="tab" data-tab="users" role="tab" type="button">用户</button>
+  </nav>
+
+  <!-- 全局提示条。值班台的这块比用户面板宽：内部通道连不上、登录过期
+       这类问题必须一眼可见，否则下面四个区域全部静默失效。 -->
+  <div id="board-msg" class="board-msg" hidden></div>
+
+  <main class="deck">
+    <!-- ============================ 1 · 在跑的 ============================
+         固定一排实时卡片，每张：当前步骤 + 中止 + 干预框。 -->
+    <section class="pane" id="pane-live" data-pane="live">
+      <div class="pane-head">
+        <h2 class="pane-h">在跑的计算任务</h2>
+        <span class="pane-sub" id="live-sub"></span>
+      </div>
+      <div class="live-list" id="live-list"></div>
+      <p class="empty" id="live-empty">此刻没有在跑的计算任务。</p>
+    </section>
+
+    <!-- ==================== 4 · 时间窗产物确认区 =========================
+         §8.2：verified=0 的产物**可见但不可下载**，要在这里转正。
+         没有它，用户会看到一批永远点不下来的产物。 -->
+    <section class="pane" id="pane-pending" data-pane="pending" hidden>
+      <div class="pane-head">
+        <h2 class="pane-h">待确认的时间窗产物</h2>
+        <span class="pane-sub" id="pending-sub"></span>
+      </div>
+      <p class="pane-lead">
+        计算进程没有给产物目录带上任务前缀时，平台靠「任务运行期间目录有改动」
+        来兜底找产物。并发跑时它可能收进别人的目录，所以下面这些**先显示、不给下载**。
+        确认归属后才会被打进结果包；确认不是它的就排除掉。
+      </p>
+      <div id="pending-list"></div>
+      <p class="empty" id="pending-empty">没有待确认的产物。</p>
+    </section>
+
+    <!-- ========================= 3 · 全部任务 =========================== -->
+    <section class="pane" id="pane-tasks" data-pane="tasks" hidden>
+      <div class="pane-head">
+        <h2 class="pane-h">全部计算任务</h2>
+        <span class="pane-sub" id="tasks-sub"></span>
+      </div>
+      <div class="filters">
+        <input id="q" type="search" placeholder="搜索标题、需求或当前步骤" autocomplete="off" aria-label="搜索">
+        <select id="status-filter" aria-label="状态筛选"><option value="">全部状态</option></select>
+        <label class="toggle"><input id="only-active" type="checkbox"> 只看在跑的</label>
+      </div>
+      <table class="grid">
+        <thead>
+          <tr>
+            <th class="c-id">#</th><th class="c-title">标题</th><th class="c-st">状态</th>
+            <th class="c-step">当前步骤</th><th class="c-owner">提交人</th>
+            <th class="c-time">提交时间</th><th class="c-act">操作</th>
+          </tr>
+        </thead>
+        <tbody id="task-rows"></tbody>
+      </table>
+      <p class="empty" id="tasks-empty">没有匹配的计算任务。</p>
+    </section>
+
+    <!-- ======================== 3 · 审计日志 ============================
+         agent 每一次 bash 调用：命令原文、退出码、耗时。
+         这是事后追责「它到底跑了什么」的唯一凭据，所以必须能导出。 -->
+    <section class="pane" id="pane-audit" data-pane="audit" hidden>
+      <div class="pane-head">
+        <h2 class="pane-h">审计日志</h2>
+        <span class="pane-sub" id="audit-sub"></span>
+      </div>
+      <div class="filters">
+        <select id="audit-task" aria-label="按任务过滤"><option value="">全部任务</option></select>
+        <select id="audit-kind" aria-label="按类型过滤"><option value="">全部类型</option></select>
+        <input id="audit-q" type="search" placeholder="搜索命令原文" autocomplete="off" aria-label="搜索命令">
+        <label class="toggle"><input id="audit-fail" type="checkbox"> 只看非零退出</label>
+        <span class="toolbar-gap"></span>
+        <button class="secondary" id="audit-export" type="button">导出 CSV</button>
+      </div>
+      <table class="grid grid-audit">
+        <thead>
+          <tr>
+            <th class="c-id">#</th><th class="c-time">时间</th><th class="c-task">任务</th>
+            <th class="c-kind">类型</th><th class="c-cmd">命令原文</th>
+            <th class="c-code">退出码</th><th class="c-ms">耗时</th>
+          </tr>
+        </thead>
+        <tbody id="audit-rows"></tbody>
+      </table>
+      <p class="empty" id="audit-empty">没有匹配的审计记录。</p>
+    </section>
+
+    <!-- ========================== 5 · 用户 ============================== -->
+    <section class="pane" id="pane-users" data-pane="users" hidden>
+      <div class="pane-head">
+        <h2 class="pane-h">用户</h2>
+        <span class="pane-sub" id="users-sub"></span>
+      </div>
+      <table class="grid grid-users">
+        <thead>
+          <tr>
+            <th class="c-id">#</th><th class="c-name">用户名</th><th class="c-role">角色</th>
+            <th class="c-state">状态</th><th class="c-time">创建时间</th><th class="c-act">操作</th>
+          </tr>
+        </thead>
+        <tbody id="user-rows"></tbody>
+      </table>
+
+      <!-- 建用户。页面内的表单，不是 window.prompt。 -->
+      <h3 class="sec-h" id="new-user-h">新建用户</h3>
+      <form class="row-form" id="new-user-form">
+        <label class="field">
+          <span>用户名</span>
+          <input id="nu-name" required maxlength="32" autocomplete="off" placeholder="字母、数字、下划线、点、短横">
+        </label>
+        <label class="field">
+          <span>初始密码</span>
+          <input id="nu-pass" required type="password" maxlength="200" autocomplete="new-password" placeholder="至少 10 位">
+        </label>
+        <label class="field field-narrow">
+          <span>角色</span>
+          <select id="nu-role"><option value="user">普通用户</option><option value="admin">管理员</option></select>
+        </label>
+        <button class="primary" type="submit" id="nu-save">创建</button>
+      </form>
+      <p class="row-msg" id="users-msg" hidden></p>
+    </section>
+  </main>
+
+  <!-- 登录。面板也走 Bearer（不放 Cookie），令牌在 localStorage。 -->
+  <dialog class="login" id="login">
+    <form class="login-inner" id="login-form" method="dialog">
+      <h2 class="login-title">自动化计算平台 · 值班台</h2>
+      <p class="login-lead">只对本机开放，需要管理员账号。</p>
+      <label class="field"><span>账号</span><input id="l-user" required autocomplete="username"></label>
+      <label class="field"><span>密码</span><input id="l-pass" required type="password" autocomplete="current-password"></label>
+      <p class="login-error" id="login-error" hidden></p>
+      <div class="composer-actions">
+        <button class="primary" type="submit" id="login-btn">登录</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 两步确认。中止 / 改状态 / 重跑 / 停用用户 / 排除产物都走这一张表。
+       表体由 app.js 的 confirmBody() **每次重建**（上一轮可能塞过下拉框与
+       输入框，复用静态节点就得记得清干净，而忘了清的症状是上一次的
+       重置密码框留在改状态表里——不报错，只是看错了值）。
+       <dialog> 是复用节点，所以收尾必须幂等并解绑监听。 -->
+  <dialog class="confirm" id="confirm"></dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

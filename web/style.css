@@ -1,0 +1,491 @@
+/* 自动化计算平台 · 用户面板前端样式
+ *
+ * 视觉方向对标本机 SnowLuma WebUI 与 creative-panel（SPEC 20.1）：
+ * 亮色纸面**冷调**（不是暖米色），彩色只在表达状态时出现。
+ * 零外链零构建：字体只用 Windows 自带族，不拉远端样式表，也不引图标库。
+ */
+
+/* [hidden] 的显式声明。两层，缺一不可：
+ *
+ *   1. 这条兜底全局规则。凡是**没有**作者 display 规则的元素，靠它（和 UA 样式
+ *      一起）就够隐藏了。
+ *   2. 每条给 display 的规则旁边还各有一条 [hidden] 伴生规则（见 .eb-edit 等）。
+ *      **只有这条全局规则是不够的**：`.eb-edit` 的 display:flex 与 `[hidden]`
+ *      特异性相同（都是 0,1,0），而本文件里它在第 13 行之后——后写的赢，
+ *      于是"存完回只读"时 textarea 仍然可见，同一段内容在页面上出现两次。
+ *      不报任何异常，只是"看起来没切换"。
+ */
+[hidden] { display: none; }
+
+:root {
+  color-scheme: light;   /* 原生 select / 滚动条跟着亮色，否则下拉是黑底 */
+
+  /* 纸面：冷调，刻意比纯白深一档，卡片浮起来才有层次。 */
+  --bg:     #EDF0F4;
+  --panel:  #F6F8FA;
+  --card:   #FFFFFF;
+  --lift:   #F9FBFC;
+  --border: #DBE1E9;
+  --line:   #E6EAF0;
+  --fg:     #15181D;     /* 墨色 */
+  --fg-dim: #69717E;
+
+  /* 四站主链 + 终态失败。色序语义：灰 → 暖 → 紫 → 绿，
+   * amber 是"在干活"的热度而不是警告，红色只给失败。 */
+  --st-queued:    #8A93A2;
+  --st-running:   #D4860B;
+  --st-packaging: #7B4DD6;
+  --st-done:      #1B9A67;
+  --st-failed:    #D33F35;
+  --accent:       #7B4DD6;    /* 按钮/焦点环用品牌紫，与 packaging 同色 */
+
+  --r:    10px;
+  --r-sm: 6px;
+  --shadow: 0 1px 2px rgba(21,32,51,.06), 0 4px 12px rgba(21,32,51,.04);
+
+  /* 显示体：Bahnschrift 是 Windows 10+ 自带的 DIN 风格窄体 grotesk，
+     自带不同宽度轴，用来做列头大数字正好——工业味、不下载、离线可用。 */
+  --display: "Bahnschrift", "DIN Alternate", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font: "Segoe UI", -apple-system, system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --mono: "Cascadia Mono", ui-monospace, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: .875rem;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+h1 { font-family: var(--display); font-size: 1rem; letter-spacing: .01em; margin: 0; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #C9D1DC; border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: #B4BECC; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ------------------------------------------------------------------ 工具条 */
+
+.toolbar {
+  display: flex; gap: .6rem; align-items: center; padding: .7rem 1.1rem;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.toolbar input[type=search] {
+  flex: 0 0 18rem; background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .4rem .65rem;
+}
+.toolbar select {
+  background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .4rem .6rem;
+}
+.toolbar input[type=search]:focus, .toolbar select:focus { border-color: var(--accent); }
+.toolbar .toggle { display: flex; align-items: center; gap: .4rem; color: var(--fg-dim); }
+.toolbar .toggle input { accent-color: var(--st-running); }
+.toolbar-gap { flex: 1 1 auto; }
+.who { color: var(--fg-dim); font-size: .78rem; }
+.toolbar .primary {
+  background: var(--accent); color: #fff;
+  border: 0; border-radius: var(--r-sm); padding: .45rem .95rem; font-weight: 600;
+}
+.toolbar .primary:hover { filter: brightness(1.08); }
+.toolbar .secondary {
+  background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: .4rem .8rem;
+}
+.toolbar .secondary:hover { color: var(--fg); background: var(--card); }
+
+/* ------------------------------------------------------------------ 五列看板 */
+
+.board {
+  flex: 1 1 auto;
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .7rem;
+  padding: .7rem 1.1rem 1.1rem;
+  align-items: stretch;      /* 列拉满高度，不留一块空地板 */
+}
+.col {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: .7rem .7rem .8rem;
+  display: flex; flex-direction: column;
+  min-height: 12rem;
+}
+/* 列头：状态名左边一道该态的色条，数字用显示体。
+ * 数字是**筛选后**的数量——写 12 却只显示 3 张会让用户无法对账。 */
+.col-head { display: flex; align-items: baseline; gap: .55rem; margin-bottom: .7rem; }
+.col-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c, var(--st-queued)); flex: none; align-self: center; }
+.col-count {
+  font-family: var(--display); font-size: 1.6rem; line-height: 1;
+  color: var(--fg); font-weight: 600;
+}
+.col-name { color: var(--fg-dim); margin-left: auto; }
+.col-list { display: flex; flex-direction: column; gap: .5rem; flex: 1 1 auto; min-height: 2rem; }
+.col-empty { color: var(--fg-dim); font-size: .78rem; padding: .3rem .1rem; }
+/* 这两个会被 paintCard 用 hidden 开关：.card-step{display:flex} 的特异性与
+ * [hidden] 相同，必须给它自己的伴生规则才藏得住（见文件开头第 1 条）。 */
+.card-step[hidden], .card-fail[hidden] { display: none; }
+
+/* ------------------------------------------------------------------ 卡片 */
+
+.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--r);
+  padding: .6rem .65rem .55rem; box-shadow: var(--shadow);
+  display: flex; flex-direction: column;   /* 轨是横向的，卡片回到纵向 */
+  cursor: pointer;
+  transition: border-color .15s, box-shadow .15s;
+}
+.card:hover { border-color: #C6CFDA; box-shadow: 0 2px 4px rgba(21,32,51,.07), 0 8px 18px rgba(21,32,51,.07); }
+/* 失败：只给卡片一道红边。**线不整条涂红**——那会丢掉"走到哪一步"，
+ * 正是流转轨存在的意义（SPEC 20.3）。 */
+.card.is-failed { border-color: var(--st-failed); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.card-body { display: flex; flex-direction: column; gap: .4rem; }
+.card-title { font-size: .9rem; font-weight: 600; overflow-wrap: anywhere; }
+.card-meta { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
+.card-id { font-family: var(--mono); color: var(--fg-dim); font-size: .72rem; }
+.card-time { color: var(--fg-dim); font-size: .72rem; margin-left: auto; }
+.tag {
+  font-size: .68rem; color: var(--fg-dim); background: var(--bg);
+  border-radius: 999px; padding: .1rem .5rem;
+}
+/* 当前步骤：running 时显示在轨下方，一行可读（SPEC 20.3）。后端已按 80 码点
+ * 截断过，前端直接显示、不再截——再截一次会在省略号中间切出半个字。 */
+.card-step {
+  display: flex; gap: .35rem; align-items: baseline;
+  font-size: .76rem; color: var(--fg-dim); margin-top: .15rem;
+  border-top: 1px solid var(--line); padding-top: .35rem;
+}
+.card-step-k { flex: none; color: var(--st-running); font-weight: 600; }
+.card-step-t { overflow-wrap: anywhere; }
+.card-fail {
+  display: flex; gap: .35rem; align-items: baseline;
+  font-size: .76rem; margin-top: .15rem;
+  border-top: 1px solid var(--line); padding-top: .35rem;
+}
+.card-fail-k { flex: none; color: var(--st-failed); font-weight: 600; }
+.card-fail-t { color: var(--fg-dim); overflow-wrap: anywhere; }
+
+/* ------------------------------------------------- 流转轨：一条地铁线
+ *
+ * 签名元素。卡片顶部一条**横向**连续线，四站对应四个主链状态，任务就是那趟车。
+ * 每站必须有圆点：缺了站就只剩一根线，读不出卡在第几站。
+ *   已过   实心点 + 那一段的线，用**它自己那一态**的颜色
+ *   当前   大一号的实心点，外圈留一圈卡片色的环（把点从线上"抬"起来 = 你在这里）
+ *   未到   空心点 + 灰色段线
+ * 失败时**只把当前站染红**，线不整条涂红。
+ */
+.rail {
+  position: relative; display: flex; align-items: center;
+  width: 100%; height: 14px; margin-bottom: .45rem;
+}
+.rail-seg {
+  position: relative; flex: 1 1 0; height: 14px;
+  display: flex; align-items: center; justify-content: center;
+}
+.rail-seg::before {
+  content: ""; position: absolute; top: 50%; left: 0; right: 0;
+  height: 2px; margin-top: -1px; border-radius: 1px;
+  background: var(--line, var(--border));
+}
+/* 线不伸出两端 */
+.rail-seg:first-child::before { left: 50%; }
+.rail-seg:last-child::before { right: 50%; }
+
+.rail-seg.past { --line: var(--seg); --line-weak: var(--seg); }
+.rail-seg.future { --line: var(--border); }
+
+.rail-dot { position: relative; display: block; }
+.rail-seg.past .rail-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--dot);
+}
+.rail-seg.future .rail-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--card); box-shadow: inset 0 0 0 1.5px var(--fg-dim);
+}
+.rail-seg.now .rail-dot {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--dot);
+  box-shadow: 0 0 0 3px var(--card);          /* 白环把点从线上"抬"起来 */
+}
+.rail-dot { transition: transform .3s cubic-bezier(.2,.7,.3,1); }
+
+/* ------------------------------------------------- 表单（提交 / 登录 / 编辑） */
+
+.composer, .login {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0;
+  width: min(32rem, 92vw); background: var(--card); color: var(--fg);
+  box-shadow: 0 24px 64px rgba(21,32,51,.22);
+}
+.composer::backdrop, .login::backdrop { background: rgba(23,32,45,.34); }
+.composer-inner, .login-inner { padding: 1.1rem 1.2rem 1.2rem; }
+.composer-title, .login-title { font-family: var(--display); font-size: 1.05rem; margin: 0 0 .5rem; }
+.composer-lead, .login-lead { margin: 0 0 .9rem; font-size: .82rem; color: var(--fg-dim); }
+.field { display: flex; flex-direction: column; gap: .3rem; margin-bottom: .75rem; }
+.field > span { font-size: .75rem; color: var(--fg-dim); font-weight: 600; letter-spacing: .03em; }
+.field input, .field textarea {
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .45rem .6rem;
+  width: 100%;
+}
+.field input:focus, .field textarea:focus { border-color: var(--accent); background: var(--card); }
+.field textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
+.composer-actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+.composer-actions .primary {
+  background: var(--accent); color: #fff; border: 0;
+  border-radius: var(--r-sm); padding: .45rem 1rem; font-weight: 600;
+}
+.composer-actions .secondary {
+  background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: .45rem .9rem;
+}
+.composer-actions .secondary:hover { color: var(--fg); background: var(--panel); }
+.composer-actions button:disabled, .login-inner button:disabled { opacity: .45; cursor: default; }
+.login-error {
+  margin: .1rem 0 0; font-size: .78rem; color: var(--st-failed);
+  border: 1px solid var(--st-failed); border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--st-failed) 6%, transparent);
+  padding: .35rem .55rem;
+}
+
+/* 两步确认表：中止/删除这类不可撤销的动作 */
+.confirm {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0;
+  width: min(27rem, 92vw); background: var(--card); color: var(--fg);
+  box-shadow: 0 24px 64px rgba(21,32,51,.22);
+}
+.confirm::backdrop { background: rgba(23,32,45,.34); }
+.confirm-inner { padding: 1.1rem 1.2rem 1.2rem; }
+.confirm-title {
+  font-family: var(--display); font-size: 1rem; margin: 0 0 .6rem;
+  overflow-wrap: anywhere;
+}
+.confirm-lead { margin: 0 0 .35rem; font-size: .84rem; color: var(--fg); }
+.confirm-list { margin: 0 0 .7rem; padding-left: 1.15rem; font-size: .84rem; color: var(--fg); }
+.confirm-list li { margin: .12rem 0; }
+.confirm-actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+.confirm-actions .danger {
+  background: var(--st-failed); color: #fff; border: 0;
+  border-radius: var(--r-sm); padding: .45rem 1rem; font-weight: 600;
+}
+.confirm-actions .danger:hover { background: color-mix(in srgb, var(--st-failed) 88%, #000); }
+.confirm-actions .secondary { padding: .45rem .9rem; }
+
+/* ------------------------------------------------------------------ 抽屉
+ *
+ * 点卡片 = 右侧抽屉。**默认只读**：用户明确纠正过「默认就是编辑模式，
+ * 跟调试模式似的」。详情是给人读的，不是给人填的。
+ */
+
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(30rem, 44vw);
+  background: var(--card);
+  border-left: 1px solid var(--border);
+  box-shadow: -12px 0 40px rgba(21,32,51,.12);
+  overflow-y: auto; z-index: 20;
+  transition: width .18s ease;
+}
+/* 全屏：读长需求说明时窄栏要来回横竖滚。全屏态下内容仍收在居中的阅读列里
+ * ——铺满 1280px 一行中文难换行，区块头的「编辑」也会远到看不见对应关系。 */
+.drawer.is-full { width: 100%; box-shadow: none; }
+/* 52rem 不是随手取的：再宽一行中文就长到难换行。 */
+.drawer.is-full .drawer-inner { max-width: 52rem; margin: 0 auto; }
+.drawer-inner { padding: 1rem 1.1rem 2rem; position: relative; }
+
+.drawer-bar { position: sticky; top: 0; z-index: 2; display: flex; gap: .15rem; justify-content: flex-end; margin: -.2rem -.25rem .1rem 0; }
+.drawer-icon {
+  background: transparent; color: var(--fg-dim);
+  border: 0; font-size: 1rem; line-height: 1; padding: .25rem .45rem;
+  border-radius: 4px; cursor: pointer;
+}
+.drawer-icon:hover { color: var(--fg); background: var(--panel); }
+.drawer-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.drawer-title { font-size: 1.15rem; margin: 0 0 .25rem; font-weight: 650; overflow-wrap: anywhere; letter-spacing: -.01em; }
+.drawer-sub { display: flex; gap: .5rem; align-items: center; color: var(--fg-dim); margin-bottom: .2rem; flex-wrap: wrap; }
+.drawer-id { font-family: var(--mono); font-size: .75rem; }
+.drawer-status { font-weight: 600; font-size: .78rem; padding: .1rem .45rem; border-radius: 999px; }
+/* 抽屉顶部的流转轨：和卡片上同一条线，只是宽一点。 */
+.drawer-rail { margin: .55rem 0 .2rem; }
+
+/* ------------------------------------------------------------------ 分区
+ *
+ * 区块头 = 小标题 + 右侧动作（编辑）同一行两端对齐。
+ * 每个区块有「只读 / 编辑」两态，点标题右侧那个小字「编辑」才进编辑态，
+ * 存完回只读。中止/下载这类是**动作不是字段**，常驻显示。
+ */
+.sec { margin-top: 1.6rem; }
+.sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; }
+.sec-h { font-size: .72rem; color: var(--fg-dim); margin: 0; font-weight: 600; letter-spacing: .06em; }
+.sec-slot { min-width: 0; }
+
+/* 只读态下的小字「编辑」：默认几乎隐形，hover 才显形，不抢内容的注意力。 */
+.mini {
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid transparent; border-radius: var(--r-sm);
+  font-size: .72rem; padding: .12rem .4rem; cursor: pointer; margin: -.12rem 0;
+}
+.mini:hover { color: var(--fg); background: var(--panel); border-color: var(--border); }
+.mini:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* .eb-edit 设了 display:flex，与 [hidden] 同特异性且写在后面 ——
+ * 只靠文件开头那条全局 [hidden] 会被它整条盖掉，"存完回只读"时 textarea
+ * 仍在可见，页面上同一段内容出现两次。伴生规则特异性 0,2,0，必胜。 */
+.eb-edit { display: flex; flex-direction: column; }
+.eb-view[hidden], .eb-edit[hidden] { display: none; }
+.eb-actions { display: flex; gap: .35rem; margin-top: .45rem; }
+.eb-actions .primary {
+  background: var(--accent); color: #fff; border: 0;
+  border-radius: var(--r-sm); padding: .32rem .85rem; font-weight: 600;
+}
+.eb-actions .secondary {
+  background: transparent; color: var(--fg-dim); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: .32rem .7rem;
+}
+.eb-actions .secondary:hover { color: var(--fg); background: var(--panel); }
+.eb-actions button:disabled { opacity: .45; cursor: default; }
+
+.eb-input, .drawer-body-edit {
+  width: 100%; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: .4rem .55rem; font: inherit;
+}
+.eb-input:focus, .drawer-body-edit:focus { border-color: var(--accent); background: var(--card); outline: none; }
+.drawer-body-edit {
+  resize: vertical; line-height: 1.55; min-height: 4.6rem;
+  overflow: hidden;              /* 自动增高后不该再拖出内部滚动条 */
+}
+
+/* 只读正文：行高给足，中文长段落也不挤 */
+.body-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; color: var(--fg); font-size: .9rem; }
+.field-empty { margin: 0; color: var(--fg-dim); font-size: .82rem; }
+.kv { display: flex; flex-direction: column; gap: .5rem; }
+.kv-row { display: flex; flex-direction: column; gap: .1rem; }
+.kv-label { font-size: .72rem; color: var(--fg-dim); }
+.kv-value { font-size: .84rem; color: var(--fg); overflow-wrap: anywhere; }
+.kv-value.is-mono { font-family: var(--mono); font-size: .78rem; }
+.kv-value.is-empty { color: var(--fg-dim); font-style: italic; }
+.kv-value.is-bad { color: var(--st-failed); }
+
+/* 芯片：标签与状态共用一套语汇，状态芯片直接染该状态的颜色——和看板列头、
+ * 时间线上的状态点说同一件事。 */
+.chip-row { display: flex; flex-wrap: wrap; gap: .3rem; }
+.chip {
+  display: inline-flex; align-items: center; font-size: .74rem;
+  padding: .1rem .45rem; border-radius: 999px;
+  background: var(--panel); border: 1px solid var(--border); color: var(--fg-dim);
+}
+.chip-queued    { color: var(--st-queued);    border-color: color-mix(in srgb, var(--st-queued) 40%, transparent); }
+.chip-running   { color: var(--st-running);   border-color: color-mix(in srgb, var(--st-running) 40%, transparent); }
+.chip-packaging { color: var(--st-packaging); border-color: color-mix(in srgb, var(--st-packaging) 40%, transparent); }
+.chip-done      { color: var(--st-done);      border-color: color-mix(in srgb, var(--st-done) 40%, transparent); }
+.chip-failed    { color: var(--st-failed);    border-color: color-mix(in srgb, var(--st-failed) 40%, transparent); }
+.chip-none { color: var(--fg-dim); }
+
+/* 动作条：中止 / 下载。它们是**动作不是字段**，所以常驻可见——
+ * 高频动作要一眼可点（SPEC 20.5）。 */
+.action-row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
+.btn {
+  border-radius: var(--r-sm); padding: .38rem .85rem; font-weight: 600;
+  border: 1px solid var(--border); background: var(--card); color: var(--fg);
+}
+.btn:hover { background: var(--lift); }
+.btn-warn { color: var(--st-failed); border-color: var(--st-failed); background: transparent; }
+.btn-warn:hover { background: color-mix(in srgb, var(--st-failed) 8%, transparent); }
+.btn-primary { background: var(--st-done); color: #fff; border-color: var(--st-done); }
+.btn-primary:hover { filter: brightness(1.06); }
+.btn:disabled { opacity: .45; cursor: default; }
+.action-note { color: var(--fg-dim); font-size: .78rem; }
+
+/* ------------------------------------------------------------------ 危险区
+ *
+ * 删除单独占一块、上面一条分隔线，和「中止」「下载」这类高频动作隔开。
+ * 它是小字链接而不是大红按钮：要不难找，但绝不能和高频动作长得像。
+ */
+.danger-zone {
+  margin-top: 2rem; padding-top: .9rem; border-top: 1px solid var(--line);
+}
+.danger-link {
+  background: transparent; border: 0; padding: .2rem 0; cursor: pointer;
+  color: var(--fg-dim); font-size: .78rem; text-decoration: underline;
+  text-underline-offset: 3px; text-decoration-color: color-mix(in srgb, var(--fg-dim) 45%, transparent);
+}
+.danger-link:hover { color: var(--st-failed); text-decoration-color: var(--st-failed); }
+.danger-link:focus-visible { outline: 2px solid var(--st-failed); outline-offset: 2px; border-radius: 2px; }
+.danger-link:disabled { opacity: .45; cursor: default; text-decoration: none; }
+
+/* --------------------------------------------- 时间线：活动流，不是日志表
+ *
+ * 一条竖线 + 一个点，主文本在上、时间与操作人在下。
+ * 两条硬要求：
+ *   1. **不裸露字段名**——服务端 `edited` 的 message 是「修改了：brief」，
+ *      服务端中文是 API 契约不能改，所以翻译放在显示层（FIELD_CN）。
+ *   2. 状态跃迁渲染成**状态芯片**，而不是纯文字箭头。
+ * 竖线用 li::before 画，最后一条不画，否则会在最后一个点底下拖一截无意义的线。
+ */
+.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.tl-item {
+  position: relative; display: grid; grid-template-columns: .8rem 1fr;
+  gap: .55rem; padding: 0 0 .95rem;
+}
+.tl-item::before {
+  content: ""; position: absolute; left: .32rem; top: .5rem; bottom: -.1rem;
+  width: 1px; background: var(--line);
+}
+.tl-item:last-child::before { display: none; }
+.tl-item:last-child { padding-bottom: 0; }
+.tl-dot {
+  width: .68rem; height: .68rem; border-radius: 50%; margin-top: .3rem;
+  background: var(--card); border: 2px solid var(--border);
+}
+.tl-created .tl-dot { border-color: var(--st-queued); }
+.tl-status  .tl-dot { border-color: var(--accent); background: var(--accent); }
+.tl-note    .tl-dot { border-color: var(--st-packaging); }
+.tl-package .tl-dot { border-color: var(--st-done); background: var(--st-done); }
+.tl-error   .tl-dot { border-color: var(--st-failed); background: var(--st-failed); }
+.tl-edited  .tl-dot { border-color: var(--border); }
+.tl-step    .tl-dot { border-color: var(--st-running); }
+
+.tl-main { min-width: 0; }
+.tl-line { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem; font-size: .84rem; line-height: 1.5; }
+.tl-what { color: var(--fg); overflow-wrap: anywhere; }
+.tl-arrow { color: var(--fg-dim); font-size: .74rem; }
+.tl-meta { color: var(--fg-dim); font-size: .72rem; margin-top: .1rem; font-family: var(--mono); }
+.tl-empty { color: var(--fg-dim); font-size: .82rem; }
+
+/* ------------------------------------------------------------------ 读数失败的兜底 */
+
+.board-msg {
+  margin: .7rem 1.1rem 0; border-radius: var(--r-sm); padding: .45rem .65rem;
+  font-size: .78rem; border: 1px solid var(--border); background: var(--panel); color: var(--fg-dim);
+}
+.board-msg.is-bad { color: var(--st-failed); border-color: var(--st-failed); background: color-mix(in srgb, var(--st-failed) 6%, transparent); }
+.board-msg.is-warn { color: var(--st-running); border-color: var(--st-running); }
+.board-msg.is-ok { color: var(--st-done); border-color: var(--st-done); }
+.drawer-msg {
+  margin: .6rem 0 0; border-radius: var(--r-sm); padding: .45rem .65rem;
+  font-size: .78rem; border: 1px solid var(--border); background: var(--panel); color: var(--fg-dim);
+}
+.drawer-msg.is-bad { color: var(--st-failed); border-color: var(--st-failed); background: color-mix(in srgb, var(--st-failed) 6%, transparent); }
+.drawer-msg.is-warn { color: var(--st-running); border-color: var(--st-running); }
+/* 保存成功也走同一块提示区：只有失败可见的话，用户会以为按钮没生效 */
+.drawer-msg.is-ok { color: var(--st-done); border-color: var(--st-done); }
+.drawer-error { color: var(--st-failed); }
+/* 抽屉本身与两条提示条都靠 hidden 开关，display 规则旁边必须各配一条伴生规则 */
+.drawer[hidden], .drawer-msg[hidden], .board-msg[hidden], .login-error[hidden] { display: none; }
+
+/* 动效只做一处（流转轨滑动），其余不加；并全部服从 prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
