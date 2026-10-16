@@ -554,6 +554,23 @@ def _package_one(task_id: int) -> None:
         _fail_task(task_id, "打包过程出错，详见服务端日志")
         return
 
+    # **写 done 之前必须重读一次状态。** 20 GB 的 zip 可能压好几分钟，用户在这期间
+    # 点中止（跑在 public app 那个进程里）是完全正常的。不重读就会把 failed 覆盖回
+    # done——用户刚点完中止，任务却变成"已完成"，中止被静默撤销。
+    # 失败路径已经有一道同款闸（_fail_task），成功路径漏了，两边不对称。
+    try:
+        current = store.get_task(task_id, is_admin=True)
+    except Exception:                                   # noqa: BLE001
+        log.exception("读任务 %s 失败，跳过收口", task_id)
+        return
+    if current.get("status") in db.TERMINAL_STATUSES:
+        # 已经被中止/失败盖住了：结果包留着（管理员确认后可以走 repack 重打），
+        # 但绝不改成 done。
+        log.info("任务 %s 在打包期间已进入终态（%s），不再改写为 done",
+                 task_id, current.get("status"))
+        sse.notify()
+        return
+
     try:
         store.update_task(task_id, package_path=str(out))
         store.set_status(task_id, "done", actor="system",
