@@ -408,12 +408,75 @@ def test_run_record_removed_when_agent_exits_normally(make_disp, make_task, tmp_
 
 
 def test_run_record_absent_before_any_dispatch(make_disp):
-    """防的回归：恢复在没有遗留记录时乱动。
+    """防的回归：恢复在没有遗留记录**也没有 running 行**时乱动。
 
     库里没有 running、磁盘没有记录 → 恢复必须是零成本的空转，不能凭空造事件。
     """
     d = make_disp()
     summary = d.recover()
     assert summary == {"candidates": 0, "settled": [], "killed": [],
-                       "left_alone": [], "errors": []}
+                       "left_alone": [], "errors": [], "no_record": 0}
     assert not d.run_dir.exists() or not list(d.run_dir.glob("*.json"))
+
+
+# ------------------------------------- 库里 running、磁盘没有记录（补扫那一路）
+
+
+def test_running_without_record_is_settled_not_left_stuck(make_disp, make_task):
+    """库里 running + 磁盘无记录 = 永久卡死，必须被补扫收尾。
+
+    这一路原先完全没有：`recover()` 只遍历 `run/<id>.json`，而 pid 只存在那儿，
+    于是没有记录的任务被整轮漏掉——用户永远看着"计算中"。
+    两个真实来源：派活途中在 claim_queued 与写记录之间崩了；
+    以及本次修复**之前**派出去的老任务（实测本机数据盘上就有四条）。
+
+    这一路**不杀任何进程**：没有记录就没有 pid，猜 pid 去杀，撞上 PID 复用
+    就是在杀无关程序。所以只收状态，并把"杀不了"如实写进原因里。
+    """
+    d = make_disp()
+    task = make_task()
+    store.set_status(task["id"], "running", actor="system")
+    assert not dispatcher._record_path(d.run_dir, task["id"]).exists()
+
+    summary = d.recover()
+
+    after = store.get_task(task["id"], is_admin=True)
+    assert after["status"] == "failed", "无记录的任务被留在 running 上，永久卡死"
+    assert summary["no_record"] == 1, summary
+    assert summary["killed"] == [], "没有 pid 就不该声称杀过任何东西"
+    assert "运行记录" in (after["error"] or ""), after["error"]
+    assert "无法确认计算进程" in (after["error"] or ""), \
+        "杀不了 pid 这件事要如实告诉用户，不能让人以为进程被清了"
+    # 不能凭空说成崩溃——那是一条不存在的事故
+    texts = [e["message"] for e in store.list_events(task["id"])]
+    assert not any("异常结束" in t for t in texts), texts
+
+
+def test_recordless_sweep_leaves_untouched_tasks_alone(make_disp, make_task):
+    """补扫只动 running；queued / done / failed 一律不碰。"""
+    d = make_disp()
+    queued = make_task()
+    done = make_task()
+    store.set_status(done["id"], "running", actor="system")
+    store.set_status(done["id"], "done", actor="system")
+
+    summary = d.recover()
+
+    assert store.get_task(queued["id"], is_admin=True)["status"] == "queued"
+    assert store.get_task(done["id"], is_admin=True)["status"] == "done"
+    assert summary["no_record"] == 0, summary
+
+
+def test_recordless_sweep_yields_when_another_instance_holds_the_claim(
+        make_disp, make_task):
+    """两个实例同时启动，只有一个能收尾那条无记录任务。"""
+    d1, d2 = make_disp(), make_disp()
+    task = make_task()
+    store.set_status(task["id"], "running", actor="system")
+    assert dispatcher._claim(d1.run_dir, task["id"], dispatcher._NO_RECORD)
+
+    summary = d2.recover()
+
+    assert summary["no_record"] == 0, summary
+    assert summary["left_alone"] == [task["id"]], summary
+    assert store.get_task(task["id"], is_admin=True)["status"] == "running"

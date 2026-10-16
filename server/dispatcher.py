@@ -94,9 +94,10 @@ RUN_DIRNAME = "run"                 # 运行态记录目录。**不放 logs/**�
 RECOVER_BUDGET = 20.0               # 恢复一轮的总时限（秒）。杀进程树可能卡在
                                     # taskkill 上，不能让 N 个孤儿把启动拖成 N×15 秒。
 PID_REUSE_SLACK = 2.0               # 进程创建时间允许的误差（秒）
-
 #: _abort_signal 回看末尾多少条事件去找"进终态那条"。见那里的说明。
 _ABORT_LOOKBACK = 200
+#: 无记录补扫用的哨兵 run_id。固定值 = 两个实例补扫同一个任务会抢同一个锁。
+_NO_RECORD = "no-record"
 
 _INTERNAL_ENV = "PROTFORGE_WEB_INTERNAL"
 _MAX_CONCURRENCY_ENV = "PROTFORGE_WEB_MAX_CONCURRENCY"
@@ -837,7 +838,7 @@ class Dispatcher:
         不能让 N 个孤儿把启动拖成 N×15 秒。
         """
         summary = {"candidates": 0, "settled": [], "killed": [],
-                   "left_alone": [], "errors": []}
+                   "left_alone": [], "errors": [], "no_record": 0}
         self.last_recovery = summary
         try:
             records = self._run_records()
@@ -845,10 +846,17 @@ class Dispatcher:
             log.exception("读取运行态记录失败，跳过重启恢复")
             return summary
         summary["candidates"] = len(records)
+        # 两条路共用一个时限：记录路要先跑，补扫路必须接着在同一个预算里。
+        # 所以它在早退分支**之前**就定下来。
+        deadline = time.monotonic() + RECOVER_BUDGET
+        seen: set = set()
         if not records:
+            # **没有记录不等于没有遗留任务**，见 _recover_recordless 的说明。
+            # 这里不能直接 return——库里还挂着 running 的行时，磁盘上没记录，
+            # 但那些任务同样永远没人收尾。
+            self._recover_recordless(summary, deadline, known=seen)
             return summary
         log.info("重启恢复：发现 %s 条遗留 running 记录", len(records))
-        deadline = time.monotonic() + RECOVER_BUDGET
         for task_id, record in records:
             if self._stopping:
                 break
@@ -863,9 +871,13 @@ class Dispatcher:
             except Exception:                     # noqa: BLE001 - 单条失败不带走整轮
                 log.exception("恢复遗留任务 %s 失败", task_id)
                 summary["errors"].append(task_id)
-        log.info("重启恢复结束：收尾 %s、清理孤儿 %s、放过 %s、出错 %s",
+            finally:
+                # 记下来，补扫要靠它避开已经走完记录这条路的任务
+                seen.add(task_id)
+        self._recover_recordless(summary, deadline, known=seen)
+        log.info("重启恢复结束：收尾 %s、清理孤儿 %s、无记录收尾 %s、放过 %s、出错 %s",
                  len(summary["settled"]), len(summary["killed"]),
-                 len(summary["left_alone"]), len(summary["errors"]))
+                 summary["no_record"], len(summary["left_alone"]), len(summary["errors"]))
         return summary
 
     def _run_records(self) -> list:
@@ -895,6 +907,75 @@ class Dispatcher:
                 continue
             out.append((task_id, rec))
         return out
+
+    def _recover_recordless(self, summary: dict, deadline: float,
+                            known: set) -> None:
+        """收尾「库里是 running、磁盘上却没有运行态记录」的任务。
+
+        为什么这一路必须单独存在
+        ----------------------
+        :meth:`recover` 遍历的是 ``run/<id>.json``，因为 pid 只存在那儿。
+        于是「库里 running + 没有记录」这一类会**整轮被漏掉**，任务永远停在
+        「计算中」。这不是理论情况，两个来源：
+
+        1. **派活途中崩了**：``claim_queued`` 把 queued 改成 running 之后、
+           ``_spawn`` 写运行态记录之前有个窗口，进程在这个窗口里死掉，库就留下
+           一条 running 而磁盘上没有对应记录。
+        2. **本次修复之前派出去的任务**：记录机制是后加的，老任务的 running 行
+           天生没有记录（实测本机数据盘上就有四条）。
+
+        这类任务**没有 pid 可杀**——记录是 pid 的唯一来源，没有它就不该猜：
+        猜 pid 去杀，撞上 PID 复用就是在杀无关程序。所以这里只做状态收尾，
+        不动手，并把「为什么杀不了」如实写进原因里。
+
+        抢锁用的是同一个 ``_claim``，哨兵 run_id 固定成 :data:`_NO_RECORD`，
+        于是两个实例补扫同一个任务时只有一方会动手。
+        """
+        try:
+            rows = store.list_tasks(status="running", is_admin=True, limit=500)
+        except Exception:                             # noqa: BLE001 - 库不可达就跳过
+            log.exception("读取 running 任务失败，跳过无记录补扫")
+            return
+
+        orphans = [int(r["id"]) for r in rows
+                   if int(r["id"]) not in self.running
+                   and int(r["id"]) not in known]
+        if not orphans:
+            return
+        log.info("重启恢复：另有 %s 条 running 任务没有运行态记录，一并收尾", len(orphans))
+
+        for task_id in orphans:
+            if self._stopping or time.monotonic() > deadline:
+                summary["left_alone"].append(task_id)
+                continue
+            if not _claim(self.run_dir, task_id, _NO_RECORD):
+                log.info("任务 %s 正被另一个实例补扫，让开", task_id)
+                summary["left_alone"].append(task_id)
+                continue
+            try:
+                # 锁内复核两件事，缺一不可：
+                #  1) 库里仍然是 running —— 期间可能已被用户中止或被上一条命收尾；
+                #  2) 磁盘上仍然没有记录 —— 期间可能刚被另一个实例派活出去，
+                #     那时它有 pid、要杀要验身份，不归这一路管（也不能去砸它）。
+                if _db_status(task_id) != "running":
+                    summary["left_alone"].append(task_id)
+                    continue
+                if _record_path(self.run_dir, task_id).exists():
+                    log.info("任务 %s 刚被派出去且已有运行态记录，补扫让开", task_id)
+                    summary["left_alone"].append(task_id)
+                    continue
+                self._mark_failed(
+                    task_id,
+                    "服务重启前未留下运行记录，无法确认计算进程是否还在，"
+                    "已按中断处理；如需重跑请重新提交")
+                store.add_event(task_id, "log", "system",
+                                "服务重启时这个任务处于运行中，但磁盘上没有对应的运行态"
+                                "记录（派活途中可能中断，或该任务早于运行记录机制）")
+                summary["settled"].append(task_id)
+                summary["no_record"] += 1
+            except Exception:                         # noqa: BLE001 - 单条不带走整轮
+                log.exception("补扫无记录任务 %s 失败", task_id)
+                summary["errors"].append(task_id)
 
     def _recover_one(self, task_id: int, record: dict, summary: dict) -> None:
         """收尾一条遗留记录。判断顺序是有讲究的，从便宜到贵、从安全到动手。"""
