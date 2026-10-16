@@ -133,9 +133,9 @@ def _install_common(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request, exc):
-        return JSONResponse(status_code=exc.status_code,
-                            content={"detail": _HTTP_DETAIL.get(
-                                exc.status_code, str(exc.detail))})
+        detail = (str(exc.detail) if isinstance(exc, PreciseHTTPException)
+                  else _HTTP_DETAIL.get(exc.status_code, str(exc.detail)))
+        return JSONResponse(status_code=exc.status_code, content={"detail": detail})
 
     @app.get("/api/health")
     def health():
@@ -217,6 +217,25 @@ class EventIn(BaseModel):
     # agent 冒充它们就能自己宣布任务完成。
     kind: Literal["log", "note", "error"] = "log"
     message: str = Field(default="", max_length=8000)
+
+
+class PreciseHTTPException(HTTPException):
+    """detail 原样返回，不被 _HTTP_DETAIL 的通用话覆盖。
+
+    只给**我们自己写的**具体原因用。框架层抛的（路由不存在、方法不对）仍旧走
+    _HTTP_DETAIL 映射。绝不要给这个类塞 401/403/400/503 的默认条目来"省事"——
+    那正是它存在的理由要避免的事。
+    """
+
+
+class RpcCmdIn(BaseModel):
+    """管理员面板 -> 内部通道。与 admin/app_admin.py 的 RpcIn 同形，两边独立定义。"""
+
+    command: str = Field(min_length=1, max_length=32)
+    message: str = Field(default="", max_length=4000)
+    model: str = Field(default="", max_length=200)
+    provider: str = Field(default="", max_length=64)
+    thinking_level: str = Field(default="", max_length=64)
 
 
 class FinishIn(BaseModel):
@@ -745,6 +764,62 @@ def create_internal_app() -> FastAPI:
                             f"计算进程自报产物：{names}{more}")
         sse.notify()
         return _detail(updated)
+
+    # 干预命令白名单。面板是值班台，不该成为往计算进程里塞任意命令的口子——
+    # 白名单与 admin/app_admin.py 的 RPC_COMMANDS 保持一致，但**独立**：面板那边
+    # 是它自己的边界，这里是内网通道的边界，两道闸不合并。
+    _RPC_COMMANDS = ("steer", "follow_up", "abort", "set_model", "set_thinking_level")
+
+    @app.post("/api/internal/admin/rpc/{task_id}")
+    def admin_rpc(task_id: int, body: RpcCmdIn, user=Depends(auth.require_admin)):
+        """把一条干预命令送进计算进程（spec §8.1 的 RPC 闭环）。
+
+        这一层做的是**形状翻译**：面板发的是 ``{"command": "steer", "message": ...}``，
+        agent 认的是 ``{"type": "steer", "message": ...}``，中间就差这一段。
+        """
+        command = (body.command or "").strip()
+        if command not in _RPC_COMMANDS:
+            raise PreciseHTTPException(400, f"不支持的干预命令：{command}")
+        store.get_task(task_id, is_admin=True)
+
+        disp = getattr(app.state, "dispatcher", None)
+        if disp is None:
+            raise PreciseHTTPException(503, "调度器没有运行，无法干预计算进程")
+
+        # abort 直接杀进程树，不透传给 agent。面板上那个按钮的意思是"停掉这个计算"，
+        # 不是"让当前这轮回答先说完"——留着进程继续烧 GPU 比多等几秒优雅重要。
+        if command == "abort":
+            stopped = disp.abort(task_id, reason="管理员中止")
+            sse.notify()
+            return {"ok": True, "result": {"aborted": bool(stopped)}}
+
+        if command in ("steer", "follow_up"):
+            text = (body.message or "").strip()
+            if not text:
+                raise PreciseHTTPException(400, "干预内容不能为空")
+            wire = {"type": command, "message": text}
+        elif command == "set_model":
+            model = (body.model or "").strip()
+            if not model:
+                raise PreciseHTTPException(400, "模型名不能为空")
+            wire = {"type": "set_model",
+                    "provider": (body.provider or "").strip() or dispatcher.LLM_PROVIDER_ID,
+                    "modelId": model}
+        else:                                                   # set_thinking_level
+            level = (body.thinking_level or "").strip()
+            if not level:
+                raise PreciseHTTPException(400, "思考档位不能为空")
+            wire = {"type": "set_thinking_level", "level": level}
+
+        try:
+            result = disp.rpc(task_id, wire)
+        except dispatcher.AgentGone:
+            raise PreciseHTTPException(
+                409, "计算进程已经不在了，干预命令没有发出去") from None
+        except dispatcher.RpcTimeout:
+            raise PreciseHTTPException(504, "计算进程没有在期限内回应") from None
+        sse.notify()
+        return {"ok": True, "result": result}
 
     @app.post("/api/internal/admin/repack/{task_id}")
     def repack(task_id: int, user=Depends(auth.require_admin)):
