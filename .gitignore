@@ -1,0 +1,21 @@
+# 数据目录：数据库、上传、工作区、产物包、日志。全部内容都在这里，
+# 不入版本库（与 creative-panel 同纪律）。备份就是整个拷走。
+data/
+
+# agent 依赖
+agent/node_modules/
+
+# 本机配置与密钥：MCP 的 API key 只从环境变量读，任何形态的本地密钥文件
+# 都不该进仓库（.env / *.local.json 之类）。
+*.env
+*.local.json
+agent/config.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 编辑器
+.vscode/
+.idea/
