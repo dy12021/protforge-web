@@ -53,19 +53,19 @@ _TIMEOUT_BY_SKILL: dict[str, int] = {
     "bindcraft": TIMEOUT_SLOW_S,
     "gromacs": TIMEOUT_SLOW_S,
     "proteinmpnn": TIMEOUT_SLOW_S,
-    # TODO(实测): pesto —— 14400s 是**猜的**，未跑真实任务计时。
-    #   猜短了会腰斩正常的 pesto 流程；猜长了挂死的任务要等 4h 才收口。
-    #   待 Task 13 用一次真实 pesto 任务实测后改，并在此处写明实测依据。
-    "pesto": DEFAULT_TIMEOUT_S,
-    # TODO(实测): esm —— 14400s 是**猜的**，未跑真实任务计时。
-    #   ESM-2/ESMFold 类推理时长随序列长度和模型规格浮动很大，猜错两个方向都会出事：
-    #   猜短了正常的 ESM-2 运行会被腰斩，猜长了挂死任务要等 4h 才收口。
-    #   待 Task 13 用一次真实 esm 任务实测后改，并在此处写明实测依据。
-    "esm": DEFAULT_TIMEOUT_S,
+    # 实测（2026-10-16 本机，Docker 已起、容器已热）：
+    #   pesto  1ubq.pdb（76 残基）        16.6 s  -> 11 hotspots，STATUS: OK
+    #   esm    1ubq 序列（73 残基）embed  36.9 s  -> dim=1280，STATUS: OK
+    # 这两个数是热容器 + 小输入，所以不拿它们当上限（esm 喂 2000 残基是这里的
+    # 27 倍），只用来定档：原来都挂在 DEFAULT_TIMEOUT_S(4h) 上，那个值是猜的，
+    # 代价是挂死任务占着并发名额和一张卡干等 4 小时。降到 MED 档——比实测宽两个
+    # 数量级，收口时间砍一半。
+    "pesto": TIMEOUT_MED_S,
+    "esm": TIMEOUT_MED_S,
 }
 
 # 档位未经验证的技能，供上层在 UI/日志上标出来，别让人当成实测值引用。
-UNVERIFIED_TIMEOUTS = frozenset({"pesto", "esm"})
+UNVERIFIED_TIMEOUTS = frozenset()      # pesto / esm 已于 2026-10-16 实测并归档
 
 _PREFIX = "protforge-"
 _WSL_RE = re.compile(r"wsl\.exe\s+-d", re.IGNORECASE)

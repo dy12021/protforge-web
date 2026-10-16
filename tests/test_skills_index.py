@@ -158,11 +158,17 @@ def test_unknown_skill_gets_default_timeout():
     assert timeout_for("完全不存在的技能") == 14400
 
 
-def test_pesto_and_esm_flagged_as_unverified():
-    """pesto / esm 的档位是猜的，必须留在表里可见，且能被上层查到未验证标记。"""
-    assert timeout_for("pesto") in (600, 7200, 28800, 14400)
-    assert timeout_for("esm") in (600, 7200, 28800, 14400)
-    assert skills_index.UNVERIFIED_TIMEOUTS == frozenset({"pesto", "esm"})
+def test_pesto_and_esm_timeouts_are_measured():
+    """pesto / esm 已于 2026-10-16 实测（pesto 16.6 s / esm 36.9 s），档位归 MED。
+
+    它们**必须**退出 UNVERIFIED_TIMEOUTS：那个集合的用途是让上层标出"别把这个
+    当实测值引用"，实测完了还留着，比一开始就没写清楚还糟——后来人会以为没人管。
+    """
+    assert skills_index.UNVERIFIED_TIMEOUTS == frozenset()
+    assert timeout_for("pesto") == skills_index.TIMEOUT_MED_S
+    assert timeout_for("esm") == skills_index.TIMEOUT_MED_S
+    # 也不能比实测小太多：那会把大输入上的合法运行腰斩
+    assert timeout_for("esm") >= 600
 
 
 # --- 其它字段 -----------------------------------------------------------
