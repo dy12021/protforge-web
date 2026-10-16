@@ -66,14 +66,36 @@ _PARAM_LABEL = {
     "task_id": "任务编号", "status": "状态",
 }
 
-# 框架层自己抛的 HTTPException（404 路由不存在、405 方法不对……）默认 detail 是
-# 英文短语。**不要**给 401/403 配条目：那些是我们自己带中文 detail 抛的，
-# 映射表会把具体原因覆盖成一句通用话。
-_HTTP_DETAIL = {
+# **错误文案的单一来源。** admin/app_admin.py import 下面这两个名字，不要再抄一份：
+# 抄过一次就已经漂了（app 侧有 422/503、admin 侧没有，两边的注释还互相矛盾），
+# 同一个框架层错误在两个面板上显示成两句话。
+#
+# 键的含义是「**框架层自己抛的** HTTPException 默认 detail 是英文短语，翻成中文」。
+# 谁抛的决定它走不走这张表：`user_detail()` 先认我们自己的异常类，认不出才查表。
+# 所以带具体中文原因的**必须** raise PreciseHTTPException，而不是指望"这张表里
+# 没配这个码就没事"——那只是让覆盖晚点发生（下一个人给 409 补个条目，
+# 「结果包还在生成中」就静默变成「请求冲突」）。
+#
+# **401/403 刻意不配条目**：auth.py 的 Unauthorized/Forbidden 也走这条兜底，
+# 而它们没法用我们的子类（auth 被 app import，反过来会成环）。它们抛的 detail
+# 本来就是中文，原样透出即可。
+HTTP_DETAIL = {
     400: "请求不对", 404: "接口不存在", 405: "请求方法不对",
     409: "请求冲突", 413: "内容太大", 422: "请求参数不合法",
     500: "服务器内部错误", 503: "服务暂时不可用",
 }
+
+
+def user_detail(exc, own=()) -> str:
+    """把一个 StarletteHTTPException 变成一句给用户看的中文 detail。
+
+    规则只有一条：**我们自己抛的（own 里的那些类）原样返回，绝不被通用话覆盖。**
+    查表的只该是框架层兜底的那些（路由不存在、方法不对、请求体不合法）。两个面板
+    共用这一个函数，所以同一个错在两个面板上必然是同一句话。
+    """
+    if isinstance(exc, own):
+        return str(exc.detail)
+    return HTTP_DETAIL.get(exc.status_code, str(exc.detail))
 
 
 def validation_message(exc: RequestValidationError) -> str:
@@ -134,9 +156,8 @@ def _install_common(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request, exc):
-        detail = (str(exc.detail) if isinstance(exc, PreciseHTTPException)
-                  else _HTTP_DETAIL.get(exc.status_code, str(exc.detail)))
-        return JSONResponse(status_code=exc.status_code, content={"detail": detail})
+        return JSONResponse(status_code=exc.status_code,
+                            content={"detail": user_detail(exc, PreciseHTTPException)})
 
     @app.get("/api/health")
     def health():
@@ -221,11 +242,13 @@ class EventIn(BaseModel):
 
 
 class PreciseHTTPException(HTTPException):
-    """detail 原样返回，不被 _HTTP_DETAIL 的通用话覆盖。
+    """detail 原样返回，不被 HTTP_DETAIL 的通用话覆盖。
 
-    只给**我们自己写的**具体原因用。框架层抛的（路由不存在、方法不对）仍旧走
-    _HTTP_DETAIL 映射。绝不要给这个类塞 401/403/400/503 的默认条目来"省事"——
-    那正是它存在的理由要避免的事。
+    **凡是带具体中文原因的错都用这个类抛**，不管状态码在不在映射表里。表是给
+    框架层兜底用的（路由不存在、方法不对）；用它挡自己的错，等于把「结果包还在
+    生成中」交给下一个人一不小心就变成「请求冲突」。
+    admin/app_admin.py 的 PanelError 是同一个角色的另一份实现，两边都靠
+    `user_detail(exc, 自己的类)` 保住具体原因。
     """
 
 
@@ -270,6 +293,10 @@ def require_agent(task_id: int, request: Request) -> int:
     """FastAPI 依赖：校验 X-Agent-Token 与路径里的 task_id 是否同一个任务。
 
     对不上返 403 而不是 401：令牌本身是真的，只是用错了地方。
+
+    这里（以及 login 的 401）用普通 HTTPException 而不是 PreciseHTTPException 是
+    有意的：401/403 不在 HTTP_DETAIL 里，原样透出，detail 保住。**哪天有人给
+    401 补了表条目，这两处要一起换成 PreciseHTTPException**。
     """
     raw = (request.headers.get("X-Agent-Token") or "").strip()
     if not raw:
@@ -373,7 +400,7 @@ def create_public_app() -> FastAPI:
         task = store.get_task(task_id, owner_id=user["id"],
                               is_admin=user["role"] == "admin")
         if task["status"] in db.TERMINAL_STATUSES:
-            raise HTTPException(
+            raise PreciseHTTPException(
                 422, f"任务已经{db.STATUS_LABEL.get(task['status'])}了，不能再中止")
         updated = store.set_status(task_id, "failed", actor="human",
                                    message="用户中止了任务")
@@ -422,24 +449,24 @@ def create_public_app() -> FastAPI:
         task = store.get_task(task_id, owner_id=user["id"],
                               is_admin=user["role"] == "admin")
         if task["status"] not in db.TERMINAL_STATUSES:
-            raise HTTPException(409, "结果包还在生成中，任务完成后才能下载")
+            raise PreciseHTTPException(409, "结果包还在生成中，任务完成后才能下载")
         raw = (task.get("package_path") or "").strip()
         if not raw:
-            raise HTTPException(409, "这个任务还没有可下载的结果包")
+            raise PreciseHTTPException(409, "这个任务还没有可下载的结果包")
         try:
             # **不能是 guards.resolve()**：生产打包写在 data\packages\task_<id>.zip，
             # 而 resolve() 认的是 agent 的四个区域（work/uploads/outputs/inputs），
             # packages 不在里面——于是每个真实任务点下载都恒 409，包生成了、用户
-            # 永远拿不到，测试全绿是因为夹具写的是 work 区里一个生产中不存在的布局。
+            # 永远拿不到，测试全绿是因为夹具写的是 work 区里一个生产上不存在的布局。
             # resolve_package() 只认本任务自己的那一个文件，顺带把 inputs/outputs/
             # work 里的任意文件也堵了（原来 write=False 是放行它们的）。
             real = guards.resolve_package(task_id, raw)
         except guards.Violation:
             # 越界（package_path 被写坏或指向别处）一律当"没有包"，
             # 不把文件系统布局透出去。
-            raise HTTPException(409, "结果包不在允许的目录里，无法下载")
+            raise PreciseHTTPException(409, "结果包不在允许的目录里，无法下载")
         if not real.is_file():
-            raise HTTPException(409, "结果包文件不见了")
+            raise PreciseHTTPException(409, "结果包文件不见了")
         return FileResponse(real, filename=real.name, media_type="application/zip")
 
     # 用户面板前端挂在**最后**，且只放行这三个文件。
@@ -456,7 +483,7 @@ def create_public_app() -> FastAPI:
     @app.get("/")
     def user_ui():
         if not (WEB_DIR / "index.html").is_file():
-            raise HTTPException(404, "用户面板前端文件缺失")
+            raise PreciseHTTPException(404, "用户面板前端文件缺失")
         return FileResponse(WEB_DIR / "index.html", media_type="text/html")
 
     @app.get("/favicon.ico")
@@ -469,10 +496,10 @@ def create_public_app() -> FastAPI:
     @app.get("/{asset}")
     def user_asset(asset: str):
         if asset not in USER_UI_FILES:
-            raise HTTPException(404, "页面不存在")
+            raise PreciseHTTPException(404, "页面不存在")
         f = WEB_DIR / asset
         if not f.is_file():
-            raise HTTPException(404, "页面不存在")
+            raise PreciseHTTPException(404, "页面不存在")
         # 静态资源不该被中途改掉：前端文件没有版本号，缓存一旧就白屏
         return FileResponse(f, headers={"Cache-Control": "no-cache"})
 
@@ -764,7 +791,7 @@ def create_internal_app() -> FastAPI:
         # 闸门看 finished 标记，不只看状态：状态已经不由 finish 决定了，
         # 只拿终态去判会把第二次 finish 放进来。
         if store.has_finished(task_id) or task["status"] in db.TERMINAL_STATUSES:
-            raise HTTPException(422, "任务已经结束，不能重复收口")
+            raise PreciseHTTPException(422, "任务已经结束，不能重复收口")
         # 给了 error 就判失败：agent 自己报的失败要能落进时间线，
         # 但只有 system/调度器才允许把任务推上 done。
         if body.error:
@@ -894,7 +921,7 @@ def create_internal_app() -> FastAPI:
         """
         task = store.get_task(task_id, is_admin=True)
         if task["status"] not in ("failed", "packaging"):
-            raise HTTPException(
+            raise PreciseHTTPException(
                 409, f"任务现在是{db.STATUS_LABEL.get(task['status'], task['status'])}，"
                      "不需要重新打包")
         store.update_task(task_id, error="")

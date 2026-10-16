@@ -10,9 +10,11 @@
    `/api/internal/admin/rpc/{task_id}` 与 `/api/internal/admin/stream/{task_id}`，
    携带管理员自己的 Bearer token。转发端点由主服务提供；它不在的时候
    干预会失败并说人话，而不是静默无效。
-3. **`detail` 恒为中文字符串**，与用户侧同一约定（spec §13）。校验消息的
-   生成规则抄 `server/app.py:validation_message`，本地多补几条参数名
-   （`role`/`ok`/`command`…），不 import 也不改那个文件。
+3. **`detail` 恒为中文字符串**，与用户侧同一约定（spec §13）。校验消息的**生成
+   规则**抄 `server/app.py:validation_message`，本地多补几条参数名
+   （`role`/`ok`/`command`…）；而错误文案的映射表不再抄——那是 server/app.py 里的
+   单一来源（`svc.HTTP_DETAIL` + `svc.user_detail`），本面板只负责用自己的
+   `PanelError` 保住具体原因。
 4. **响应头 `Content-Security-Policy: default-src 'self'`。** 令牌存在
    localStorage 里，一次 XSS 就能把它拿走；面板又是本机页面，正好是内网里
    最容易被顺手打开的一个，所以头必须发。
@@ -81,22 +83,22 @@ _PARAM_LABEL = {
     "enabled": "停用状态",
 }
 
-# 框架层自己抛的 HTTPException（404 路由不存在、405 方法不对……）默认 detail 是
-# 英文短语，映射成中文。401/403/422 **不配条目**：那些是我们自己带中文 detail
-# 抛的（见 PanelError），映射表会把具体原因覆盖成一句通用话——「任务已经失败了」
-# 变成「请求参数不合法」之后，管理员不知道该点什么。
-_HTTP_DETAIL = {
-    400: "请求不对", 404: "接口不存在", 405: "请求方法不对",
-    409: "请求冲突", 413: "内容太大", 500: "服务器内部错误",
-}
+# 错误文案的映射表与 `user_detail()` **只有一份**，在 server/app.py（主服务）里，
+# 这里 import 过来用。不要再抄一份：抄过一次就已经漂了——app 侧有 422/503、
+# 这边没有，两边的注释还互相矛盾，于是同一个框架层错误在两个面板上显示成两句话。
+import app as svc               # noqa: E402  server/app.py：错误文案的单一来源
 
 
 class PanelError(HTTPException):
     """本面板自己抛的错，detail 恒为中文。
 
-    单开一个子类而不是直接用 HTTPException：Starlette 的异常处理器按异常的
+    单开一个子类而不是直接抛 HTTPException：Starlette 的异常处理器按异常的
     **MRO** 找最近的处理器，直接抛 HTTPException 会落进 StarletteHTTPException
-    那条兜底，被 _HTTP_DETAIL 覆盖掉具体原因。
+    那条兜底，被 svc.HTTP_DETAIL 覆盖掉具体原因。`svc.user_detail(exc, PanelError)`
+    里那个 own 参数就是干这个的——server/app.py 侧的对应类是 PreciseHTTPException，
+    两边各保各的具体原因。
+
+    **凡是有具体中文原因的错都用这个类抛**，不管状态码在不在映射表里。
     """
 
     def __init__(self, status_code: int, detail: str):
@@ -364,9 +366,9 @@ def create_admin_app() -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request, exc):
+        # PanelError 自己带的中文 detail 原样透出；框架层兜底的才查 svc.HTTP_DETAIL。
         return JSONResponse(status_code=exc.status_code,
-                            content={"detail": _HTTP_DETAIL.get(
-                                exc.status_code, str(exc.detail))})
+                            content={"detail": svc.user_detail(exc, PanelError)})
 
     # --- 静态三件套（零构建零外链，所以自己发就行，不必引 StaticFiles） -------
 
