@@ -35,6 +35,17 @@ STEP_MAX = 80
 BRIEF_MAX = 20000
 TITLE_MAX = 500
 
+# set_status 的 CAS 重试上限。正常情况下第一次就命中，重试只在"读 prev 与写库之间
+# 真被别人改了"时发生（最多三个进程：主服务 / 管理员面板 / agent 编排）。给到 8 是
+# 为了极罕见的连续抢输也不至于把调用方逼到抛错——抛错在这里比吞掉一次改写诚实。
+_STATUS_CAS_TRIES = 8
+
+# 终态只能被**显式的人/管理员动作**带走。自动回写（system / agent 的进度、收口、
+# 打包收口）一律不许把 done/failed 推回非终态：用户点了中止，调度器再回写一次
+# "正在运行"，等于把中止撤销了。重跑 / 重新打包走 admin，用户中止走 human，都在
+# 这条线之外，不受影响。
+_EXPLICIT_ACTORS = ("human", "admin")
+
 
 def truncate_step(text: str) -> str:
     """按 Unicode 码点截断。不能用 [:80] 之外的字节操作——那会切坏 UTF-8。
@@ -190,25 +201,81 @@ def set_status(task_id: int, status: str, actor: str = "system",
 
     校验用 db.VALID_STATUSES（主链 4 态 + failed），不能用 STATUS_KEYS，
     后者不含 failed，会把"标记失败"判成非法。
+
+    **读 prev、判断、写必须合成一个原子动作。** 旧实现是「连库读 → 内存判断 → 再连库
+    写」，中间隔着 add_event 与 _update 两次独立开库，中间是有窗口的：
+
+    - 用户中止（public app 在另一个进程里把状态写成 failed）正好落在这个窗口时，
+      set_status(..., "running") 会把中止**静默覆盖**——任务等于没被中止，白烧一轮
+      GPU，还交给用户一个"正在运行"；
+    - 同源的第二处：prev 是旧值时 ``status in TERMINAL and prev not in TERMINAL``
+      判错，done_at 会被多写一次，"进终态的时刻"就此不可信。
+
+    写法照 :func:`claim_queued` 的路子：**CAS**——UPDATE 带 ``WHERE status = 刚读到
+    的 prev``，单条语句原子，谁先到谁赢；rowcount=0 说明这个窗口确实被别人占了，
+    就重读 prev 重新判断。**不用 BEGIN IMMEDIATE**：Python 的 sqlite3 只在第一条写
+    语句前隐式开事务，裸 BEGIN 会和它打架；而且它把读也关进写锁，随后 add_event
+    那条新连接会撞上 SQLite 的单写者锁自锁（claim_queued 的 docstring 记着这条）。
+
+    **自动回写不许把终态推回非终态。** 读到 prev 已是终态（done/failed）、请求的状态
+    不是终态、而发起方又不是 human/admin 时，放弃这次改写、返回当前行，并补一条 log
+    说明为什么没改成——沉默地不生效会让人以为中止没成功。管理员改状态、重跑推回队列、
+    重新打包都是 human/admin 的显式动作，一次干净调用，不受这条限制，语义与旧实现
+    完全一致。调度器收口（dispatcher._settle 推 packaging）与打包器收口（推 done）走的
+    正是 system/agent，正好被这条挡住：中止之后进程再退出也不会把任务翻回"进行中"。
+
+    事件与状态写同处一个事务：分两次开库时，两个并发调用可能一个先提交状态、另一个
+    先提交事件，时间线上的 from/to 链会自己错位（先记 packaging→done、后记
+    queued→running），审计链就不可信了。
     """
     if status not in db.VALID_STATUSES:
         raise Invalid(f"未知状态：{status}")
-    c = db.connect()
-    try:
-        row = c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if row is None:
-            raise NotFound("任务不存在")
-        prev = row["status"]
-        fields = {"status": status}
-        if status in db.TERMINAL_STATUSES and prev not in db.TERMINAL_STATUSES:
-            fields["done_at"] = db.now_iso()
-        if note:
-            add_event(task_id, "note", actor, message or status)
-        else:
-            add_event(task_id, "status", actor, message, from_status=prev, to_status=status)
-        return _update(task_id, **fields)
-    finally:
-        c.close()
+    tid = int(task_id)
+    prev = ""
+    won = False
+    refused = False
+    for _attempt in range(_STATUS_CAS_TRIES):
+        c = db.connect()
+        try:
+            row = c.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+            if row is None:
+                raise NotFound("任务不存在")
+            prev = str(row["status"])
+            if (prev in db.TERMINAL_STATUSES
+                    and status not in db.TERMINAL_STATUSES
+                    and actor not in _EXPLICIT_ACTORS):
+                refused = True          # 别人已经收口/中止了，别盖回去
+                break
+            # done_at 与状态同一条 UPDATE：条件成立才写，prev 是真读到的值，
+            # 所以"第一次进终态"只会被认一次。
+            if status in db.TERMINAL_STATUSES and prev not in db.TERMINAL_STATUSES:
+                cur = c.execute(
+                    "UPDATE tasks SET status = ?, done_at = ? WHERE id = ? AND status = ?",
+                    (status, db.now_iso(), tid, prev))
+            else:
+                cur = c.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+                    (status, tid, prev))
+            won = cur.rowcount == 1
+            if won:
+                if note:
+                    _insert_event(c, tid, "note", actor, message or status)
+                else:
+                    _insert_event(c, tid, "status", actor, message,
+                                  from_status=prev, to_status=status)
+            c.commit()
+        finally:
+            c.close()
+        if won:
+            break
+    else:
+        raise StoreError("任务状态正在被其他进程修改，请稍后重试")
+
+    if refused:
+        add_event(tid, "log", actor,
+                  f"状态已被改成{db.STATUS_LABEL.get(prev, prev)}，"
+                  f"没有再改成{db.STATUS_LABEL.get(status, status)}")
+    return get_task(tid, is_admin=True)
 
 
 def claim_queued(task_id: int) -> str:
@@ -247,6 +314,30 @@ def claim_queued(task_id: int) -> str:
 
 # ---------------------------------------------------------------- events
 
+def _insert_event(c, task_id: int, kind: str, actor: str, message: str = "",
+                  from_status=None, to_status=None) -> int:
+    """在**调用方给定的连接/事务**里插一条事件，返回事件 id。
+
+    抽出来是因为 set_status 要把「改状态」和「记事件」放进同一个事务：它们是同一
+    件事的两半，拆成两次开库写就会在并发下错位（先提交状态、后提交事件的那一方，
+    时间线上的 from/to 会指错来处）。CHECK 兜底非法 kind/actor 的行为与 add_event
+    一致——只有一条 INSERT 实现，复制两份必然会漂移。
+    """
+    try:
+        cur = c.execute(
+            """INSERT INTO events
+               (task_id, kind, from_status, to_status, actor, message, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (int(task_id), kind, from_status, to_status, actor,
+             message or "", db.now_iso()),
+        )
+    except sqlite3.IntegrityError:
+        raise Invalid("事件类型或来源不合法")
+    if cur.rowcount == 0:
+        raise NotFound("任务不存在")
+    return cur.lastrowid
+
+
 def add_event(task_id: int, kind: str, actor: str, message: str = "",
               from_status=None, to_status=None) -> int:
     """写一条时间线事件，返回事件 id（前端拿它做 SSE 游标）。
@@ -257,19 +348,8 @@ def add_event(task_id: int, kind: str, actor: str, message: str = "",
     c = db.connect()
     try:
         with c:
-            try:
-                cur = c.execute(
-                    """INSERT INTO events
-                       (task_id, kind, from_status, to_status, actor, message, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (int(task_id), kind, from_status, to_status, actor,
-                     message or "", db.now_iso()),
-                )
-            except sqlite3.IntegrityError:
-                raise Invalid("事件类型或来源不合法")
-            if cur.rowcount == 0:
-                raise NotFound("任务不存在")
-            return cur.lastrowid
+            return _insert_event(c, task_id, kind, actor, message,
+                                 from_status=from_status, to_status=to_status)
     finally:
         c.close()
 
