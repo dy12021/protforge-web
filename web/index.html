@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- SPEC 12：不做移动端适配，只保证桌面 1280px 以上。锁死布局宽度，
+     免得窗口一小，五列被压扁。 -->
+<meta name="viewport" content="width=1280">
+<title>自动化计算平台</title>
+<!-- 空 data URI 当 favicon：省掉一次必然 404 的 /favicon.ico 请求 -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <h1>自动化计算平台</h1>
+    <input id="q" type="search" placeholder="搜索标题、需求或当前步骤" autocomplete="off" aria-label="搜索">
+    <select id="status-filter" aria-label="状态筛选"><option value="">全部状态</option></select>
+    <label class="toggle"><input id="only-active" type="checkbox"> 只看在跑的</label>
+    <button id="new-btn" class="primary" type="button">＋ 提交计算任务</button>
+    <span class="toolbar-gap"></span>
+    <span id="who" class="who"></span>
+    <button id="logout-btn" class="secondary" type="button">退出</button>
+  </header>
+
+  <!-- 只读提示条：服务没起来 / 登录过期这类全局问题落在这里，
+       不能塞进抽屉或某个卡片里——抽屉关着的时候用户看不见。 -->
+  <div id="board-msg" class="board-msg" hidden></div>
+
+  <main class="board" id="board"></main>
+
+  <!-- 提交计算任务：页面内的表单。
+       不是 window.prompt——浏览器自带的小灰框，样式不受控、一关输入就没了。
+       <dialog> 原生自带 Esc 关闭与焦点约束。 -->
+  <dialog class="composer" id="composer">
+    <form class="composer-inner" id="composer-form" method="dialog">
+      <h2 class="composer-title">提交计算任务</h2>
+      <p class="composer-lead">
+        用一句话说清想算什么。提交后平台自己编排技能链，中间不用管，
+        进度在看板上看得到。
+      </p>
+      <label class="field">
+        <span>任务标题</span>
+        <input id="c-title" required maxlength="200" placeholder="例如：1ubq 折叠稳定性打分"
+               autocomplete="off">
+      </label>
+      <label class="field">
+        <span>需求说明</span>
+        <!-- 上限 20000 字符，与后端一致：超出后端返 422，前端先挡住，
+             别让用户白等一次往返才发现写多了。 -->
+        <textarea id="c-brief" required maxlength="20000" rows="7"
+                  placeholder="要算什么、输入是什么、想要什么形式的产物。写得越具体，计算链越不用猜。"></textarea>
+      </label>
+      <div class="composer-actions">
+        <button class="secondary" type="button" id="c-cancel">算了</button>
+        <button class="primary" type="submit" id="c-save">提交</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 登录。token 存 localStorage 并走 Authorization 头（不放 Cookie，
+       浏览器不会自动附加自定义头，天然免 CSRF）。 -->
+  <dialog class="login" id="login">
+    <form class="login-inner" id="login-form" method="dialog">
+      <h2 class="login-title">自动化计算平台</h2>
+      <p class="login-lead">用公司发的账号登录。</p>
+      <label class="field">
+        <span>账号</span>
+        <input id="l-user" required autocomplete="username">
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input id="l-pass" required type="password" autocomplete="current-password">
+      </label>
+      <p class="login-error" id="login-error" hidden></p>
+      <div class="composer-actions">
+        <button class="primary" type="submit" id="login-btn">登录</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 两步确认。中止计算任务、以及删除计算任务都走这张表。
+       <dialog> 是复用节点，所以 app.js 里的收尾必须幂等并解绑监听。 -->
+  <dialog class="confirm" id="confirm">
+    <div class="confirm-inner">
+      <h2 class="confirm-title" id="confirm-title"></h2>
+      <p class="confirm-lead" id="confirm-lead"></p>
+      <ul class="confirm-list" id="confirm-list"></ul>
+      <div class="confirm-actions">
+        <button class="secondary" type="button" id="confirm-cancel">算了</button>
+        <button class="danger" type="button" id="confirm-ok">确认</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- 抽屉：点卡片开。**默认只读**——详情是给人读的，不是给人填的。
+       每个区块标题右侧有小字「编辑」才进编辑态，存完回只读。 -->
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer-inner">
+      <div class="drawer-bar">
+        <button class="drawer-icon" id="drawer-full" type="button"
+                aria-label="展开到全屏" title="展开到全屏">⤢</button>
+        <button class="drawer-icon" id="drawer-close" type="button"
+                aria-label="关闭" title="关闭（Esc）">✕</button>
+      </div>
+      <div id="drawer-body"></div>
+    </div>
+  </aside>
+
+  <script src="app.js"></script>
+</body>
+</html>
