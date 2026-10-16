@@ -30,10 +30,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import zipfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +53,11 @@ _ISO_FMT = "%Y-%m-%dT%H:%M:%S.%f"  # 与 db.now_iso / trg_tasks_touch 一致
 # 进度事件最多写这么多条（按百分比去重后天然 ≤101）。产物可有十万文件，
 # 每个文件写一条事件会把用户时间线刷成瀑布，还会拖慢 SSE 的游标扫描。
 _PROGRESS_STEP = 1  # 百分比跳变阈值
+
+# stderr 只留尾巴，且留的量远大于报错要显示的 300 字：子进程可以往 stderr 倒几 MB
+# 的 warning，无脑 append 等于主服务自己把内存吃穿；而真失败时最有用的是最后几行。
+_STDERR_TAIL_CHARS = 32 * 1024
+_STDERR_MSG_CHARS = 300
 
 
 class PackageError(Exception):
@@ -384,9 +392,54 @@ def _emit(task_id: int, payload: dict, progress_cb, last_pct: list[int]) -> None
         store.add_event(task_id, "package", "system", str(payload.get("message", ""))[:200])
 
 
+class _Tail:
+    """定长尾巴缓冲：只保留最后 ``limit`` 个字符。
+
+    stderr 只能边读边丢，不能整段攒着——子进程可能倒几 MB 噪音；而打包失败时
+    真正说明问题的 traceback 在**最后**几行，所以丢的是头不是尾。
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        self._parts: deque[str] = deque()
+        self._len = 0
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if len(chunk) >= self._limit:      # 单块就超限：整块换成它自己的尾巴
+            self._parts.clear()
+            self._len = 0
+            chunk = chunk[-self._limit:]
+        self._parts.append(chunk)
+        self._len += len(chunk)
+        while self._len > self._limit and len(self._parts) > 1:
+            self._len -= len(self._parts.popleft())
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
 def _run_pack_worker(task_id: int, spec_path: Path, out: Path, progress_cb,
                      timeout: float | None) -> str:
-    """起独立 python 进程执行 zip，只读它的 stdout 收进度。"""
+    """起独立 python 进程执行 zip，收它的 stdout 进度，**同时**抽干它的 stderr。
+
+    **stderr 必须与 stdout 同时被读，否则死锁。** 旧实现只读 stdout、等 stdout 读到
+    EOF 之后才去 ``proc.stderr.read()``：打包 20 GB 时子进程随手一条 traceback /
+    warning 就能写满管道缓冲区（Windows 匿名管道默认 4 KB），写满后子进程阻塞在
+    stderr 写上、再也吐不出 stdout；父进程却还卡在 ``for line in proc.stdout`` 等
+    EOF——两边互等，永久挂起。所以 stdout / stderr 各起一个读取线程：stdout 的行进
+    队列（进度回调仍在**调用方线程**里发，行为与旧实现一致），stderr 的行进定长
+    尾巴缓冲。
+
+    **超时覆盖整个操作，不是只覆盖 wait()。** 旧实现的 ``proc.wait(timeout=...)`` 在
+    stdout 读到 EOF 之后才起算，而死锁时永远等不到 EOF——那个 timeout 参数实际上是
+    摆设。现在用单调时钟的截止时间，边收行边查。
+
+    **进程一定被回收。** 读完、超时、_emit 抛异常三条路都汇到同一个 finally：还活着
+    就杀整棵树（_kill_tree，含孙进程），已经退了也显式 wait 收一次，不给主服务留下
+    僵尸/孤儿子进程继续占着 zip 的文件句柄。
+    """
     cmd = [sys.executable, str(Path(__file__).resolve()), "--pack", str(spec_path)]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(
@@ -394,10 +447,40 @@ def _run_pack_worker(task_id: int, spec_path: Path, out: Path, progress_cb,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
         creationflags=creationflags,
     )
+    lines: "queue.Queue" = queue.Queue()      # stdout 逐行；EOF 放 None 作哨兵
+    tail = _Tail(_STDERR_TAIL_CHARS)
+
+    def _pump_stdout() -> None:
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    def _pump_stderr() -> None:
+        for chunk in iter(lambda: proc.stderr.readline(), ""):
+            tail.append(chunk)
+
+    readers = [threading.Thread(target=_pump_stdout, name="pack-stdout", daemon=True),
+               threading.Thread(target=_pump_stderr, name="pack-stderr", daemon=True)]
+
+    deadline = None if timeout is None else time.monotonic() + float(timeout)
     last_pct = [-100]
     failure = ""
+    rc = -1
     try:
-        for line in proc.stdout:
+        for t in readers:
+            t.start()
+        timed_out = False
+        while True:
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                line = lines.get(timeout=wait)
+            except queue.Empty:
+                timed_out = True
+                break
+            if line is None:
+                break                    # stdout 收完，子进程已关掉它那半边
             line = line.strip()
             if not line:
                 continue
@@ -409,22 +492,40 @@ def _run_pack_worker(task_id: int, spec_path: Path, out: Path, progress_cb,
                 failure = str(payload.get("message") or "打包子进程报告失败")
                 continue
             _emit(task_id, payload, progress_cb, last_pct)
+        if timed_out:
+            _kill_tree(proc)
+            raise PackageError("打包超时，已终止打包进程") from None
+        # stdout 收到 EOF 只说明它不写了，退出码还得等它真正退出——收尾阶段仍可能
+        # 卡住（刷盘、关句柄），所以这里也按同一个截止时间算。
         try:
-            rc = proc.wait(timeout=timeout)
+            rc = proc.wait(timeout=None if deadline is None
+                           else max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             _kill_tree(proc)
             raise PackageError("打包超时，已终止打包进程") from None
     finally:
-        if proc.stdout:
-            proc.stdout.close()
+        if proc.poll() is None:
+            _kill_tree(proc)                # 超时/异常路径：不能让 zip 继续跑
+        else:
+            try:
+                proc.wait(timeout=10)
+            except Exception:              # noqa: BLE001 —— 收尸失败不该盖掉主异常
+                pass
+        for t in readers:
+            t.join(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
-    stderr = ""
-    if proc.stderr:
-        stderr = proc.stderr.read() or ""
-        proc.stderr.close()
+    stderr = tail.text().strip()
     if rc != 0:
-        raise PackageError(failure or f"打包子进程异常退出（退出码 {rc}）"
-                           + (f"：{stderr.strip()[:300]}" if stderr.strip() else ""))
+        # 括号是必需的：+ 的优先级高于 or，不括起来就是「failure 非空就整条短路」，
+        # stderr 永远拼不上去——子进程自己报了错（failure 非空）的时候恰恰最需要它。
+        raise PackageError((failure or f"打包子进程异常退出（退出码 {rc}）")
+                           + (f"：{stderr[-_STDERR_MSG_CHARS:]}" if stderr else ""))
     if not out.exists():
         raise PackageError("打包子进程已退出，但没有产出压缩包")
     return str(out)
