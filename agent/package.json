@@ -1,0 +1,26 @@
+{
+  "name": "protforge-web-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ProtForge compute-platform agent: pi coding agent child process with AST command guard",
+  "type": "module",
+  "scripts": {
+    "start": "node run.mjs",
+    "test": "node --test guards.test.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.1",
+    "mvdan-sh": "0.10.1",
+    "typebox": "1.3.27"
+  },
+  "overrides": {
+    "@earendil-works/chord": "1.0.1",
+    "@earendil-works/pi-agent-core": "1.0.1",
+    "@earendil-works/pi-ai": "1.0.1",
+    "@earendil-works/pi-codemode": "1.0.1",
+    "@earendil-works/pi-mcp": "1.0.1",
+    "@earendil-works/pi-telemetry": "1.0.1",
+    "@earendil-works/pi-tui": "1.0.1"
+  }
+}
