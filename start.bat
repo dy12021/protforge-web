@@ -21,6 +21,10 @@ if exist ".env" (
     )
 )
 
+rem 后台工种总开关（调度器 + 打包器 + 清理器）。必须开：不打开的话
+rem 任务提交后永远停在「排队中」。默认关闭只是为了测试，生产必开。
+if not defined PROTFORGE_WEB_WORKERS set "PROTFORGE_WEB_WORKERS=1"
+
 if not exist "%PYTHON%" (
     echo [错误] 找不到 Python：%PYTHON%
     echo.
@@ -39,8 +43,7 @@ if not errorlevel 1 (
     echo 主服务已在运行，直接打开浏览器完成。
     start "" "%URL%"
     echo.
-    echo   如果浏览器里是 404 或页面不全，见 README 的「尚未验证」一节：
-    echo   用户面板前端目前还没有被主服务发出来。
+    echo   如果浏览器里是 404，先看那个服务窗口里的报错。
     echo.
     pause
     exit /b 0
@@ -61,6 +64,14 @@ echo   浏览器会自动打开用户面板。那三个窗口才是服务，本窗口关掉不影响。
 echo.
 echo ============================================================
 echo.
+
+if not defined PROTFORGE_ADMIN_USER (
+    echo [提醒] .env 里没设 PROTFORGE_ADMIN_USER。
+    echo        库里如果还没有管理员，谁都登不进去，管理面板也进不去。
+    echo        在 .env 里加上 PROTFORGE_ADMIN_USER 和 PROTFORGE_ADMIN_PASSWORD
+    echo        之后重启，服务会自动创建这个管理员。
+    echo.
+)
 
 rem uvicorn 要一会儿才绑上端口，所以延时一点再开浏览器，
 rem 否则会先看到「无法访问此页面」。ping 当延时用；timeout 需要后台才有。

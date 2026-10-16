@@ -136,6 +136,30 @@ class _TokenStore:
         with self._lock:
             self._items.pop(int(task_id), None)
 
+    def bound_task(self, token) -> int | None:
+        """令牌 -> 它绑定的 task_id。没配对或过期返回 None。
+
+        表是按 task_id 建的，:meth:`verify` 只能回答"这个令牌对不对得上这个任务"。
+        内部 API 还需要区分**两种错**：令牌根本不存在（401）与令牌是真的但用在了
+        别的任务上（403）——后者是拿 task 1 的钥匙去开 task 2 的门，提示语不该一样。
+        所以这里补一个反查，让 API 层能说出人话，而不是一律"令牌无效"。
+        """
+        if not isinstance(token, str) or not token:
+            return None
+        with self._lock:
+            self._purge()
+            items = list(self._items.items())
+        try:
+            for tid, (known, _) in items:
+                if hmac.compare_digest(known, token):
+                    return tid
+        except TypeError:
+            # compare_digest 碰到非 ASCII 的 str 会抛，而不是返回 False。令牌是
+            # base64url，本来就不该有非 ASCII；真来了就当它没配对——绝不能让鉴权
+            # 端点因为一个畸形请求头返回 500。
+            return None
+        return None
+
     def _purge(self) -> None:
         now = time.time()
         for tid, (_, issued) in list(self._items.items()):
@@ -170,6 +194,16 @@ def verify_agent_token(task_id: int, token) -> bool:
 
 def revoke_agent_token(task_id: int) -> None:
     _TOKENS.revoke(task_id)
+
+
+def agent_token_task(token) -> int | None:
+    """令牌 -> 绑定的 task_id；查不到或已过期返回 None。
+
+    内部 app 的 agent 通道用它把 401（令牌不存在）和 403（令牌用错了任务）分开。
+    表还是 :data:`_TOKENS` 这一张——app.py **不要**再抄一份自己的令牌表，两份表
+    在两个进程里会各说各话，症状是 agent 每一步回调都 401。
+    """
+    return _TOKENS.bound_task(token)
 
 
 # --- GPU 探测 ------------------------------------------------------------------------
@@ -254,6 +288,7 @@ class AgentProc:
     reader: threading.Thread = field(default=None, repr=False)
 
     aborted: bool = False                    # 管理员明确中止过
+    abort_reason: str = ""                   # 为什么中止；收尾时用它当失败原因
     settled: bool = False                    # 已被收尾（幂等闸）
     exit_code: int | None = None
     eof: bool = False                        # stdout 读完
@@ -281,6 +316,15 @@ def _append_log(path: Path, line: str) -> None:
             f.write(line + "\n")
     except OSError:
         pass          # 日志写不进去不能带崩事件流
+
+
+def _db_status(task_id: int) -> str:
+    """读库里的任务状态；读不到就返回空串（这一轮当作没看见）。"""
+    try:
+        return str(store.get_task(task_id, is_admin=True).get("status") or "")
+    except Exception:                                 # noqa: BLE001 - 轮询线程不能死
+        log.exception("读任务 %s 状态失败", task_id)
+        return ""
 
 
 def _notify() -> None:
@@ -399,6 +443,13 @@ class Dispatcher:
 
     def _reap(self) -> None:
         for ap in list(self.running.values()):
+            # 用户中止发生在 public app，那是**另一个进程**：那边改得到数据库，改不到
+            # 这里的进程。所以中止要靠库里的状态传导过来——发现它已经是 failed 就把
+            # 进程杀掉，否则用户点了中止之后计算还会接着跑完，白烧一轮 GPU。
+            # 调度器自己 abort 的 ap.aborted 已置位，跳过以免重复收尾。
+            if not ap.aborted and _db_status(ap.task_id) == "failed":
+                self.abort(ap.task_id, reason="任务已被中止")
+                continue
             try:
                 code = ap.proc.poll()
             except OSError:
@@ -431,17 +482,21 @@ class Dispatcher:
             except guards.Violation as e:
                 self._mark_failed(task_id, f"工作区路径不合法：{e}")
                 continue
+            # 先抢再起。抢不到说明轮到自己之前它已经不在队列里了，最常见的原因是
+            # 用户刚点了中止（public app 写 failed）——这时候绝不能再写回 running，
+            # 否则中止被覆盖，任务白烧一轮 GPU 还显示"正在运行"。
+            try:
+                got = store.claim_queued(task_id)
+            except Exception:                       # noqa: BLE001 - 这一轮先跳过
+                log.exception("抢占任务 %s 失败", task_id)
+                continue
+            if got != "queued":
+                continue
             try:
                 self._spawn(task_id, row.get("brief", ""), work_dir)
             except Exception as e:                  # noqa: BLE001 - 起不来必须记账，不能悄悄留着
                 log.exception("spawn %s 失败", task_id)
                 self._mark_failed(task_id, f"计算进程启动失败：{e}")
-                continue
-            try:
-                store.set_status(task_id, "running", actor="system", message="计算进程已启动")
-            except Exception:                       # noqa: BLE001
-                log.exception("把 %s 置为 running 失败，杀掉刚起的进程", task_id)
-                self.abort(task_id, reason="状态写入失败，已回滚")
                 continue
             _notify()
             admitted.append(task_id)
@@ -681,6 +736,7 @@ class Dispatcher:
             return False
 
         ap.aborted = True
+        ap.abort_reason = reason or ""
         kill_tree(ap.proc)
         try:
             ap.proc.wait(timeout=KILL_TIMEOUT)
@@ -752,7 +808,7 @@ class Dispatcher:
                             f"计算进程正常退出（退出码 {code}）")
             _notify()
         elif ap.aborted:
-            self._mark_failed(ap.task_id, "已由管理员中止")
+            self._mark_failed(ap.task_id, ap.abort_reason or "已由管理员中止")
             store.add_event(ap.task_id, "log", "admin",
                             f"中止：已杀掉进程树 pid={ap.pid}，stderr 见 {ap.stderr_path.name}")
             _notify()
@@ -767,7 +823,21 @@ class Dispatcher:
 
         三样都要：``error`` 字段给详情页，状态事件让流转轨动格，``error`` 事件让
         时间线上直接看得见失败原因（管理员翻时间线时不该去猜字段）。
+
+        **已经是 failed 的不重写。** 用户中止与调度器收尾会先后碰到同一个任务，
+        谁后到谁覆盖的话，用户明明点的是中止，最后看到的却是"计算进程异常结束
+        （退出码 -1）"。拦住的是状态与 error 字段的覆盖；"已杀掉进程树"那条事件
+        由 :meth:`_settle` 单独补，用户仍然看得到进程确实被杀了。
         """
+        try:
+            task = store.get_task(task_id, is_admin=True)
+        except store.StoreError:
+            return                                 # 任务被删了，没什么可标记的
+        except Exception:                         # noqa: BLE001
+            log.exception("读任务 %s 失败，跳过标记", task_id)
+            return
+        if task.get("status") == "failed":
+            return
         try:
             store.update_task(task_id, error=reason)
             store.set_status(task_id, "failed", actor="system", message=reason)
@@ -786,6 +856,7 @@ __all__ = [
     "issue_agent_token",
     "verify_agent_token",
     "revoke_agent_token",
+    "agent_token_task",
     "probe_gpu_count",
     "kill_tree",
     "DEFAULT_INTERNAL_BASE",

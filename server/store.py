@@ -211,6 +211,40 @@ def set_status(task_id: int, status: str, actor: str = "system",
         c.close()
 
 
+def claim_queued(task_id: int) -> str:
+    """把排队中的任务**原子地**抢成 running，返回抢到的当前状态。
+
+    为什么调度器不能用 :func:`set_status`：它是无条件覆盖。调度器读完队列、还没
+    起进程的那一瞬，用户可以点中止（public app 在另一个进程里把状态写成
+    ``failed``）。这时再 ``set_status(..., "running")`` 就把中止覆盖掉了——任务
+    等于没被中止，白烧一轮 GPU，还交给用户一个"正在运行"。
+
+    ``UPDATE ... WHERE status='queued'`` 在 SQLite 里是单条语句的原子操作，谁先到
+    谁赢。返回 ``"queued"`` 表示抢到了（调用方接着起进程）；返回别的状态表示这一轮
+    轮到自己之前它已经不在队列里了。
+
+    事件单独补写：``add_event`` 自己开连接，在本连接还持着写事务时调会撞上
+    SQLite 的单写者锁，所以先 commit 再写。
+    """
+    task_id = int(task_id)
+    c = db.connect()
+    try:
+        cur = c.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ? AND status = 'queued'",
+            (task_id,),
+        )
+        won = cur.rowcount == 1
+        c.commit()
+    finally:
+        c.close()
+    if won:
+        add_event(task_id, "status", "system", "计算进程已启动",
+                  from_status="queued", to_status="running")
+        return "queued"
+    row = get_task(task_id, is_admin=True)      # 抢不到就得说清它去哪了
+    return str(row.get("status") or "")
+
+
 # ---------------------------------------------------------------- events
 
 def add_event(task_id: int, kind: str, actor: str, message: str = "",

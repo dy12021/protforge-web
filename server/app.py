@@ -1,6 +1,6 @@
 """FastAPI 主服务。**两个 app 实例，两个端口**，不是一台机器两个 app。
 
-    create_public_app()    -> 0.0.0.0:8473    用户 API（浏览器够得着）
+    create_public_app()    -> 0.0.0.0:8473    用户 API + 用户面板前端
     create_internal_app()  -> 127.0.0.1:8475  内部 API（本机反代不该碰）
 
 为什么不能合成一个 app + 检查来源 IP：用户的反代跑在本机，公网请求经反代
@@ -20,8 +20,13 @@ store.py 属于别的 worker，数据层不该知道有没有人在听，所以�
 """
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
 import secrets
+import threading
 import time
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -30,14 +35,23 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import artifacts
 import auth
 import db
+import dispatcher
 import guards
+import janitor
 import skills_index
 import sse
 import store
 
 VERSION = "0.1.0"
+
+log = logging.getLogger("protforge.web")
+
+# 用户面板前端。挂在仓库里而不是数据盘：它是程序的一部分，不该跟着数据一起被清。
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+USER_UI_FILES = frozenset({"index.html", "app.js", "style.css"})
 
 PUBLIC_PORT = 8473
 INTERNAL_PORT = 8475
@@ -208,39 +222,28 @@ class EventIn(BaseModel):
 class FinishIn(BaseModel):
     summary: str = Field(default="", max_length=4000)
     error: str = Field(default="", max_length=4000)
+    # agent 自报的产物清单。**注意它和产物发现不是一回事**：这里说的是工作目录下的
+    # 相对路径，而 artifacts.discover 扫的是 ProtForge 的 outputs 根，两棵不同的树。
+    # 所以这份清单只记进时间线供排查，不参与打包——真按它去 assemble 会打空包。
+    # 但字段必须收下：pydantic 会把未声明的键**静默丢掉**，agent 以为自己报了、
+    # 后端却当没收到，这种不一致最难查。
+    artifacts: list[str] = Field(default_factory=list, max_length=50)
 
 
 # ---------------------------------------------------------------- 内部令牌
 
-AGENT_TOKEN_TTL = 24 * 3600
+# **令牌表只有一张，在 dispatcher 里。** 签发方是调度器（它起进程时把令牌交给
+# agent），校验方是下面这个文件里的内部端点，两边必须读同一张表：本文件原先自己
+# 抄了一份，两个进程各留各的，症状是 agent 每一步回调都 401 且极难看出原因。
+#
+# 顺带一个约束：令牌是进程内存，所以调度器必须与内部 app(8475) 同进程，
+# 签发走 /api/internal/admin/tokens/{task_id}，别写进数据库——进程重启即失效
+# 反而是对的，这把钥匙不该比它守的门活得久。
+AGENT_TOKEN_TTL = dispatcher.AGENT_TOKEN_TTL
 
-# {token: (task_id, 过期时间戳)}。**进程内**：agent_token 是"这次计算的进程
-# 凭证"，不该比任务活得久，进程重启即失效反而是对的。代价是签发方必须与
-# 内部 app 同一个进程——所以签发走 /api/internal/admin/tokens/{task_id}。
-_AGENT_TOKENS: dict[str, tuple[int, float]] = {}
-
-
-def issue_agent_token(task_id: int, ttl: float = AGENT_TOKEN_TTL) -> str:
-    """给某个任务签一个 agent_token。**与 task_id 绑定**——这是它唯一的作用域保证。"""
-    token = secrets.token_urlsafe(32)
-    _AGENT_TOKENS[token] = (int(task_id), time.time() + float(ttl))
-    return token
-
-
-def revoke_agent_token(task_id: int | None = None, token: str | None = None) -> None:
-    if token is not None:
-        _AGENT_TOKENS.pop(token, None)
-    if task_id is not None:
-        for t in [k for k, v in _AGENT_TOKENS.items() if v[0] == int(task_id)]:
-            _AGENT_TOKENS.pop(t, None)
-
-
-def agent_token_task(token: str) -> int | None:
-    """令牌 -> 绑定的 task_id。过期或查不到返回 None。"""
-    entry = _AGENT_TOKENS.get((token or "").strip() or "")
-    if entry is None or entry[1] < time.time():
-        return None
-    return entry[0]
+issue_agent_token = dispatcher.issue_agent_token
+revoke_agent_token = dispatcher.revoke_agent_token
+agent_token_task = dispatcher.agent_token_task
 
 
 def require_agent(task_id: int, request: Request) -> int:
@@ -354,6 +357,9 @@ def create_public_app() -> FastAPI:
                 422, f"任务已经{db.STATUS_LABEL.get(task['status'])}了，不能再中止")
         updated = store.set_status(task_id, "failed", actor="human",
                                    message="用户中止了任务")
+        # error 字段也补上：详情页读它展示失败原因，而调度器看到库里已经是 failed
+        # 之后收尾不会再覆盖（_mark_failed 遇到 failed 直接返回），不写就空了。
+        updated = store.update_task(task_id, error="用户中止了任务")
         sse.notify()
         return _detail(updated)
 
@@ -410,14 +416,285 @@ def create_public_app() -> FastAPI:
             raise HTTPException(409, "结果包文件不见了")
         return FileResponse(real, filename=real.name, media_type="application/zip")
 
+    # 用户面板前端挂在**最后**，且只放行这三个文件。
+    #
+    # **不要**改成 app.mount("/", StaticFiles(...))：那会把整棵树接管，POST /api/...
+    # 从 404 变成 405、detail 也不再是中文，而"用户侧没有 /advance"这条设计就被
+    # 悄悄改掉了——症状是三条不相干的测试同时变红，没人会想到是挂载顺序。
+    #
+    # 前端用相对路径引用（href="style.css"），所以单段路径就够；/api/* 至少两段，
+    # 撞不上。未知单段路径落到下面 raise 的 404，仍是统一的中文提示。
+    if not (WEB_DIR / "index.html").is_file():
+        log.warning("用户面板前端不在 %s，8473 首页会是 404", WEB_DIR)
+
+    @app.get("/")
+    def user_ui():
+        if not (WEB_DIR / "index.html").is_file():
+            raise HTTPException(404, "用户面板前端文件缺失")
+        return FileResponse(WEB_DIR / "index.html", media_type="text/html")
+
+    @app.get("/favicon.ico")
+    def user_favicon():
+        # 前端用的是 data: 空图标，但浏览器仍会来要一次。给它 204 而不是 404，
+        # 省得在日志里堆无意义的报错。
+        from fastapi import Response
+        return Response(status_code=204)
+
+    @app.get("/{asset}")
+    def user_asset(asset: str):
+        if asset not in USER_UI_FILES:
+            raise HTTPException(404, "页面不存在")
+        f = WEB_DIR / asset
+        if not f.is_file():
+            raise HTTPException(404, "页面不存在")
+        # 静态资源不该被中途改掉：前端文件没有版本号，缓存一旧就白屏
+        return FileResponse(f, headers={"Cache-Control": "no-cache"})
+
     return app
+
+
+# ---------------------------------------------------------------- 后台工种
+#
+# 这三样都是"模块写好了但没人调"的那一类，症状一律是静默的：任务停在 packaging
+# 没人打包、E 盘只增不减、没人能登录。所以它们在这里被真正接上，而不是留在文档里。
+
+PACK_SCAN_INTERVAL = 2.0        # 秒。packaging 是给人看的状态，不该让人等太久
+JANITOR_INTERVAL = 30 * 60      # 半小时。清理是体力活，不需要勤
+
+# 正在打包的 task_id。打包在子进程里跑、要占磁盘，同一个任务不能被扫两遍。
+_pack_lock = threading.Lock()
+_packing: set[int] = set()
+
+
+def _task_visible(task_id: int) -> dict | None:
+    """读任务并叫醒 SSE；读不到返回 None。"""
+    try:
+        task = store.get_task(task_id, is_admin=True)
+    except Exception:                                  # noqa: BLE001
+        log.exception("读任务 %s 失败", task_id)
+        return None
+    sse.notify()
+    return task
+
+
+def _fail_task(task_id: int, reason: str) -> None:
+    """把任务标成失败并说明原因。已经是终态的**不覆盖**。
+
+    不覆盖的原因：打包失败和调度器收尾可能撞在一起（比如管理员同时点了中止），
+    谁后到谁覆盖的话，用户点的是中止，最后看到的却是"打包失败"——
+    和 dispatcher._mark_failed 里那道闸门是同一个道理。
+    """
+    try:
+        task = store.get_task(task_id, is_admin=True)
+    except Exception:                                  # noqa: BLE001
+        log.exception("读任务 %s 失败，跳过标记", task_id)
+        return
+    if task.get("status") in db.TERMINAL_STATUSES:
+        return
+    try:
+        store.update_task(task_id, error=reason)
+        store.set_status(task_id, "failed", actor="system", message=reason)
+        store.add_event(task_id, "error", "system", reason)
+    except Exception:                                  # noqa: BLE001
+        log.exception("把任务 %s 标记为失败时出错", task_id)
+    sse.notify()
+
+
+def _package_one(task_id: int) -> None:
+    """打一个包：先登记产物，再压 zip，最后写 package_path 并收口。
+
+    产物靠时间窗兜底发现时 verified=0（"先显示、再确认"），这种情况**不自动放行**：
+    自动确认等于把"先显示、再确认"这道闸门拆了。它诚实地失败，由管理员确认后
+    走 /api/internal/admin/repack 重新打包。
+    """
+    try:
+        found = artifacts.discover(task_id)
+    except Exception as e:                             # noqa: BLE001
+        log.exception("登记产物失败：%s", task_id)
+        _fail_task(task_id, f"登记产物时出错：{e}")
+        return
+
+    if not artifacts.downloadable(task_id):
+        if found:
+            _fail_task(task_id, "产物已找到但尚未确认打包："
+                              "需要管理员在产物列表里确认后重新打包")
+        else:
+            _fail_task(task_id, "计算结束了，但没有找到任何产物")
+        return
+
+    out = artifacts.default_package_path(task_id)
+    try:
+        artifacts.package(task_id, out_zip=out)
+    except artifacts.PackageError as e:                # QuotaExceeded 是它的子类
+        log.warning("打包 %s 失败：%s", task_id, e)
+        _fail_task(task_id, str(e))
+        return
+    except Exception:                                   # noqa: BLE001
+        log.exception("打包 %s 时出错", task_id)
+        _fail_task(task_id, "打包过程出错，详见服务端日志")
+        return
+
+    try:
+        store.update_task(task_id, package_path=str(out))
+        store.set_status(task_id, "done", actor="system",
+                         message="结果包已就绪，可以下载")
+    except Exception:                                   # noqa: BLE001
+        log.exception("收口任务 %s 失败", task_id)
+        return
+    sse.notify()
+
+
+def _pack_scan_once() -> list[int]:
+    """把停在 packaging 的任务打包掉。返回处理过的 task_id。"""
+    handled: list[int] = []
+    try:
+        rows = store.list_tasks(status="packaging", is_admin=True, limit=50)
+    except Exception:                                   # noqa: BLE001
+        log.exception("读取待打包任务失败")
+        return handled
+    for row in rows:
+        task_id = int(row["id"])
+        if (row.get("package_path") or "").strip():
+            continue                                   # 已经打过包了，别再来一遍
+        with _pack_lock:
+            if task_id in _packing:
+                continue
+            _packing.add(task_id)
+        try:
+            _package_one(task_id)
+            handled.append(task_id)
+        finally:
+            with _pack_lock:
+                _packing.discard(task_id)
+    return handled
+
+
+def _pack_loop(stop: threading.Event) -> None:
+    while not stop.wait(PACK_SCAN_INTERVAL):
+        try:
+            _pack_scan_once()
+        except Exception:                               # noqa: BLE001 - 线程不能死
+            log.exception("打包扫描出错")
+
+
+def _janitor_loop(stop: threading.Event) -> None:
+    while not stop.wait(JANITOR_INTERVAL):
+        try:
+            janitor.sweep()
+        except Exception:                               # noqa: BLE001
+            log.exception("磁盘清理出错")
+
+
+def _start_housekeeping(app: FastAPI) -> list[threading.Thread]:
+    """起打包与清理两个后台线程，返回它们（停机时 join）。"""
+    threads = []
+    for name, target in (("packager", _pack_loop), ("janitor", _janitor_loop)):
+        stop = threading.Event()
+        app.state.housekeeping_stop = stop
+
+        def run(stop=stop, target=target, name=name):
+            target(stop)
+
+        t = threading.Thread(target=run, name=name, daemon=True)
+        t.start()
+        threads.append(t)
+    return threads
+
+
+ADMIN_USER_ENV = "PROTFORGE_ADMIN_USER"
+ADMIN_PASSWORD_ENV = "PROTFORGE_ADMIN_PASSWORD"
+
+
+def bootstrap_admin() -> dict | None:
+    """按环境变量建初始管理员，返回建出来的用户。没配返回 None。
+
+    **只在环境变量给了用户名+口令时才动手**，不自动生成随机口令往日志里打——
+    那种做法迟早会有人把日志贴到工单里。没配也**不是错误**：可能管理员是别人
+    建好的，所以由 :func:`_warn_if_no_admin` 去说这件事。
+    """
+    user = (os.environ.get(ADMIN_USER_ENV) or "").strip()
+    pwd = os.environ.get(ADMIN_PASSWORD_ENV) or ""
+    if not user or not pwd:
+        return None
+    if auth.get_user(user) is not None:
+        return None                                    # 已经有了，**绝不覆盖**
+    try:
+        made = auth.create_user(user, pwd, role="admin")
+    except Exception:                                  # noqa: BLE001
+        log.exception("创建初始管理员 %s 失败", user)
+        return None
+    log.info("已按环境变量创建初始管理员：%s", user)
+    return made
+
+
+def _warn_if_no_admin() -> None:
+    """一个管理员都没有时把话说清楚——否则表现是"登录页谁都登不进去"。"""
+    if not _has_any_admin():
+        log.warning(
+            "库里还没有管理员，用户端登录与管理面板都会用不了。"
+            "在 .env 里设 %s / %s 再重启即可创建。", ADMIN_USER_ENV, ADMIN_PASSWORD_ENV)
+
+
+def _has_any_admin() -> bool:
+    try:
+        c = db.connect()
+        try:
+            row = c.execute("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").fetchone()
+            return row is not None
+        finally:
+            c.close()
+    except Exception:                                  # noqa: BLE001
+        log.exception("检查管理员是否存在时出错")
+        return True                                    # 查不了就别拦着，交给登录时报错
 
 
 # ---------------------------------------------------------------- 内部 API
 
+# 后台工种总开关：调度器 + 打包器 + 清理器，三样一起开或一起关。
+#
+# **生产必须设为 1**，否则任务提交后永远停在"排队中"，不会有 agent 被拉起来。
+# 默认关闭只有一个理由：测试用 TestClient 起内部 app 时，这三样都会对着临时库
+# 真去干活（起 node 进程、压 zip），测试既慢又不确定。
+WORKERS_ENV = "PROTFORGE_WEB_WORKERS"
+_TRUTHY = ("1", "on", "true", "yes")
+
+
+@contextlib.asynccontextmanager
+async def _workers_lifespan(app: FastAPI):
+    """内部 app 顺带把三个后台工种带起来——**只有内部 app 带**。
+
+    - **调度器**：agent 的令牌在这里校验、管理员的 RPC 也转发到这里，它跟这两样
+      同进程才共享得到那张内存令牌表。public app 里再起一个等于起两份，
+      两份会互相抢任务。
+    - **打包器 / 清理器**：跟着调度器一起开关。三样都是"没人调用就静默不干活"的
+      东西，分成两个旋钮的话，运维只开一个会得到一个能登录、能提交、但永远
+      排队的服务——比全关掉更难查。
+
+    全部由 :data:`WORKERS_ENV` 显式打开。
+    """
+    bootstrap_admin()
+    _warn_if_no_admin()
+
+    if os.environ.get(WORKERS_ENV, "").strip().lower() not in _TRUTHY:
+        yield
+        return
+
+    disp = dispatcher.Dispatcher()
+    app.state.dispatcher = disp
+    disp.start()
+    threads = _start_housekeeping(app)
+    try:
+        yield
+    finally:
+        disp.stop()
+        for t in threads:
+            t.join(timeout=2.0)
+
+
 def create_internal_app() -> FastAPI:
     db.init_db()
-    app = FastAPI(title="蛋白计算平台（内部通道）", version=VERSION)
+    app = FastAPI(title="蛋白计算平台（内部通道）", version=VERSION,
+                  lifespan=_workers_lifespan)
     _install_common(app)
 
     @app.post("/api/internal/agent/{task_id}/step")
@@ -456,6 +733,31 @@ def create_internal_app() -> FastAPI:
         # finished 事件放最后：调度器拿 has_finished() 区分"重连"与"真跑完"，
         # 它出现即代表本次计算已彻底收口。
         store.record_finished(task_id, actor="agent")
+        if body.artifacts:
+            names = "、".join(p.strip() for p in body.artifacts[:8] if p.strip())
+            more = f"（共 {len(body.artifacts)} 项）" if len(body.artifacts) > 8 else ""
+            store.add_event(task_id, "note", "agent",
+                            f"计算进程自报产物：{names}{more}")
+        sse.notify()
+        return _detail(updated)
+
+    @app.post("/api/internal/admin/repack/{task_id}")
+    def repack(task_id: int, user=Depends(auth.require_admin)):
+        """把任务推回 packaging，让打包器再打一次。
+
+        存在的理由：产物靠时间窗兜底发现时 verified=0（"先显示、再确认"），
+        管理员在产物列表里点完确认之后需要一个重新打包的入口。
+        只认 failed 与 packaging——已经是 done 的任务重打会把已有 zip 覆盖掉，
+        那种事该由人显式决定，不该由一个通用端点顺手做掉。
+        """
+        task = store.get_task(task_id, is_admin=True)
+        if task["status"] not in ("failed", "packaging"):
+            raise HTTPException(
+                409, f"任务现在是{db.STATUS_LABEL.get(task['status'], task['status'])}，"
+                     "不需要重新打包")
+        store.update_task(task_id, error="")
+        updated = store.set_status(task_id, "packaging", actor="admin",
+                                   message="已重新排队打包")
         sse.notify()
         return _detail(updated)
 
