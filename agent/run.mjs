@@ -15,6 +15,11 @@
  * 可选：
  *   PROTFORGE_SKILLS_DIR    技能目录，默认 ../protforge/skills
  *   MINIMAX_API_KEY / MINIMAX_API_HOST   联网检索能力；缺失时降级但仍能跑
+ *   PROTORGE_AGENT_DIR     pi 的模型配置目录，由调度器在任务工作目录里物化。
+ *                          不设就退回 getAgentDir()（用户全局），而本机那份是
+ *                          空的 {}——症状是「agent 一直不吭声」而不是报错。
+ *   PROTORGE_LLM_PROVIDER / PROTORGE_LLM_MODEL   显式指定模型。不指定就由 pi 自己
+ *                          挑「第一个可用模型」，空配置下等于没有模型。
  */
 
 import { mkdirSync } from 'node:fs';
@@ -30,6 +35,7 @@ import {
   createPowerShellTool,
   getAgentDir,
   loadSkillsFromDir,
+  ModelRuntime,
   SessionManager,
   runRpcMode,
 } from '@earendil-works/pi-coding-agent';
@@ -180,13 +186,41 @@ async function main() {
     log('联网检索能力未就绪：缺少 MINIMAX_API_KEY，本次任务只能使用本地技能链继续运行');
   }
 
-  const agentDir = getAgentDir();
+  // 优先用调度器物化的那份（写在任务工作目录里，跟着任务建、跟着任务删）；
+  // 没有就退回用户全局目录——那份在多数机器上是空的，见下面 MODEL 的处理。
+  const agentDir = process.env.PROTFORGE_AGENT_DIR || getAgentDir();
+  const LLM_PROVIDER = (process.env.PROTFORGE_LLM_PROVIDER || '').trim();
+  const LLM_MODEL = (process.env.PROTFORGE_LLM_MODEL || '').trim();
   const sessionManager = SessionManager.inMemory(WORK_DIR);
 
   const createRuntime = async ({ cwd, agentDir: dir, sessionManager: sm }) => {
+    // 显式构造 ModelRuntime 并把模型挑出来。**必须挑**：不挑的话 pi 取
+    // 「第一个可用模型」，而空配置下那等于没有——agent 会安静地一直不吭声。
+    const extras = {};
+    if (LLM_PROVIDER && LLM_MODEL) {
+      const mr = await ModelRuntime.create({
+        authPath: path.join(dir, 'auth.json'),
+        modelsPath: path.join(dir, 'models.json'),
+      });
+      const found = mr.getModel(LLM_PROVIDER, LLM_MODEL);
+      if (found) {
+        extras.modelRuntime = mr;
+        extras.model = found;
+        log(`模型：${LLM_PROVIDER}/${LLM_MODEL}`);
+      } else {
+        const have = mr.getModels(LLM_PROVIDER).map((m) => m.id);
+        log(`模型配置里没有 ${LLM_PROVIDER}/${LLM_MODEL}；`
+          + `该 provider 下有：${have.length ? have.join(', ') : '(空)'}`);
+      }
+    } else {
+      log('未指定模型（PROTFORGE_LLM_PROVIDER / PROTORGE_LLM_MODEL 没设），'
+        + '退回 pi 自己的默认解析；若全局配置是空的，agent 将一直不发起请求');
+    }
+
     const services = await createAgentSessionServices({
       cwd,
       agentDir: dir,
+      ...extras,
       resourceLoaderOptions: {
         additionalSkillPaths: [SKILLS_DIR],
         extensionFactories,
@@ -208,6 +242,12 @@ async function main() {
   });
 
   for (const d of runtime.diagnostics || []) log(`会话诊断：${d.type} ${d.message}`);
+  // 模型掉回默认值时 modelFallbackMessage 是唯一的线索，之前一直没打。
+  if (runtime.modelFallbackMessage) log(`模型回退：${runtime.modelFallbackMessage}`);
+  try {
+    const m = runtime.session?.model;
+    if (m) log(`当前模型：${m.provider ?? '?'}/${m.id ?? '?'}（api=${m.api ?? '?'}）`);
+  } catch { /* 拿不到就跳过：诊断信息不该反过来把 agent 弄挂 */ }
   log(`进入 RPC 模式，任务 ${TASK_ID}，工作目录 ${WORK_DIR}`);
 
   await runRpcMode(runtime);

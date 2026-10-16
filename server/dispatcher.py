@@ -206,6 +206,87 @@ def agent_token_task(token) -> int | None:
     return _TOKENS.bound_task(token)
 
 
+# --- 模型配置 ------------------------------------------------------------------------
+#
+# pi 从**用户全局**的 agent 目录读 models.json / auth.json。本机那两个文件是空的，
+# 于是 agent 起得来却永远发不出第一次模型请求：不报错、不退出、心跳照跳，状态永远
+# 停在「正在准备环境」。这里给每个任务物化一份，密钥用 $ENV 插值、不落盘。
+
+PI_AGENT_DIRNAME = ".pi-agent"
+
+LLM_BASE_URL_ENV = "PROTFORGE_LLM_BASE_URL"
+LLM_MODEL_ENV = "PROTFORGE_LLM_MODEL"
+LLM_KEY_ENV_ENV = "PROTFORGE_LLM_API_KEY_ENV"        # 放的是"环境变量名"，不是密钥本身
+LLM_CTX_ENV = "PROTFORGE_LLM_CONTEXT_WINDOW"
+LLM_MAXTOK_ENV = "PROTFORGE_LLM_MAX_TOKENS"
+LLM_PROVIDER_ID = "protforge-llm"
+
+# 默认值与 llm-quant 的 [llm] 段一致——那是本机上已经跑通过的同一套端点。
+_LLM_DEFAULTS = {
+    LLM_BASE_URL_ENV: "https://api.minimax.cn/v1",
+    LLM_MODEL_ENV: "MiniMax-M3.1-Flash-Preview",
+    LLM_KEY_ENV_ENV: "MINIMAX_API_KEY",
+    LLM_CTX_ENV: "1000000",
+    LLM_MAXTOK_ENV: "8192",
+}
+
+
+def _llm_setting(env_name: str) -> str:
+    return (os.environ.get(env_name) or _LLM_DEFAULTS[env_name]).strip()
+
+
+def materialize_model_config(work_dir: Path) -> tuple[Path, bool]:
+    """在任务工作目录里写一份 pi 的 models.json。返回 (agent 目录, 是否有密钥)。
+
+    **密钥不写进文件**：apiKey 写成 ``$MINIMAX_API_KEY``，由 pi 在运行时从环境变量插值。
+    写死密钥的话，密钥会跟着任务目录进备份、进同步、可能进 zip。
+    """
+    key_env = _llm_setting(LLM_KEY_ENV_ENV)
+    have_key = bool(os.environ.get(key_env, "").strip())
+
+    agent_dir = Path(work_dir) / PI_AGENT_DIRNAME
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    base_url = _llm_setting(LLM_BASE_URL_ENV).rstrip("/")
+    model_id = _llm_setting(LLM_MODEL_ENV)
+
+    def _int(env_name: str) -> int:
+        raw = _llm_setting(env_name)
+        try:
+            return int(raw)
+        except ValueError:
+            log.warning("%s 不是整数（%r），退回默认值", env_name, raw)
+            return int(_LLM_DEFAULTS[env_name])
+
+    config = {
+        "providers": {
+            LLM_PROVIDER_ID: {
+                "name": "ProtForge 计算平台（OpenAI 兼容）",
+                "baseUrl": base_url,
+                "api": "openai-completions",
+                "apiKey": f"${key_env}",
+                # **models 是数组，不是按 id 建的字典**，而且每项必须有 id。
+                # 写成字典不会报任何错，整个 provider 会被静默丢掉——表现是
+                # ModelRuntime.getModels(provider) 返回空，agent 就一直不吭声。
+                "models": [{
+                    "id": model_id,
+                    "name": model_id,
+                    "api": "openai-completions",
+                    "reasoning": True,
+                    "input": ["text"],
+                    "contextWindow": _int(LLM_CTX_ENV),
+                    "maxTokens": _int(LLM_MAXTOK_ENV),
+                    "cost": {"input": 0, "output": 0,
+                             "cacheRead": 0, "cacheWrite": 0},
+                }],
+            },
+        },
+    }
+    (agent_dir / "models.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return agent_dir, have_key
+
+
 # --- GPU 探测 ------------------------------------------------------------------------
 
 GPU_PROBE_CMD = ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"]
@@ -533,6 +614,18 @@ class Dispatcher:
         # agent 侧的路径守卫要跟服务端用同一个 ProtForge 根，否则它读的是另一片 outputs
         env.setdefault("PROTFORGE_DATA", DEFAULT_PROTFORGE_DATA)
 
+        # 模型配置跟着任务走：写在工作目录里，跟着任务建、跟着任务删。
+        agent_dir, have_key = materialize_model_config(work_dir)
+        env["PROTFORGE_AGENT_DIR"] = str(agent_dir)
+        env["PROTFORGE_LLM_PROVIDER"] = LLM_PROVIDER_ID
+        env["PROTFORGE_LLM_MODEL"] = _llm_setting(LLM_MODEL_ENV)
+        if not have_key:
+            # 不在这里就失败：agent 没有模型可用，但本地技能链也许还能干点别的，
+            # 让它跑起来再由人看日志，比在调度器层硬拒更灵活。说清楚缺哪个变量。
+            env["PROTFORGE_LLM_KEY_ENV"] = _llm_setting(LLM_KEY_ENV_ENV)
+            log.warning("任务 %s：环境变量 %s 没值，agent 大概率发不出模型请求",
+                        task_id, _llm_setting(LLM_KEY_ENV_ENV))
+
         argv = [self.node_exe, str(self.agent_script)]
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.logs_dir / f"agent-{task_id}.log"
@@ -577,7 +670,50 @@ class Dispatcher:
             log.debug("任务 %s 不在库里，跳过启动事件", task_id)
         except Exception:                         # noqa: BLE001
             log.exception("记录 %s 的启动事件失败", task_id)
+        self._dispatch_prompt(ap, brief)
         return ap
+
+    @staticmethod
+    def _dispatch_prompt(ap: AgentProc, brief: str) -> None:
+        """把需求作为第一条 prompt 发进 agent 的 stdin。**没有它任务永远不会开始。**
+
+        run.mjs 跑的是 headless 的 ``runRpcMode``：agent 起来、加载完技能、进入
+        RPC 模式，然后就等着 stdin 上的第一条命令。需求虽然写进了 brief.md 并用
+        环境变量指了路，但没人把它发过去——进程活着、心跳在跳、状态永远停在
+        「正在准备环境」，不报错也不退出。
+
+        用 ``sendline`` 而不是 :meth:`rpc`：派活**不等回应**。模型的第一轮思考可能
+        要几十秒到几分钟，而 rpc 的等待窗口是给管理员那种"问一句很快就有回音"的
+        命令设计的。回应由 stdout 泵照常分流，不走等待队列。
+        """
+        text = (brief or "").strip()
+        if not text:
+            text = "请阅读工作目录下的 brief.md，按里面的要求完成计算。"
+
+        # 先换模型再派活。**必须换**：不换的话 pi 会用内置 catalog 里的默认模型
+        # （本机是 minimax/MiniMax-M2.7，指向 api.minimaxi.com），拿本平台的
+        # api.minimax.cn 密钥去打它必然 401，而界面上只看得见 step 停在
+        # 「正在准备环境」。set_model 是 headless 模式里被支持的换模型途径，
+        # 而且带回应，成功与否是能验的。
+        lines = [{
+            "id": uuid.uuid4().hex,
+            "type": "set_model",
+            "provider": LLM_PROVIDER_ID,
+            "modelId": _llm_setting(LLM_MODEL_ENV),
+        }, {
+            "id": uuid.uuid4().hex,
+            "type": "prompt",
+            "message": text,
+        }]
+        try:
+            for payload in lines:
+                ap.proc.stdin.write(
+                    (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            ap.proc.stdin.flush()
+        except Exception:                         # noqa: BLE001 - 派不出活就是起废了
+            log.exception("把需求发给计算进程 %s 失败", ap.task_id)
+            raise DispatcherError(f"无法把需求发给计算进程 {ap.task_id}")
+        _notify()
 
     # --- stdout 泵 ---------------------------------------------------------------
 
