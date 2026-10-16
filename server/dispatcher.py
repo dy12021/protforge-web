@@ -15,6 +15,10 @@
    缺产物的包还不知道。
 4. **中止**要杀整棵进程树：agent 起的 ``docker exec`` / ``wsl.exe`` 会变成孤儿继续
    烧 GPU。Windows 上 ``terminate()`` 只杀直接子进程，必须 ``taskkill /T /F``。
+5. **重启恢复**：``self._running`` 是纯内存表，进程一起就没了。上一条命接走的任务
+   在库里还是 ``running``，却再没有任何进程被跟踪——用户看到"永远在计算中"，同时
+   那些 node agent 成了孤儿继续烧 GPU。派活时把 pid 落一份运行态记录（``run/``），
+   ``start()`` 里据此收尾：**验身份** → 杀整棵进程树 → 落成带中文原因的终态。
 
 **并发上限 = nvidia-smi 探测的 GPU 数**，因为 ``_common.sh`` 的 ``protforge_exec``
 会自动挑空闲 GPU，上限等于卡数才不会互相抢卡。探测失败退回 1（不能因为没装
@@ -36,6 +40,7 @@ SQLite 共享队列，本来就不需要共享内存。令牌校验请走
 from __future__ import annotations
 
 import collections
+import datetime
 import hmac
 import json
 import logging
@@ -75,6 +80,20 @@ KILL_TIMEOUT = 15.0
 READER_JOIN_TIMEOUT = 5.0
 MAX_LINE = 1 << 20                                 # 单行 stdout 上限 1 MB，防 agent 吐大 blob 撑爆内存
 MAX_EVENTS = 5000                                  # 事件流缓冲上限，溢出丢最旧并计数
+
+# --- 重启恢复 ------------------------------------------------------------------------
+#
+# self._running 是**纯内存**表，进程一起就没了。上一条命接走的任务在库里仍是
+# running，却没有进程被跟踪：用户看到"永远在计算中"，而那些 node agent 成了孤儿，
+# Docker 里的算还在烧 GPU。派活时必须把 pid 落一份盘，start() 时据此收尾。
+
+RUN_DIRNAME = "run"                 # 运行态记录目录。**不放 logs/**：janitor 对
+                                    # logs/ 有名字形态闸（^agent-\d+(\.err)?\.log），
+                                    # 多一种后缀会被记成命名漂移；run/ 不参与清扫，
+                                    # 记录由 _settle 自己删。
+RECOVER_BUDGET = 20.0               # 恢复一轮的总时限（秒）。杀进程树可能卡在
+                                    # taskkill 上，不能让 N 个孤儿把启动拖成 N×15 秒。
+PID_REUSE_SLACK = 2.0               # 进程创建时间允许的误差（秒）
 
 _INTERNAL_ENV = "PROTFORGE_WEB_INTERNAL"
 _MAX_CONCURRENCY_ENV = "PROTFORGE_WEB_MAX_CONCURRENCY"
@@ -314,14 +333,128 @@ def probe_gpu_count() -> int:
     return sum(1 for line in (out.stdout or "").splitlines() if line.strip())
 
 
-def kill_tree(proc: subprocess.Popen, timeout: float = KILL_TIMEOUT) -> int | None:
-    """杀掉进程**整棵树**，返回 taskkill 的退出码（拿不到返回 None）。
+def _norm_image(path) -> str:
+    """进程映像名归一：只留 basename，去掉 .exe，转小写。
 
-    Windows 上 ``proc.terminate()`` 只杀直接子进程：agent 起的 ``docker exec`` /
-    ``wsl.exe`` 会脱离出去继续烧 GPU，而且没人再管它。``taskkill /T /F`` 才是
-    「连子孙一起杀」，``/F`` 是为了不让它有机会留下半截输出文件。
+    记下来的是 ``node`` 这种短名（可能只是 PATH 里的一个词），而系统报回来的是
+    ``C:\\Program Files\\nodejs\\node.exe``，直接比字符串永远不相等。
     """
-    pid = proc.pid
+    return os.path.basename(str(path or "")).removesuffix(".exe").lower()
+
+
+def _proc_fingerprint(pid) -> tuple[str, float] | None:
+    """pid -> (映像/命令行, 进程创建时刻)；**进程不在就返回 None**。
+
+    用来回答"这个 pid 还是不是我们起的那个进程"。单看 pid 不够：Windows 与 Linux
+    都会很快复用 pid，一个睡了几小时的孤儿号很可能已经被无关程序占着，不验身份
+    就 taskkill 等于替用户杀掉他随手开的编辑器。
+
+    创建时刻是两个平台都拿得到、且**不会随 pid 复用而相同**的量：Windows 走
+    ``GetProcessTimes``，Linux 走 ``/proc/<pid>/stat`` 的 starttime 字段（开机以来
+    的时钟滴答数，不是墙上时间，不受改系统时间影响）。故意只用标准库——为一个
+    查身份的活引第三方依赖不值得，本项目也没有这个依赖。
+
+    拿不到就返回 None，调用方必须据此**放弃杀进程**（判不出来 ≠ 判成是我们自己的）。
+    """
+    pid = int(pid)
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        return _win_fingerprint(pid)
+    return _posix_fingerprint(pid)
+
+
+def _win_fingerprint(pid: int) -> tuple[str, float] | None:
+    """Windows：QueryFullProcessImageNameW 拿映像路径，GetProcessTimes 拿创建时刻。
+
+    两个 API 都只要 ``PROCESS_QUERY_LIMITED_INFORMATION``，不需要 SeDebugPrivilege，
+    也**不额外起进程**——恢复轮里每个孤儿都要问一次，起 PowerShell 的话几十个孤儿
+    就是几十秒。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    # 不显式声明 argtypes/restype 的话，64 位下 HANDLE 会被截成 32 位整数，
+    # OpenProcess 返回值高位丢失 → 拿到一个乱句柄。必须声明。
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                             wintypes.LPWSTR,
+                                             ctypes.POINTER(wintypes.DWORD)]
+    k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k.GetProcessTimes.restype = wintypes.BOOL
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+
+    handle = k.OpenProcess(0x1000, False, pid)       # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None                                  # 进程没了（或无权查）→ 当它不在
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if not k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return None
+        image = buf.value
+        created = wintypes.FILETIME()
+        other = [wintypes.FILETIME() for _ in range(3)]
+        if not k.GetProcessTimes(handle, ctypes.byref(created), *other):
+            return image, 0.0                        # 拿不到时刻：还剩映像名可用
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return image, ticks / 1e7 - 11644473600.0     # FILETIME(1601 起 100ns) → unix 秒
+    finally:
+        k.CloseHandle(handle)
+
+
+def _posix_fingerprint(pid: int) -> tuple[str, float] | None:
+    """Linux 走 /proc；macOS/BSD 没有 /proc，用 ps 兜底。"""
+    try:                                              # Linux
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read()
+        # comm 字段带括号且可能含空格，从**最后一个** ')' 之后切才是第 3 个字段
+        # （state）。starttime 是整表第 22 个字段，即切分后下标 19。
+        fields = raw[raw.rindex(b")") + 2:].split()
+        start = int(fields[19]) / float(os.sysconf("SC_CLK_TCK"))
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        return cmd or f"pid-{pid}", start
+    except (OSError, ValueError, IndexError):
+        pass
+    try:                                              # macOS / BSD
+        def _ps(fmt):
+            out = subprocess.run(["ps", "-p", str(pid), "-o", fmt],
+                                 capture_output=True, text=True,
+                                 timeout=GPU_PROBE_TIMEOUT, check=False)
+            return (out.stdout or "").strip() if out.returncode == 0 else ""
+
+        command = _ps("command=")
+        if not command:
+            return None
+        # lstart 的格式随 locale 变，解析不出来就只交命令行，交给调用方比映像名
+        start = 0.0
+        raw_start = _ps("lstart=")
+        for fmt in ("%a %b %d %H:%M:%S %Y", "%c"):
+            try:
+                start = datetime.datetime.strptime(raw_start, fmt).timestamp()
+                break
+            except ValueError:
+                continue
+        return command, start
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _kill_tree_pid(pid, timeout: float = KILL_TIMEOUT) -> int | None:
+    """按 pid 杀掉进程**整棵树**，返回 taskkill 的退出码（拿不到返回 None）。
+
+    恢复路径上没有 :class:`subprocess.Popen` 句柄（进程属于上一条命），只有 pid，
+    所以树杀要能按 pid 发起。Windows 上仍然必须 ``/T /F``：只杀 node 本体的话，
+    它派生的 ``docker exec`` / ``wsl.exe`` 会活下来继续烧 GPU。
+    """
+    pid = int(pid)
+    if pid <= 0:
+        return None
     if os.name == "nt":
         kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
         try:
@@ -329,13 +462,43 @@ def kill_tree(proc: subprocess.Popen, timeout: float = KILL_TIMEOUT) -> int | No
                                  capture_output=True, text=True, timeout=timeout, **kwargs)
             return out.returncode
         except (OSError, subprocess.SubprocessError) as e:
-            log.warning("taskkill %s 失败，退回 terminate：%s", pid, e)
-    else:
+            log.warning("taskkill %s 失败：%s", pid, e)
+            return None
+    # POSIX：能整组杀就整组杀，但**先确认它不在我们这一组**。本模块 spawn 时用了
+    # start_new_session，所以在跑的进程总是独立进程组；可恢复路径拿到的是孤儿——
+    # 万一当初没起独立组，killpg 会连调度器自己一起杀掉。
+    pgid = None
+    try:
+        pgid = os.getpgid(pid)
+    except (OSError, AttributeError):
+        pgid = None
+    if pgid is not None and pgid != os.getpgrp():
         try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
             return 0
-        except (OSError, AttributeError) as e:
-            log.warning("killpg %s 失败，退回 terminate：%s", pid, e)
+        except OSError as e:
+            log.warning("killpg %s 失败，退回单进程：%s", pgid, e)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return 0
+    except OSError as e:
+        log.warning("kill %s 失败：%s", pid, e)
+        return None
+
+
+def kill_tree(proc: subprocess.Popen, timeout: float = KILL_TIMEOUT) -> int | None:
+    """杀掉进程**整棵树**，返回 taskkill 的退出码（拿不到返回 None）。
+
+    Windows 上 ``proc.terminate()`` 只杀直接子进程：agent 起的 ``docker exec`` /
+    ``wsl.exe`` 会脱离出去继续烧 GPU，而且没人再管它。``taskkill /T /F`` 才是
+    「连子孙一起杀」，``/F`` 是为了不让它有机会留下半截输出文件。
+
+    树杀逻辑本身在 :func:`_kill_tree_pid`（恢复路径只有 pid，没有句柄），这里只补
+    句柄兜底：按 pid 杀不动时退回 ``terminate()``。
+    """
+    code = _kill_tree_pid(proc.pid, timeout)
+    if code is not None:
+        return code
     try:
         proc.terminate()
     except OSError:
@@ -408,6 +571,26 @@ def _db_status(task_id: int) -> str:
         return ""
 
 
+
+def _restart_reason(pid: int, cleaned: bool) -> str:
+    """服务重启后收尾遗留任务的失败原因。**不许静默改状态。**
+
+    用户看到的是一个已经算不成、也不打算自动重算的任务（重跑可能有几万步的副作用，
+    悄悄重排队的代价比让他自己按一次重提交大）。所以文案必须把"为什么"说全：不是
+    任务算错了，是服务重启把进程带走了。
+
+    ``cleaned`` 只在**确认进程真的没了**时为真。没确认就不能说"已清理"——否则用户
+    以为 GPU 空出来了，其实还在替他烧。
+    """
+    if cleaned:
+        return (f"服务重启，计算进程已中断（残留进程树 pid={pid} 已清理）；"
+                f"这次计算没有完成，需要的话请重新提交")
+    if pid > 0:
+        return (f"服务重启，计算进程已中断（原进程 pid={pid} 未能确认清理，请检查 "
+                f"是否还有残留计算进程）；这次计算没有完成，需要的话请重新提交")
+    return "服务重启，计算进程已中断；这次计算没有完成，需要的话请重新提交"
+
+
 def _notify() -> None:
     """写完事件叫醒 SSE 订阅者（Task 6 的交接项）。
 
@@ -419,6 +602,86 @@ def _notify() -> None:
         sse.notify()
     except Exception:                     # noqa: BLE001 - 叫醒失败不是调度器的故障
         log.debug("SSE 叫醒失败", exc_info=True)
+
+
+# --- 运行态记录（重启恢复用） -------------------------------------------------------
+#
+# tasks 表里**没有 pid 列**（schema 在 db.py，本模块不碰它），而 self._running 是纯内存
+# 的，进程一起就没了。所以派活时把 pid 与它的身份指纹落一份小 JSON 到 run/<id>.json，
+# 收尾时删掉。落盘的是运行态而不是业务数据：丢了最坏结果是恢复时少杀一个孤儿，
+# 不会让任务算错，所以刻意不进数据库、不做迁移。
+
+
+def _record_path(run_dir: Path, task_id: int) -> Path:
+    return Path(run_dir) / f"{int(task_id)}.json"
+
+
+def _claim_path(run_dir: Path, task_id: int, run_id: str) -> Path:
+    """认领锁的文件名**带 run_id**：新一次派活换一把锁，不会被上一条命的残锁堵住。"""
+    return Path(run_dir) / f"{int(task_id)}-{run_id}.claim"
+
+
+def _verify_pid(record: dict) -> tuple[bool, str]:
+    """这个 pid 还是不是我们起的那个 agent？返回 (能不能杀, 理由)。
+
+    两道闸，缺一不可：
+
+    1. **进程得还在**（``_proc_fingerprint`` 返回 None）。顺带把"上一条命的进程早就
+       退了"这种情况从"杀"降级成"只是账没销"。
+    2. **创建时刻对得上**。pid 会被复用，创建时刻不会；差出 :data:`PID_REUSE_SLACK`
+       就是别人的进程。Windows 上再比一遍映像名（node vs node.exe 这类短名/全名
+       差异由 :func:`_norm_image` 吸收）。
+
+    记录里压根没有指纹（派活时就没查到）时**一律不杀**：判不出来不等于判成自己的，
+    宁可留一个孤儿，也不能替用户杀掉他无关的程序。
+    """
+    pid = int(record.get("pid") or 0)
+    fp = _proc_fingerprint(pid)
+    if fp is None:
+        return False, f"原计算进程 pid={pid} 已经不在了"
+    image, start = fp
+    want_start = float(record.get("start_epoch") or 0.0)
+    if want_start and start and abs(start - want_start) > PID_REUSE_SLACK:
+        return False, f"pid={pid} 已被别的进程复用（{image}），不杀"
+    want_image = record.get("image") or record.get("node_exe")
+    if want_image and os.name == "nt" and _norm_image(image) != _norm_image(want_image):
+        return False, f"pid={pid} 的映像是 {image}，不是我们起的 {want_image}，不杀"
+    return True, f"残留计算进程 pid={pid}"
+
+
+def _claim(run_dir: Path, task_id: int, run_id: str) -> bool:
+    """抢恢复的认领权。抢不到就返回 False（别的实例正在收尾同一个 pid）。
+
+    ``O_CREAT | O_EXCL`` 是文件系统级的原子原语，与 :func:`store.claim_queued` 在
+    SQLite 里那句 ``UPDATE ... WHERE status='queued'`` 同源：两个调度器实例同时启动
+    （或者有人在另一个 app 里手动拉起一个）时，只有一个会去杀那个 pid、落那个终态，
+    另一个直接让开——否则两边各写一条"服务重启"事件、并发 taskkill 同一个号。
+
+    与 claim_queued 不同的是这里不用库：认领的是**这台机器上的某个 pid**，不是库里
+    的一行，写文件正好对得上，而且不碰 store 就不受另一个人正在改 store 的影响。
+    """
+    try:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(_claim_path(run_dir, task_id, run_id)),
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    except OSError as e:
+        # 建不出锁文件不算致命：退化成"不杀进程，只销账"，见 _recover_one
+        log.warning("抢恢复认领锁失败，任务 %s：%s", task_id, e)
+        return True
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_claim(path: Path) -> None:
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
 
 
 class Dispatcher:
@@ -446,6 +709,10 @@ class Dispatcher:
         self.rpc_timeout = float(rpc_timeout or RPC_TIMEOUT)
         self.poll_interval = float(poll_interval or POLL_INTERVAL)
         self.logs_dir = self.data_root / "logs"
+        self.run_dir = self.data_root / RUN_DIRNAME    # 运行态记录，见 _verify_pid 上方
+        #: 最近一次恢复的账（start() 时写）。给测试与排障看"启动到底收了几条"。
+        self.last_recovery: dict = {"candidates": 0, "settled": [], "killed": [],
+                                    "left_alone": [], "errors": []}
         self.gpu_count = max(0, int((gpu_probe or probe_gpu_count)()))
         self.limit = self._resolve_limit(max_concurrency)
 
@@ -482,7 +749,14 @@ class Dispatcher:
             return dict(self._running)
 
     def start(self) -> None:
-        """起后台线程轮询队列。重复调用是空操作。"""
+        """起后台线程轮询队列。重复调用是空操作。
+
+        **先恢复再开线程**：上一条命接走的任务在库里还是 running，而本进程的
+        ``_running`` 是空的，没有任何东西会去收尾它们——用户看到的是"永远在计算
+        中"，同时那些 node agent 成了孤儿继续烧 GPU。恢复必须发生在起线程之前，
+        否则新接的任务会先占满并发，恢复还被排在后面。
+        """
+        self.recover()
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -491,6 +765,164 @@ class Dispatcher:
             self._thread = threading.Thread(target=self._loop, name="dispatcher", daemon=True)
             self._thread.start()
         log.info("调度器启动：并发上限 %s（探测到 %s 张 GPU）", self.limit, self.gpu_count)
+
+    # --- 重启恢复 ----------------------------------------------------------------
+
+    def recover(self) -> dict:
+        """收尾「上一条命」留下的 running 任务，返回一张账。
+
+        每个 ``run/<id>.json`` 代表一个曾被派出去、进程可能还活着的 agent：
+        查身份 → 杀整棵进程树 → 把任务落成 ``failed`` 并写明中文原因。
+
+        **全程不抛**：库不可达、记录损坏、taskkill 卡住都只记日志。恢复是启动前的
+        善后，坏掉的善后不该让平台起不来——用户至少还能进来看任务列表。
+        :data:`RECOVER_BUDGET` 是总时限，杀进程树最坏要 KILL_TIMEOUT 秒一棵树，
+        不能让 N 个孤儿把启动拖成 N×15 秒。
+        """
+        summary = {"candidates": 0, "settled": [], "killed": [],
+                   "left_alone": [], "errors": []}
+        self.last_recovery = summary
+        try:
+            records = self._run_records()
+        except Exception:                         # noqa: BLE001 - 读不到就当没有孤儿
+            log.exception("读取运行态记录失败，跳过重启恢复")
+            return summary
+        summary["candidates"] = len(records)
+        if not records:
+            return summary
+        log.info("重启恢复：发现 %s 条遗留 running 记录", len(records))
+        deadline = time.monotonic() + RECOVER_BUDGET
+        for task_id, record in records:
+            if self._stopping:
+                break
+            if time.monotonic() > deadline:
+                # 超时就不管了：宁可留一个孤儿在库里显示 running，也不能把服务启动
+                # 卡死。剩下的记进 left_alone，日志里点名。
+                log.warning("重启恢复超时，%s 条记录留给下一轮人工处理", task_id)
+                summary["left_alone"].append(task_id)
+                continue
+            try:
+                self._recover_one(task_id, record, summary)
+            except Exception:                     # noqa: BLE001 - 单条失败不带走整轮
+                log.exception("恢复遗留任务 %s 失败", task_id)
+                summary["errors"].append(task_id)
+        log.info("重启恢复结束：收尾 %s、清理孤儿 %s、放过 %s、出错 %s",
+                 len(summary["settled"]), len(summary["killed"]),
+                 len(summary["left_alone"]), len(summary["errors"]))
+        return summary
+
+    def _run_records(self) -> list:
+        """读出全部运行态记录，按 task_id 升序（先来的先收）。
+
+        认不出来的一律跳过并单独告警：记录是运行态，坏了最多丢一个孤儿的清理，
+        不该在启动路径上抛异常。
+        """
+        out: list = []
+        if not self.run_dir.is_dir():
+            return out
+        try:
+            entries = sorted(self.run_dir.glob("*.json"), key=lambda p: p.name)
+        except OSError as e:
+            log.warning("扫运行态目录失败：%s", e)
+            return out
+        for path in entries:
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                task_id = int(rec["task_id"])
+                pid = int(rec.get("pid") or 0)
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                log.warning("运行态记录 %s 认不出来，跳过：%s", path.name, e)
+                continue
+            if pid <= 0:
+                log.warning("运行态记录 %s 没有 pid，跳过", path.name)
+                continue
+            out.append((task_id, rec))
+        return out
+
+    def _recover_one(self, task_id: int, record: dict, summary: dict) -> None:
+        """收尾一条遗留记录。判断顺序是有讲究的，从便宜到贵、从安全到动手。"""
+        run_id = str(record.get("run_id") or "")
+        # 1) 本实例正在跑它 → 不是遗留，别动自己的进程
+        if task_id in self.running:
+            summary["left_alone"].append(task_id)
+            return
+        # 2) 抢认领权：另一个调度器实例已经在收同一个 pid 就让开，避免两边各杀一次、
+        #    各写一条"服务重启"事件
+        claim = _claim_path(self.run_dir, task_id, run_id)
+        if not _claim(self.run_dir, task_id, run_id):
+            log.info("任务 %s 正被另一个调度器实例恢复，让开", task_id)
+            summary["left_alone"].append(task_id)
+            return
+        try:
+            # 3) 抢到锁之后**重读**记录：抢锁之前它可能已经被新一次派活覆盖了
+            #    （run_id 变了），那时这个 pid 是新进程的，杀它等于砸掉正在算的任务。
+            #    这与 claim_queued「抢不到就别写回 running」是同一个道理：动手之前
+            #    必须在锁内复核一次。
+            fresh = self._run_records()
+            current = {tid: rec for tid, rec in fresh}.get(task_id)
+            if current is None or str(current.get("run_id") or "") != run_id:
+                log.info("任务 %s 的运行态记录已被新一轮派活覆盖，跳过恢复", task_id)
+                summary["left_alone"].append(task_id)
+                return
+            record = current
+            # 4) 库里已经不是 running → 别人（用户中止 / 上一条命自己收尾 / 别的实例）
+            #    已经处理过了，**不许覆盖**，只把账销掉
+            if _db_status(task_id) != "running":
+                log.info("任务 %s 已不在 running（可能已被中止或收尾），只销记录", task_id)
+                summary["left_alone"].append(task_id)
+                return
+            # 5) 验身份 → 杀整棵树 → 落终态
+            killable, why = _verify_pid(record)
+            pid = int(record.get("pid") or 0)
+            cleaned = False
+            if killable:
+                _kill_tree_pid(pid)
+                # 杀完**再问一次**还在不在：taskkill 可能失败或超时。没确认就说"已清理"
+                # 是在骗用户——他以为 GPU 空出来了，其实还在烧。
+                cleaned = _proc_fingerprint(pid) is None
+                if cleaned:
+                    summary["killed"].append(task_id)
+                    log.warning("任务 %s：服务重启，杀掉残留进程树 %s", task_id, why)
+                else:
+                    log.warning("任务 %s：服务重启，%s，但进程树仍在运行，需人工确认",
+                                task_id, why)
+            else:
+                log.warning("任务 %s：%s", task_id, why)
+            self._mark_failed(task_id, _restart_reason(pid, cleaned))
+            summary["settled"].append(task_id)
+        finally:
+            _release_claim(claim)
+            self._drop_run_record(task_id)
+
+    def _write_run_record(self, ap: AgentProc) -> None:
+        """派活成功后落运行态记录。落不下去只警告——它只影响重启后的清理。"""
+        fp = _proc_fingerprint(ap.pid) or ("", 0.0)
+        rec = {
+            "task_id": ap.task_id,
+            # run_id 是这一轮派活的身份：新一轮派活会换一个新值，恢复时靠它认出
+            # 「这条记录已经被人重写」。
+            "run_id": uuid.uuid4().hex,
+            "pid": ap.pid,
+            "argv": [str(a) for a in ap.argv],
+            "node_exe": str(self.node_exe),
+            "image": fp[0],
+            "start_epoch": fp[1],
+            "started_at": ap.started_at,
+            "work_dir": str(ap.work_dir),
+        }
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            _record_path(self.run_dir, ap.task_id).write_text(
+                json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            log.warning("写运行态记录失败，任务 %s 的孤儿将来不会被自动清理：%s",
+                        ap.task_id, e)
+
+    def _drop_run_record(self, task_id: int) -> None:
+        try:
+            _record_path(self.run_dir, task_id).unlink()
+        except OSError:
+            pass                  # 本来就没有，不算事
 
     def stop(self) -> None:
         """停轮询并中止所有在跑的进程。服务退出时调，可重复调。"""
@@ -657,6 +1089,8 @@ class Dispatcher:
         )
         with self._lock:
             self._running[task_id] = ap
+        # 立刻落运行态记录：进程一旦起来，它就可能活过本进程，必须留凭据给恢复用
+        self._write_run_record(ap)
         ap.reader = threading.Thread(target=self._pump_stdout, args=(ap,),
                                      name=f"agent-stdout-{task_id}", daemon=True)
         ap.reader.start()
@@ -927,6 +1361,9 @@ class Dispatcher:
         code = ap.proc.poll() if exit_code is None else exit_code
         ap.exit_code = code
         revoke_agent_token(ap.task_id)
+        # 收尾是唯一的"这个 pid 已经归我处理完了"信号：记录留着的话，下次启动会把
+        # 一个早就退出的进程当成孤儿来追（更糟的是 pid 已经被复用，见 _verify_pid）
+        self._drop_run_record(ap.task_id)
         self._close_handles(ap)
 
         try:
