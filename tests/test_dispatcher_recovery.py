@@ -467,6 +467,48 @@ def test_recordless_sweep_leaves_untouched_tasks_alone(make_disp, make_task):
     assert summary["no_record"] == 0, summary
 
 
+def test_recordless_sweep_releases_its_claim(make_disp, make_task):
+    """补扫抢到的认领锁必须被还回去。
+
+    这条来自真机跑：起一次服务收掉四条卡住的 running 任务之后，run/ 里留下
+    四个 `*-no-record.claim` 没人删（run/ 不参与 janitor 清扫）。对这一路来说
+    残留不是"垃圾文件"那么轻——run_id 是固定哨兵，锁在就意味着**这个 task_id
+    永远进不了补扫**。同一个任务第二次以同样方式卡住时就再也扫不掉了，
+    正是这个功能要根治的症状换了个形式回来。
+    """
+    d = make_disp()
+    task = make_task()
+    store.set_status(task["id"], "running", actor="system")
+
+    d.recover()
+
+    claim = dispatcher._claim_path(d.run_dir, task["id"], dispatcher._NO_RECORD)
+    assert not claim.exists(), f"认领锁没还回去：{claim.name}"
+
+
+def test_recordless_task_can_be_swept_twice(make_disp, make_task):
+    """同一条无记录任务连扫两次都能收尾——残锁挡不住第二次。
+
+    这是上一条的行为后果：管理员重跑后再次卡住、库里又出现 running + 无记录时，
+    补扫必须还能再收一次。
+    """
+    d = make_disp()
+    task = make_task()
+    store.set_status(task["id"], "running", actor="system")
+    first = d.recover()
+    assert first["no_record"] == 1, first
+
+    # 模拟管理员重跑：failed -> queued -> running，磁盘上依旧没有记录
+    store.set_status(task["id"], "queued", actor="admin", message="重跑")
+    store.set_status(task["id"], "running", actor="system")
+
+    second = d.recover()
+
+    assert second["no_record"] == 1, (
+        f"第二次补扫被上一次的残锁挡住了：{second}")
+    assert store.get_task(task["id"], is_admin=True)["status"] == "failed"
+
+
 def test_recordless_sweep_yields_when_another_instance_holds_the_claim(
         make_disp, make_task):
     """两个实例同时启动，只有一个能收尾那条无记录任务。"""

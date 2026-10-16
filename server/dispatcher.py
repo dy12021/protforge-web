@@ -929,7 +929,8 @@ class Dispatcher:
         不动手，并把「为什么杀不了」如实写进原因里。
 
         抢锁用的是同一个 ``_claim``，哨兵 run_id 固定成 :data:`_NO_RECORD`，
-        于是两个实例补扫同一个任务时只有一方会动手。
+        于是两个实例补扫同一个任务时只有一方会动手。**抢到就要还**——认领锁靠删文件
+        释放，run/ 又不参与清扫，残锁会把同一个 task_id 永远挡在补扫之外。
         """
         try:
             rows = store.list_tasks(status="running", is_admin=True, limit=500)
@@ -976,6 +977,13 @@ class Dispatcher:
             except Exception:                         # noqa: BLE001 - 单条不带走整轮
                 log.exception("补扫无记录任务 %s 失败", task_id)
                 summary["errors"].append(task_id)
+            finally:
+                # **抢到就要还。** 认领锁靠 O_CREAT|O_EXCL 建，靠「删掉」释放；
+                # 不删的话它会永久留在这里，而 run/ 不参与 janitor 清扫。
+                # 这一路的 run_id 还是固定哨兵，于是残锁会把这个 task_id
+                # **永远**挡在补扫之外——同一个任务第二次以同样的方式卡住时，
+                # 就再也扫不掉了，正是这个功能要根治的症状换了个形式回来。
+                _release_claim(_claim_path(self.run_dir, task_id, _NO_RECORD))
 
     def _recover_one(self, task_id: int, record: dict, summary: dict) -> None:
         """收尾一条遗留记录。判断顺序是有讲究的，从便宜到贵、从安全到动手。"""
