@@ -676,7 +676,12 @@ def test_agent_event_bad_kind_is_422(internal, public):
     assert r.status_code == 422 and is_chinese(r.json()["detail"])
 
 
-def test_agent_finish_marks_done(internal, public):
+def test_agent_finish_records_marker_without_moving_status(internal, public):
+    """finish **不改状态**——算完不等于交付完。
+
+    状态由调度器推进：进程退出 -> packaging -> 打包器 -> done。原先 finish 直接
+    置 done，调度器随后又改回 packaging，界面上流转轨会**倒退一格**再前进。
+    """
     make_user()
     task = create_task(public, login(public))
     tok = svc.issue_agent_token(task["id"])
@@ -686,9 +691,23 @@ def test_agent_finish_marks_done(internal, public):
                       headers={"X-Agent-Token": tok})
     assert r.status_code == 200
     got = store.get_task(task["id"])
-    assert got["status"] == "done"
+    assert got["status"] == "running", "finish 不该推状态，状态归调度器"
     assert got["summary"] == "算完了，RMSD 1.2"
     assert store.has_finished(task["id"])
+
+
+def test_agent_finish_twice_is_refused(internal, public):
+    """状态不再由 finish 决定，所以重复收口的闸门必须看 finished 标记。"""
+    make_user()
+    task = create_task(public, login(public))
+    tok = svc.issue_agent_token(task["id"])
+    store.set_status(task["id"], "running", actor="system")
+    first = internal.post("/api/internal/agent/%d/finish" % task["id"],
+                          json={"summary": "算完了"}, headers={"X-Agent-Token": tok})
+    assert first.status_code == 200
+    again = internal.post("/api/internal/agent/%d/finish" % task["id"],
+                          json={"summary": "再算一次"}, headers={"X-Agent-Token": tok})
+    assert again.status_code == 422 and is_chinese(again.json()["detail"])
 
 
 def test_agent_finish_with_error_marks_failed(internal, public):

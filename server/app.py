@@ -718,18 +718,23 @@ def create_internal_app() -> FastAPI:
     def agent_finish(task_id: int, body: FinishIn,
                      _tid: int = Depends(require_agent)):
         task = store.get_task(task_id)
-        if task["status"] in db.TERMINAL_STATUSES:
+        # 闸门看 finished 标记，不只看状态：状态已经不由 finish 决定了，
+        # 只拿终态去判会把第二次 finish 放进来。
+        if store.has_finished(task_id) or task["status"] in db.TERMINAL_STATUSES:
             raise HTTPException(422, "任务已经结束，不能重复收口")
         # 给了 error 就判失败：agent 自己报的失败要能落进时间线，
         # 但只有 system/调度器才允许把任务推上 done。
-        fields = {"status": "failed", "error": body.error} if body.error \
-            else {"status": "done"}
-        updated = store.set_status(task_id, fields.pop("status"), actor="agent",
-                                   message=body.summary or body.error)
+        if body.error:
+            updated = store.set_status(task_id, "failed", actor="agent",
+                                       message=body.error)
+            updated = store.update_task(task_id, error=body.error)
+        else:
+            # **成功时不改状态。** 算完不等于交付完：还要 _settle 推 packaging、
+            # 打包器打 zip，才到 done。原来这里直接置 done，调度器随后又把状态改回
+            # packaging，界面上流转轨会**倒退一格**再前进——明明算完了却看着像返工。
+            updated = task
         if body.summary:
-            fields["summary"] = body.summary
-        if fields:
-            updated = store.update_task(task_id, **fields)
+            updated = store.update_task(task_id, summary=body.summary)
         # finished 事件放最后：调度器拿 has_finished() 区分"重连"与"真跑完"，
         # 它出现即代表本次计算已彻底收口。
         store.record_finished(task_id, actor="agent")

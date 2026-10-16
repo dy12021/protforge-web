@@ -178,6 +178,26 @@ def discover(task_id: int, started_at=None, ended_at=None) -> list[dict]:
     found: list[tuple[str, str, str, int, int]] = []  # path, name, source, size, verified
     seen: set[str] = set()
 
+    # 登记一张产物。**不去查 seen**：调用它的那段循环已经先往 seen 里塞过了，
+    # 再查一次等于把每一项都当成重复跳掉，于是 discover 什么都找不到。
+    # 工作目录那一路自己用 reg_seen 去重。
+    reg_seen: set[str] = set()
+
+    def _register(path: Path, name: str, source: str, verified: int,
+                  dedup: bool = False) -> None:
+        key = os.path.normcase(str(path))
+        if dedup:
+            if key in reg_seen:
+                return
+            reg_seen.add(key)
+        size = path.stat().st_size if path.is_file() else _measure(path)[0]
+        aid = store.artifacts.add(tid, str(path), name,
+                                  kind="file" if path.is_file() else "dir",
+                                  size=size, source=source)
+        if not verified:
+            _set_verified(tid, aid, 0)
+        found.append((str(path), name, source, size, verified))
+
     for d in sorted(root.iterdir(), key=lambda p: p.name):
         # 只认目录：outputs/ 下的散文件是工具的临时残留。
         # 跳过 symlink/junction：跟着它 zip 会把 outputs 之外的东西拖进下载包。
@@ -195,8 +215,6 @@ def discover(task_id: int, started_at=None, ended_at=None) -> list[dict]:
 
         source = "prefix" if is_prefix else "timewindow"
         path = str(d)
-        aid = store.artifacts.add(tid, path, d.name, kind="dir", size=size,
-                                  source=source)
         verified = 1
         if source == "timewindow":
             # store.add 恒写 verified=1，这里把它降回 0；但管理员此前明确确认过的
@@ -204,8 +222,28 @@ def discover(task_id: int, started_at=None, ended_at=None) -> list[dict]:
             prev = before.get(path)
             if not (prev and int(prev["verified"]) == 1):
                 verified = 0
-                _set_verified(tid, aid, 0)
-        found.append((path, d.name, source, size, verified))
+        _register(d, d.name, source, verified)
+
+    # --- 任务工作目录：每个任务独占，里面的东西必然属于它 -----------------------------
+    #
+    # 联调实测 agent 把结果写在这里，而 outputs 根是空的。工作目录不需要前缀或
+    # 时间窗去猜——它本来就是这个任务的，所以一律 verified=1，可直接下载。
+    work = db.data_root() / "work" / str(tid)
+    if work.is_dir():
+        for f in sorted(work.rglob("*"), key=lambda p: p.name):
+            if not f.is_file() or f.is_symlink():
+                continue
+            rel = f.relative_to(work)
+            # 这三个不是产物：模型配置不该进用户的下载包；brief 是输入不是结果；
+            # pack_spec 是打包用的临时参数。
+            if rel.parts and rel.parts[0] == ".pi-agent":
+                continue
+            if f.name in ("brief.md", "pack_spec.json"):
+                continue
+            # 显示名用文件名本身：store.artifacts.add 禁止 name 里带分隔符
+            # （它会变成 zip 的 arcname，放行等于开路径穿越）。目录结构由
+            # package 打包时按相对工作目录的真实路径补回去。
+            _register(f, f.name, "workdir", 1, dedup=True)
 
     ids = {r["id"] for r in store.artifacts.list(tid) if r["path"] in
            {f[0] for f in found}}
@@ -295,9 +333,19 @@ def package(task_id: int, out_zip=None, progress_cb=None,
             src = guards.resolve(r["path"], tid, write=False)
         except guards.Violation as e:
             raise PackageError(f"产物路径越界，已跳过：{e}") from e
+        # 目录和散文件都收：outputs 根那边是目录（一个工具一个输出目录），
+        # 任务工作目录那边是 agent 自己写的散文件。
+        if not src.is_dir() and not src.is_file():
+            raise PackageError(f"产物不存在：{src}")
+        # zip 内的路径。工作目录里的产物用它相对工作目录的真实路径，保留目录结构
+        # （登记时为了防穿越，name 被压成了文件名，结构得在这儿补回来）。
+        arc = r["name"]
         if not src.is_dir():
-            raise PackageError(f"产物目录不存在：{src}")
-        sources.append({"src": str(src), "arcname": r["name"]})
+            try:
+                arc = src.relative_to(db.data_root() / "work" / str(tid)).as_posix()
+            except ValueError:
+                pass                                   # 不在工作目录里，用 name
+        sources.append({"src": str(src), "arcname": arc})
 
     work = db.data_root() / "work" / str(tid)
     work.mkdir(parents=True, exist_ok=True)
@@ -415,19 +463,24 @@ def _worker_main(spec_path: str) -> int:
         emit({"event": "error", "message": f"打包参数不可用：{e}"})
         return 2
 
-    roots = []
+    roots = []      # 目录，整棵收进去
+    singles = []    # 散文件，一个就是一个条目
     for s in sources:
         src = Path(s["src"])
-        if not src.is_dir():
-            emit({"event": "error", "message": f"产物目录不存在：{src}"})
+        if src.is_dir():
+            roots.append((src, s["arcname"]))
+        elif src.is_file():
+            singles.append((src, s["arcname"]))
+        else:
+            emit({"event": "error", "message": f"产物不存在：{src}"})
             return 2
-        roots.append((src, s["arcname"]))
 
-    total = 0
+    total = len(singles)
     for src, _arc in roots:
         for _d, _dn, fns in os.walk(src, followlinks=False):
             total += len(fns)
-    emit({"event": "start", "pid": os.getpid(), "total": total, "sources": len(roots)})
+    emit({"event": "start", "pid": os.getpid(), "total": total,
+          "sources": len(roots) + len(singles)})
 
     out.parent.mkdir(parents=True, exist_ok=True)
     done = 0
@@ -438,6 +491,18 @@ def _worker_main(spec_path: str) -> int:
     try:
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, allowZip64=True,
                              compresslevel=1) as zf:
+            for src, arc in singles:
+                try:
+                    zf.write(src, arc)
+                except OSError:
+                    skipped += 1
+                    continue
+                done += 1
+                pct = int(done * 100 / total) if total else 100
+                if pct != last_pct:
+                    last_pct = pct
+                    emit({"event": "progress", "done": done, "total": total,
+                          "pct": pct, "path": str(src)})
             for src, arc in roots:
                 for dirpath, _dn, fns in os.walk(src, followlinks=False):
                     for fn in sorted(fns):
