@@ -119,11 +119,12 @@ export function createReporter(cfg) {
     },
 
     /**
-     * 记下「当前正在跑什么」，供心跳复用。
-     * 由 run.mjs 在每次工具调用前后调用。
+     * 「当前在做什么」只由模型的 report_step 决定，**没有任何旁路**能改写它。
+     *
+     * 早先 run.mjs 挂着 spawnHook，每条命令执行前调 setCurrent 把命令原文塞进来，
+     * 于是页面上那行显示的是被截到 70 字符的 shell 命令。现在那条旁路已经删掉：
+     * 命令原文归 audit_log（带退出码和耗时），step 归叙事，两者不抢同一行。
      */
-    setCurrent(text) { current = text ? clip(text) : null; },
-
     startHeartbeat(intervalMs = HEARTBEAT_MS) {
       if (timer || finished) return;
       timer = setInterval(() => {
@@ -151,11 +152,18 @@ export function createReporterTools(reporter) {
     name: 'report_step',
     label: 'report_step',
     description:
-      '向网页回传当前正在做什么，让用户看到实时进度。'
-      + `文本不超过 ${MAX_STEP_CODEPOINTS} 个字，说人话，别写日志。`
-      + '长时间运行的步骤也要定期重复上报，否则页面看起来像卡住了。',
+      '向网页回传当前正在做什么——这句话会显示在任务卡片最显眼的位置，给用户看。'
+      + `不超过 ${MAX_STEP_CODEPOINTS} 个字。`
+      + '要求：用户视角的动宾短语（例如「正在搜寻蛋白质序列」「正在计算表面面积」）；'
+      + '**绝不要**贴命令、路径、管道、重定向或参数，那些是审计日志的内容，不是进度。'
+      + '只在换阶段时上报，没换阶段就不用反复报——页面上那句话本来就会一直挂着。',
     parameters: Type.Object({
-      text: Type.String({ description: `一句话进度，不超过 ${MAX_STEP_CODEPOINTS} 个字` }),
+      text: Type.String({
+        description:
+          `一句话进度（用户视角的动宾短语，不超过 ${MAX_STEP_CODEPOINTS} 个字）。`
+          + '例：「正在搜寻蛋白质序列」。'
+          + '反面例：「正在执行：cd E:/... && python foo.py 2>&1 | tail」——这是命令，不是进度。',
+      }),
     }),
     async execute(_callId, params) {
       const r = await reporter.step(params?.text);

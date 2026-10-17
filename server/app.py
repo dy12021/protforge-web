@@ -819,8 +819,8 @@ def create_internal_app() -> FastAPI:
                    _tid: int = Depends(require_agent)):
         store.get_task(task_id)
         step = store.set_step(task_id, body.text)      # 返回值已是截断后的
-        store.add_event(task_id, "step", "agent", body.text)
-        sse.notify()
+        store.add_step_event(task_id, "agent", step)    # 与上一条同文则不重复写时间线
+        sse.notify()                                    # 无论去重与否都要唤醒：还活着
         return {"step": step}
 
     @app.post("/api/internal/agent/{task_id}/event")

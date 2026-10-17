@@ -72,9 +72,6 @@ const SKILLS_DIR = process.env.PROTFORGE_SKILLS_DIR || DEFAULT_SKILLS_DIR;
 
 const log = (...a) => console.error('[agent]', ...a);
 
-// spawnHook 是模块级函数，拿不到 main() 里的 reporter，用这个引用接过去。
-let reporterRef = null;
-
 // ---------------------------------------------------------------- 平台规则
 
 /**
@@ -94,7 +91,16 @@ const PLATFORM_RULES = `
   写成 .sh 脚本文件再按路径调用。
 - 命令会被安全守卫校验：解析不出来的、含 eval/source/.、以及作用在工作目录与 ../protforge
   之外路径上的删除/写入/挂载，一律拒绝并把理由返回给你。被拒就换写法，不要反复重试同一条。
-- \`report_step\` 用于回传进度，**长步骤期间要周期性重复上报**，否则页面看起来像卡死。
+- \`report_step\` 回传的是**给用户看的一句话进度**，它显示在任务卡片最显眼的位置。
+  - 写**用户视角的动宾短语**，像进度播报：正在搜寻蛋白质序列 / 正在用 RFdiffusion 生成结构 /
+    正在计算表面面积 / 正在比对候选表位。
+  - **绝对不要**把命令、路径、参数照抄进去：\`正在执行：cd E:/.../work/13 && python foo.py 2>&1 | tail\`
+    这种是审计日志的内容，不是给人读的。原样贴命令等于没回传。
+    你跑的命令原样记在 audit_log 里，那里才查得到。
+  - 30 个字以内，不带句号，不加「正在执行：」这种前缀。
+  - **只在换阶段时上报**（换了技能、换了个产物、拿到新结论）。没换阶段就不用反复报——
+    页面上的那句话本来就会一直挂着，长命令跑着的时候也不会动。
+  - 顺带一提：\`report_step\` 不接受「进度条百分比」，只接受一句话。
 - 只有在计算真的跑完、产物已经落在工作目录里之后，才调用 \`finish\`。
   没跑完就调 finish 会让后端直接去打包一堆半成品。`;
 console.log = console.error; // stdout 归 RPC 独占
@@ -116,7 +122,6 @@ async function main() {
   for (const d of diagnostics || []) log(`技能诊断：${d.type} ${d.message}`);
 
   const reporter = createReporter({ internal: INTERNAL, taskId: TASK_ID, token: TOKEN });
-  reporterRef = reporter;
   reporter.startHeartbeat();
   await reporter.step('计算进程已启动，正在准备环境');
 
@@ -141,13 +146,13 @@ async function main() {
   log('命令守卫已启用（AST 解析，失败即拒）');
 
   const codingTools = createCodingTools(WORK_DIR, {
-    bash: { operations: guard.bash, spawnHook },
+    bash: { operations: guard.bash },
     read: { operations: guard.read },
     write: { operations: guard.write },
     edit: { operations: guard.edit },
   });
   // createCodingTools 只产出 read/bash/edit/write，PowerShell 要单独挂一个。
-  codingTools.push(createPowerShellTool(WORK_DIR, { operations: guard.powershell, spawnHook }));
+  codingTools.push(createPowerShellTool(WORK_DIR, { operations: guard.powershell }));
   const customTools = [...codingTools, ...createReporterTools(reporter)];
 
   /**
@@ -260,15 +265,18 @@ async function main() {
   await runRpcMode(runtime);
 }
 
-/**
- * 每条 shell 命令执行前把它记成「当前在做什么」，心跳定时器就靠它续命。
- * 蛋白结构预测动辄几十分钟，期间模型是没有机会调用 report_step 的，
- * 所以这里必须由 agent 侧自己播报，否则网页进度会停在上一句话上。
- */
-function spawnHook(context) {
-  reporterRef?.setCurrent(`正在执行：${String(context.command).slice(0, 70)}`);
-  return context;
-}
+/* 刻意**没有**「把命令原文播报成当前步骤」的钩子。
+
+早先这里有个 spawnHook，每条命令执行前把命令塞进 step，心跳再重复它。于是网页上
+最显眼的那一行显示的是「正在执行：cd data/work/13 && python
+analyze_bdnf.py 2>&1 | tail」——被截断到 70 字符，经常断在半截路径上。
+
+命令原文本来就逐条落在 audit_log 里（带退出码和耗时），要看随时查得到，不必再占着
+界面的主位。step 是**给人读的进度叙事**，审计是**给查的原始记录**，两者不该抢同一行。
+
+心跳重复的是模型最后一次 report_step 的那句话，所以长命令跑着的时候，界面上留着的
+是「正在搜寻蛋白质序列」这类话，而不是一条 shell 命令。代价是：模型长时间不说话时，
+界面上那句话不会变——那是模型该补 report_step 的理由，平台规则里写死了。 */
 
 /** 把平台规则追加到 pi 自己生成的 system prompt 之后。 */
 function platformRulesExtension() {

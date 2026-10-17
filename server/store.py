@@ -359,6 +359,33 @@ def add_event(task_id: int, kind: str, actor: str, message: str = "",
         c.close()
 
 
+def add_step_event(task_id: int, actor: str, message: str):
+    """写一条 step 事件；与**上一条 step 完全同文**时跳过，返回 ``None``。
+
+    agent 侧的心跳每 60 秒会把最后一次 ``report_step`` 的原话重发一次——长命令跑着
+    的时候模型没有机会再调 ``report_step``。没有这条去重，一条二十分钟的命令会在
+    时间线上刷出二十行一模一样的话。时间线要回答的是"发生了什么变化"，
+    "还活着吗"是 ``tasks.step`` 与 ``updated_at`` 的事。
+
+    只跟**上一条**比，不是跟全表比：文本来回切换时（做A → 做B → 做A），
+    那两条相隔很远的同文事件都是真实的变化，吞掉就丢了过程。
+
+    返回 ``None`` 表示被去重了，调用方**照样**要写 ``tasks.step`` 与唤醒 SSE——
+    去重的是时间线噪音，不是"还活着"这个信号。
+    """
+    c = db.connect()
+    try:
+        last = c.execute(
+            "SELECT message FROM events WHERE task_id = ? AND kind = 'step' "
+            "ORDER BY id DESC LIMIT 1", (int(task_id),)).fetchone()
+        if last is not None and last["message"] == message:
+            return None
+        with c:
+            return _insert_event(c, task_id, "step", actor, message)
+    finally:
+        c.close()
+
+
 def list_events(task_id: int, after_id: int = 0, limit: int = 500) -> list:
     """按 id 升序列时间线事件。after_id 是 SSE 游标：只取比它新的。"""
     c = db.connect()
