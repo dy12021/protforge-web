@@ -36,7 +36,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from starlette.concurrency import iterate_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # 面板在 admin\ 下，业务模块在 server\。与 tests/conftest.py 同一套做法：
@@ -619,12 +619,28 @@ def create_admin_app() -> FastAPI:
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):
                     raise PanelError(e.code, "内部通道拒绝了这次订阅") from None
+                # 409 要**原样透出**，不能像 _public_status 那样压成 502。
+                # 内部端口对"这个任务的计算进程不在运行，没有实时流"回的是
+                # 409，那是一句准确答案；压成 502「内部通道没有响应」会把
+                # 排查的人带偏——通道明明活着，是这一条订阅不成立。
+                # （任务刚好在轮询与开流之间收口就会走到这里，属于常态。）
+                if e.code == 409:
+                    why = _detail_of(e.read().decode(errors="replace"))
+                    raise PanelError(409, why or "这个任务现在没有实时流") from None
                 raise PanelError(502, "内部通道没有响应") from None
             except (urllib.error.URLError, OSError):
                 raise PanelError(502, f"连不上内部通道 {internal_base()}") from None
 
-        resp = await iterate_in_threadpool(_open)
+        # _open 是**普通函数**（返回一个 HTTPResponse），不是生成器。
+        # 这里必须用 run_in_threadpool；用 iterate_in_threadpool 会得到一个
+        # async generator，再 await 它就是
+        # "TypeError: object async_generator can't be used in 'await' expression"
+        # ——而这个 TypeError 只出现在服务端日志里，前端只是收不到流，
+        # 靠 10 秒轮询照样刷得动界面，看着一切正常。
+        resp = await run_in_threadpool(_open)
         return StreamingResponse(
+            # 这里反过来：_iter_body 确实是同步生成器，逐块读阻塞 IO，
+            # 所以要 iterate_in_threadpool 把它搬到线程池里迭代。
             iterate_in_threadpool(_iter_body(resp)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
