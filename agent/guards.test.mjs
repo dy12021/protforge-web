@@ -155,6 +155,32 @@ test('rejects write redirects outside the declared write set', () => {
   deny('echo x > /usr/local/bin/evil');
 });
 
+test('allows discarding output to the null device', () => {
+  // 实测踩出来的：`cd dir 2>/dev/null || cd dir; python x.py` 被守卫拒了，
+  // 理由是「重定向写到允许范围之外：/dev/null」。空设备写入即丢弃，不落文件、
+  // 不删东西，守卫在这里拦的不是破坏，只是无害的语法——代价是计算进程
+  // 每次想丢掉一条命令的 stderr 都要被迫改写写法重试。
+  allow('fold.py job.json 2>/dev/null');
+  allow('cmd 1>/dev/null 2>/dev/null');
+  allow('python run.py >NUL');
+  allow('python run.py 2>NUL');
+});
+
+test('the null-device exemption is exact, not a prefix match', () => {
+  // 放行「名字里带 null」等于给前缀绕过开门：这两个是绝对路径，
+  // 必须照常走「允许根」判定并被拒。
+  deny('echo x > /dev/null/evil');
+  deny('echo x > /dev/nullx');
+  deny('echo x > /dev/null.txt');
+  // 大小写与分隔符归一后仍是同一个设备
+  allow('python run.py 2> /DEV/NULL');
+  allow('python run.py >nul');
+  // 注意：`./nul` 被放行**不是因为**空设备豁免，而是因为它是相对路径、
+  // 落在工作目录里——这条规则本来就在（见上面 isAbsoluteLike 的分支）。
+  // 这里写出来是为了防止有人以为豁免把前缀绕过放开了。
+  allow('echo x > ./nul');
+});
+
 test('rejects docker privileged and dangerous mounts', () => {
   deny('docker run --privileged img');
   deny('docker run -v /:/host img');

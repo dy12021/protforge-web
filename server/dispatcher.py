@@ -78,6 +78,9 @@ POLL_INTERVAL = 1.0                                # 队列轮询 + 退出检测
 GPU_PROBE_TIMEOUT = 10.0
 KILL_TIMEOUT = 15.0
 READER_JOIN_TIMEOUT = 5.0
+#: agent 报完 finish 之后，给它自己收尾（关 stdin → runRpcMode 返回 → 进程退出）
+#: 的宽限。逾时就杀进程树——宁可强杀也不能让任务永远停在「计算中」。
+WIND_DOWN_GRACE = 10.0
 MAX_LINE = 1 << 20                                 # 单行 stdout 上限 1 MB，防 agent 吐大 blob 撑爆内存
 MAX_EVENTS = 5000                                  # 事件流缓冲上限，溢出丢最旧并计数
 
@@ -1466,6 +1469,59 @@ class Dispatcher:
             log.warning("中止 %s 后进程 %s 仍在运行", task_id, ap.pid)
         self._settle(ap)
         return True
+
+    def wind_down(self, task_id: int) -> bool:
+        """agent 报完 finish 之后，让这个进程**自己走到退出**。返回是否动了手。
+
+        为什么必须有这一步
+        ----------------
+        收尾（:meth:`_settle`）只在**进程退出**时触发，而 ``finish`` 只是模型调用的
+        一个工具：它 POST 完就返回给模型，进程继续挂在 ``runRpcMode`` 上等 stdin。
+        于是形成一个死锁——
+
+            agent 调 finish → 标记落库 → 没人关 stdin → 进程不退 → 收尾不跑
+            → 状态永远停在「计算中」→ 不进打包 → **用户永远下载不到任何东西**
+
+        这条链上每一环单独看都对，串起来才致命，而且端到端跑一次才会现形。
+
+        做法：**关 stdin**（agent 的 RPC 循环读到 EOF 就该返回、``main()`` 结束、
+        node 正常退出），给 :data:`WIND_DOWN_GRACE` 的宽限；还不退就杀整棵进程树。
+
+        刻意**不置** ``ap.aborted``：收尾分流的第一条判据是 ``has_finished``，
+        把它标成中止会让一次正常收口被写成「用户中止了任务」。
+
+        整个动作丢到后台线程：/finish 的调用方就是 agent 自己，堵在请求里
+        等它退出等于让它等自己。
+        """
+        task_id = int(task_id)
+        ap = self.running.get(task_id)
+        if ap is None or ap.settled or ap.aborted:
+            return False
+        threading.Thread(target=self._wind_down_worker, args=(ap,),
+                         name=f"winddown-{task_id}", daemon=True).start()
+        return True
+
+    def _wind_down_worker(self, ap: AgentProc) -> None:
+        try:
+            if ap.proc.stdin is not None:
+                try:
+                    ap.proc.stdin.close()
+                except OSError:
+                    pass
+            try:
+                ap.proc.wait(timeout=WIND_DOWN_GRACE)
+            except subprocess.TimeoutExpired:
+                log.warning("任务 %s 报完收口后进程 %s 仍在运行，杀掉",
+                            ap.task_id, ap.pid)
+                kill_tree(ap.proc)
+                try:
+                    ap.proc.wait(timeout=KILL_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    log.error("任务 %s 的进程 %s 杀了也没退", ap.task_id, ap.pid)
+        except Exception:                             # noqa: BLE001 - 后台线程不能死
+            log.exception("收口 %s 时出错", ap.task_id)
+        finally:
+            self._settle(ap)
 
     def _close_handles(self, ap: AgentProc) -> None:
         """收尾：关管道、唤醒还在等响应的调用方。"""

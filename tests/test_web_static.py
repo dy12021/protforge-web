@@ -254,11 +254,59 @@ def test_save_uses_server_echoed_value():
     """保存后用服务端回填值重绘，不能拿本地输入值。
 
     服务端会规范化（去首尾空白、截断 step），不回填就会出现「存了但看着没变」。
+
+    **不要按变量名或行距来钉。** 原来这条断言写的是"PATCH 的下一行出现
+    done("、或字面量 "done(got."，于是它同时被两件无关的事弄坏：把响应包进
+    detailTask 会多出两行，变量从 got 改名成 saved 又会让字面量对不上——
+    而这两种改法都是**对的**。一条会因为正确重构而失败的断言，比没有断言更糟：
+    它训练人把红当成噪声。
+
+    现在钉的是真正的不变量：**同一个变量**先从 PATCH 的返回值来，随后被交给
+    done() 重绘。中间隔着几行、变量叫什么，都不影响它成立。
     """
     js = _read(JS)
-    assert re.search(r"PATCH[^\n]*\n[^\n]*done\(", js) or "done(got." in js, (
-        "保存后没有用服务端回填值重绘"
-    )
+    saved = re.compile(
+        r"const\s+(\w+)\s*=\s*detailTask\(\s*await api\(\s*\"PATCH\".*?\);"
+        r".*?done\(\s*\1\s*\.",
+        re.S)
+    hits = saved.findall(js)
+    assert hits, (
+        "保存后没有用服务端回填值重绘：找不到「PATCH 的返回值被交给 done()」"
+        "这一对同一个变量的引用")
+
+    # 反向断言：保存回调内部不能把**本地输入值**交给 done()。
+    # 那是"存了但界面还显示你自己输入的那一份"的写法。
+    # 只看保存回调：`}, () => done(value))` 是**取消**回调，那里回原值是对的，
+    # 全文件扫会把正确的写法一起判成错的。
+    for body in _save_callbacks(js):
+        for local in ("done(ta.value)", "done(input.value)", "done(value)"):
+            assert local not in body, (
+                f"保存后拿本地值 {local} 重绘，服务端做的规范化（去空白、截断）"
+                f"会被悄悄丢掉")
+
+
+def _save_callbacks(js: str) -> list[str]:
+    """取出所有含 PATCH 的 `async () => { … }` 保存回调的函数体。
+
+    按花括号配对取，别用正则截——函数体里有 try/catch 与嵌套调用，
+    朴素匹配会在函数中间截断，断言"函数体里没有 X"就变成了"我没看全"。
+    """
+    bodies = []
+    for m in re.finditer(r"async\s*\(\s*\)\s*=>\s*\{", js):
+        depth, i = 0, m.end() - 1
+        while i < len(js):
+            if js[i] == "{":
+                depth += 1
+            elif js[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        body = js[m.end():i]
+        if 'api("PATCH"' in body or "api('PATCH'" in body:
+            bodies.append(body)
+    assert bodies, "找不到任何调用 PATCH 的保存回调，前端结构变了？"
+    return bodies
 
 
 # --- 数据层 -------------------------------------------------------------

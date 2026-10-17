@@ -67,12 +67,16 @@ const TOKEN_KEY = "protforge.token";
 function token() { return localStorage.getItem(TOKEN_KEY) || ""; }
 function setToken(v) { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); }
 
-/* base 走同源 /api。开发时后端可能不在同一个源（PROTFORGE_WEB_BASE 由服务端
- * 注入成 window 全局，或用 ?base= 临时指过去），所以留一个覆盖口。 */
+/* base 是**源前缀**，不含 /api。所有调用处传的都是 "/api/xxx" 完整路径，
+ * 这里再拼一次 "/api" 会变成 /api/api/xxx —— 整块面板的接口全部 404，
+ * 而页面骨架是静态 HTML，照样渲染得很正常，看着像"能打开"。
+ *
+ * ?base= 覆盖口保留：开发时后端不在同一个源，填 http://127.0.0.1:8473 这样
+ * 的**源**（不要带 /api），最终拼成 http://127.0.0.1:8473/api/xxx。 */
 function apiBase() {
   const q = new URLSearchParams(location.search).get("base");
   const b = q || window.PROTFORGE_WEB_BASE || "";
-  return (b ? b.replace(/\/+$/, "") : "") + "/api";
+  return b ? b.replace(/\/+$/, "") : "";
 }
 
 function authHeaders(lastEventId) {
@@ -110,6 +114,25 @@ async function api(method, path, body) {
 }
 
 // ---------------------------------------------------------------- 小工具
+
+/* 任务详情类接口（POST /api/tasks、PATCH /api/tasks/{id}、POST …/abort）
+ * 返回的都是**信封**：{ task, events, artifacts }，任务本体在 got.task 里。
+ *
+ * 早先这几处把返回值直接当任务对象用，于是：
+ *   - 提交后 openDrawer(got.id) 打开的是 undefined，请求 /api/tasks/undefined 得 422；
+ *   - 改完标题或需求说明，存进 state.byId 的是整个信封，抽屉里字段全空。
+ * 症状都是"点了没反应"——请求要么 422、要么干脆不报错。
+ *
+ * 这里**故意不写成 got.task || got**：容错等于把形状不匹配重新藏起来，
+ * 而藏形状不匹配正是这个洞的成因。形状真变了就让它当场炸出一句中文，
+ * 至少能在界面上看见，而不是抽屉里一片空白。 */
+function detailTask(got, where) {
+  const t = got && got.task;
+  if (!t || typeof t !== "object" || t.id == null) {
+    throw new Error("服务端返回的任务详情格式变了（" + where + " 取不到 task 字段）");
+  }
+  return t;
+}
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -313,9 +336,12 @@ let loadSeq = 0;
 
 async function load() {
   const seq = ++loadSeq;
-  const items = await api("GET", "/api/tasks");
+  // 服务端返回的是 {"tasks": [...]}，**不是**裸数组。少拆这一层的话
+  // applyItems 拿到的是对象，items.map 直接抛 "items.map is not a function"，
+  // 看板上一张卡片都渲染不出来——而页面骨架是静态 HTML，看着只是"空空如也"。
+  const got = await api("GET", "/api/tasks");
   if (seq !== loadSeq) return;             // 已经有更新的请求在飞，丢掉这次
-  applyItems(items);
+  applyItems(Array.isArray(got) ? got : (got.tasks || []));
   hideMsg(document.getElementById("board-msg"));
 }
 
@@ -477,7 +503,7 @@ function scheduleRefresh(id) {
   refreshTimers.set(id, setTimeout(async () => {
     refreshTimers.delete(id);
     try {
-      const t = await api("GET", "/api/tasks/" + id);
+      const t = detailTask(await api("GET", "/api/tasks/" + id), "实时刷新");
       const i = state.items.findIndex(x => x.id === id);
       if (i >= 0) state.items[i] = t; else state.items.push(t);
       state.byId.set(id, t);
@@ -633,7 +659,7 @@ async function openDrawer(id) {
   body.textContent = "";
   let t = state.byId.get(id);
   try {
-    t = await api("GET", "/api/tasks/" + id);
+    t = detailTask(await api("GET", "/api/tasks/" + id), "打开详情");
     state.byId.set(id, t);
   } catch (e) {
     if (e && e.status === 401) { signedOut("登录已过期，请重新登录"); return; }
@@ -702,10 +728,11 @@ function drawDrawer(id, t) {
         const s = bar.querySelector(".primary");
         s.disabled = true;
         try {
-          const got = await api("PATCH", "/api/tasks/" + id, { brief: ta.value });
-          state.byId.set(id, got);
+          const saved = detailTask(
+            await api("PATCH", "/api/tasks/" + id, { brief: ta.value }), "保存需求说明");
+          state.byId.set(id, saved);
           setMsg(drawerMsgHost(), "需求说明已保存", "ok");
-          done(got.brief == null ? "" : got.brief);
+          done(saved.brief == null ? "" : saved.brief);
         } catch (e) {
           s.disabled = false;
           if (!patchFailed(e, id)) setMsg(drawerMsgHost(), e.message, "bad");
@@ -737,10 +764,11 @@ function drawDrawer(id, t) {
         const s = bar.querySelector(".primary");
         s.disabled = true;
         try {
-          const got = await api("PATCH", "/api/tasks/" + id, { title: input.value });
-          state.byId.set(id, got);
+          const saved = detailTask(
+            await api("PATCH", "/api/tasks/" + id, { title: input.value }), "保存标题");
+          state.byId.set(id, saved);
           setMsg(drawerMsgHost(), "标题已保存", "ok");
-          done(got.title == null ? "" : got.title);
+          done(saved.title == null ? "" : saved.title);
         } catch (e) {
           s.disabled = false;
           if (!patchFailed(e, id)) setMsg(drawerMsgHost(), e.message, "bad");
@@ -803,8 +831,8 @@ function abortBtn(t) {
     if (!ok) return;
     b.disabled = true;
     try {
-      const got = await api("POST", "/api/tasks/" + t.id + "/abort", {});
-      state.byId.set(t.id, got);
+      state.byId.set(t.id, detailTask(
+        await api("POST", "/api/tasks/" + t.id + "/abort", {}), "中止任务"));
       setMsg(drawerMsgHost(), "已请求中止", "warn");
       stopStream(t.id);
       await load().catch(() => {});
@@ -958,6 +986,7 @@ function showLogin(msg) {
 
 function signedOut(msg) {
   setToken("");
+  state.me = null;                 // 身份没了：兜底轮询与重试都以它为闸，不清就一直空转
   state.streams.forEach((ctl, id) => stopStream(id));
   state.streams.clear();
   state.items = [];
@@ -1012,13 +1041,14 @@ document.getElementById("composer-form").addEventListener("submit", async e => {
   const save = document.getElementById("c-save");
   save.disabled = true;
   try {
-    const got = await api("POST", "/api/tasks", {
-      title: document.getElementById("c-title").value.trim(),
-      brief: document.getElementById("c-brief").value.trim(),
-    });
+    const created = detailTask(
+      await api("POST", "/api/tasks", {
+        title: document.getElementById("c-title").value.trim(),
+        brief: document.getElementById("c-brief").value.trim(),
+      }), "提交任务");
     document.getElementById("composer").close();
     await load();
-    openDrawer(got.id);
+    openDrawer(created.id);
   } catch (err) {
     if (err && err.status === 401) signedOut("登录已过期，请重新登录");
     else setMsg(document.getElementById("board-msg"), err.message, "bad");
@@ -1063,7 +1093,7 @@ document.addEventListener("keydown", e => {
 /* 兜底轮询：SSE 不可用时（反代没开、通道被中间层掐了）至少别让看板僵住。
  * SSE 可用时它只是兜底，不承担实时性。页面在后台标签时不跑，省得空转。 */
 setInterval(() => {
-  if (!token()) return;
+  if (!state.me) return;          // 还没通过 /api/me 确认身份（含没登录）就别空转
   if (document.visibilityState !== "visible") return;
   reload();
 }, 10000);
@@ -1074,13 +1104,17 @@ Object.assign(window, {
   api, state, el, render, load, reload, filtered, fmtTime,
   STATUS_ORDER, STATUS_LABEL, COLUMNS, buildRail, paintRail, slideRail,
   railIndex, openDrawer, closeDrawer, setDrawerFull, confirmAction,
-  taskEvents, eventLine, FIELD_CN, KIND_LABEL, ACTOR_LABEL, apiBase,
+  taskEvents, eventLine, FIELD_CN, KIND_LABEL, ACTOR_LABEL, apiBase, detailTask,
 });
 
+/* 登录与否由服务端说了算，不由 localStorage 里有没有令牌说了算。
+ * 早先这里写的是 if (!token()) return showLogin() —— 那是**替服务端猜**：
+ * 令牌存在与否只说明"上次点过登录"，不代表"现在还登录着"。服务端开了旁路
+ * （或换成别的鉴权方式）时压根没有令牌，/api/me 却完全通，于是面板永远
+ * 卡在登录框，接口明明是 200。改成先问 /api/me，401 才弹登录框。 */
 async function boot() {
   buildCols();
   renderStatusFilter();
-  if (!token()) return showLogin();
   try {
     state.me = await api("GET", "/api/me");
     const who = state.me || {};
@@ -1088,8 +1122,12 @@ async function boot() {
       (who.username || "") + (who.role === "admin" ? "（管理员）" : "");
     await load();
   } catch (e) {
-    if (e && e.status === 401) signedOut("登录已过期，请重新登录");
-    else setMsg(document.getElementById("board-msg"), (e && e.message) || "连不上服务", "bad");
+    if (e && e.status === 401) {
+      // 有过令牌才叫"过期"；一进来就没有是"还没登录"，提示语不该混成一句
+      signedOut(token() ? "登录已过期，请重新登录" : "请登录");
+    } else {
+      setMsg(document.getElementById("board-msg"), (e && e.message) || "连不上服务", "bad");
+    }
   }
 }
 

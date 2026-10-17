@@ -147,6 +147,7 @@ def validation_message(exc: RequestValidationError) -> str:
 
 def _install_common(app: FastAPI) -> None:
     """两个 app 共用的异常处理器与 /api/health。detail 全局只有一种形态。"""
+    _warn_if_dev_login()          # 三个 app 都过这里，所以只喊一次就够
 
     @app.exception_handler(store.NotFound)
     async def _not_found(request, exc):
@@ -251,6 +252,23 @@ class EventIn(BaseModel):
     # agent 冒充它们就能自己宣布任务完成。
     kind: Literal["log", "note", "error"] = "log"
     message: str = Field(default="", max_length=8000)
+
+
+class AuditIn(BaseModel):
+    """计算进程上报的一条命令审计（spec §9.2 的 `audit_log`）。
+
+    kind 收窄到**它自己产生**的三种。`admin_rpc` 之类的留给管理员端点，
+    不放开的话 agent 可以往审计表里写"管理员干预"，把追责记录伪造掉。
+
+    `elapsed_ms` 有上限：字段来自 agent 进程，一个传 10^18 的耗时就能把
+    任何按时间排序/聚合的查询撑爆，这不是模型会算错的数，是不可信的输入。
+    """
+    kind: Literal["bash", "bash_denied", "tool"] = "bash"
+    # 命令原文。**不截断语义**：管理端 CSV 导出与"是不是有 rm"的判断
+    # 都建立在这一列上，宁可长也别替它决定哪里可以省略。
+    command: str = Field(default="", max_length=8000)
+    exit_code: int | None = None
+    elapsed_ms: int | None = Field(default=None, ge=0, le=86_400_000)
 
 
 class PreciseHTTPException(HTTPException):
@@ -717,6 +735,23 @@ def _warn_if_no_admin() -> None:
             "在 .env 里设 %s / %s 再重启即可创建。", ADMIN_USER_ENV, ADMIN_PASSWORD_ENV)
 
 
+def _warn_if_dev_login() -> None:
+    """临时登录旁路开着的时候**必须喊出来**。
+
+    这个开关等于"这个进程上所有接口都不需要凭证"。开着就喊，喊得很难看，
+    这样没人会带着它忘了关。
+    """
+    raw = (os.environ.get(auth.DEV_LOGIN_ENV) or "").strip()
+    if not raw:
+        return
+    log.warning(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        "  临时登录旁路已开启（%s=%s）：本进程上的接口**不需要任何凭证**。\n"
+        "  只在真机联调时用，测完请把这个环境变量去掉并重启。\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+        auth.DEV_LOGIN_ENV, raw)
+
+
 def _has_any_admin() -> bool:
     try:
         c = db.connect()
@@ -796,6 +831,27 @@ def create_internal_app() -> FastAPI:
         sse.notify()
         return {"event_id": eid}
 
+    @app.post("/api/internal/agent/{task_id}/audit")
+    def agent_audit(task_id: int, body: AuditIn,
+                    _tid: int = Depends(require_agent)):
+        """收计算进程的命令审计。
+
+        这一条端点是规格 §14「所有 bash 调用全量记入审计日志」**唯一的实现**。
+        少了它，`audit_log` 表、管理端审计页签、CSV 导出、30 天保留策略
+        和清理器里的审计清扫会全部静默地空转——每一行代码都在，但没有一行
+        会真的被调用到。
+
+        刻意**不**调 `sse.notify()`：一次 rfdiffusion 能产生上万条命令，
+        逐条唤醒 SSE 会把用户的实时流变成日志瀑布。正是为了避开这一点，
+        审计才被从 `events` 里分出来（§9.2）；在这里又把它灌回去等于
+        把当初的设计推翻。管理端本来就是 10 秒轮询审计页签。
+        """
+        store.get_task(task_id)
+        rid = store.audit.log(task_id, body.kind, command=body.command,
+                              exit_code=body.exit_code, elapsed_ms=body.elapsed_ms,
+                              actor="agent")
+        return {"audit_id": rid}
+
     @app.post("/api/internal/agent/{task_id}/finish")
     def agent_finish(task_id: int, body: FinishIn,
                      _tid: int = Depends(require_agent)):
@@ -826,6 +882,15 @@ def create_internal_app() -> FastAPI:
             store.add_event(task_id, "note", "agent",
                             f"计算进程自报产物：{names}{more}")
         sse.notify()
+        # 标记落了不等于进程会退。agent 报完收口只是把结果告诉了我们，它自己
+        # 还挂在 runRpcMode 上等 stdin——不主动收口，任务就永远停在「计算中」，
+        # 打包与下载整条链路都走不到。详见 Dispatcher.wind_down。
+        disp = getattr(app.state, "dispatcher", None)
+        if disp is not None:
+            try:
+                disp.wind_down(task_id)
+            except Exception:                        # noqa: BLE001 - 收口失败不该让 finish 报错
+                log.exception("收口 %s 的计算进程时出错", task_id)
         return _detail(updated)
 
     # 干预命令白名单。面板是值班台，不该成为往计算进程里塞任意命令的口子——

@@ -206,6 +206,20 @@ const isAbsoluteLike = (p) =>
 /** `~` / `~user` 指向家目录，本沙箱永远不在允许集合里。 */
 const isHomePath = (p) => String(p).startsWith('~');
 
+/**
+ * 空设备：写进去的内容直接丢弃，不落文件、不删东西。
+ *
+ * `cmd 2>/dev/null` 是最常见的 shell 写法之一。把它判成「写到允许范围之外」
+ * 是纯粹的误伤——守卫拦的应该是破坏，而这里什么都没有可破坏。实测代价很实在：
+ * 计算进程每次想丢弃一条命令的 stderr 都会被拒一次，然后被迫改写写法重试。
+ *
+ * 只认**精确**匹配的两个名字（统一小写、分隔符归一），`/dev/null/x`、`./nul`
+ * 之类照常走路径判定——放行「名字里带 null 的路径」等于给前缀绕过开门。
+ */
+const NULL_DEVICES = new Set(['/dev/null', 'nul']);
+const isNullDevice = (p) =>
+  NULL_DEVICES.has(String(p).replace(/\\/g, '/').toLowerCase());
+
 function isUnderAny(p, roots) {
   const c = canonPath(p);
   return roots.some((r) => {
@@ -345,6 +359,9 @@ function visitRedirect(redir, ctx) {
   if (!redir.Word) return OK; // 数字 fd 复制（1>&2 之类）没有目标词
   const { value, dynamic } = wordToString(redir.Word);
   if (dynamic) return bad('重定向目标来自变量，无法静态判定');
+  // 空设备先放行：它不是文件系统路径，落不进「允许根」判定，
+  // 但丢弃输出没有任何副作用（见 isNullDevice 的说明）。
+  if (isNullDevice(value)) return OK;
   if (!isAbsoluteLike(value)) return OK; // 相对路径落在 cwd（= 工作目录）内
   if (isHomePath(value)) return bad('重定向到家目录，禁止');
   if (!isUnderAny(value, ctx.fileRoots)) {
@@ -662,9 +679,30 @@ export function checkCommand(command, opts = {}) {
 // ------------------------------------------------------------------ pi 接线
 
 /**
+ * 记一条审计。**记账失败绝不抛。**
+ *
+ * 审计是证据，不是任务的一部分。让它有能力把一条本来跑成功的命令变成
+ * "执行失败"，模型会换个写法把同一件事再跑一遍——那既浪费又危险。
+ * 失败只留一行 stderr。
+ */
+async function reportAudit(opts, row) {
+  const fn = opts && opts.onAudit;
+  if (typeof fn !== 'function') return;
+  try {
+    await fn(row);
+  } catch (e) {
+    console.error('[audit] 上报失败（不影响命令本身）:', e && e.message ? e.message : e);
+  }
+}
+
+/**
  * 把守卫接到 pi 的 BashOperations.exec 上。
  * pi 文档里的推荐姿势是包住 operations：本地执行保持不变，
  * 只有在命令真正跑起来之前插入校验。
+ *
+ * `opts.onAudit` 存在时，这里就是规格 §14「所有 bash 调用全量记入审计日志」
+ * 的实现点。**放行与拦截都要记**：被拦下的那条恰恰是事后追责最想看的一行，
+ * 只记成功的话，"它曾经想干什么、为什么被挡下"就永远查不到。
  */
 export function createGuardedBashOperations(opts, base = null) {
   const local = base || createLocalBashOperations();
@@ -672,11 +710,44 @@ export function createGuardedBashOperations(opts, base = null) {
     async exec(command, cwd, options) {
       const verdict = checkCommand(command, opts);
       if (!verdict.allowed) {
+        // 命令原文一行不改地留在第一行，拒绝理由追加在下一行。
+        // audit_log 的列是规格 §9.2 定死的（没有 reason 列），而"为什么被拦"
+        // 是这段证据的一半；改写原文又会毁掉"里面有没有 rm"的判断，
+        // 所以按行拼接——原文仍是原文，只是后面跟了一行说明。
+        await reportAudit(opts, {
+          kind: 'bash_denied',
+          command: `${command}\n# 被守卫拒绝：${verdict.reason}`,
+          exit_code: null,              // 从没执行过，没有退出码可报
+          elapsed_ms: 0,
+        });
         // 抛错而不是静默失败：让模型看到拒绝理由并换一条写法，
         // 这是守卫唯一能帮它继续工作的方式。
         throw new Error(`命令被安全守卫拒绝：${verdict.reason}\n请改用等效的安全写法后重试。`);
       }
-      return local.exec(command, cwd, options);
+      const started = Date.now();
+      try {
+        const result = await local.exec(command, cwd, options);
+        await reportAudit(opts, {
+          kind: 'bash',
+          command,
+          // pi 的 BashResult.exitCode 在被 kill / 取消时是 undefined，
+          // 原样传 null 而不是编一个 0 出来——"没退出码"和"退出码是 0"
+          // 在追责时是两回事。
+          exit_code: result && result.exitCode !== undefined ? result.exitCode : null,
+          elapsed_ms: Date.now() - started,
+        });
+        return result;
+      } catch (e) {
+        // 执行本身抛了（超时、被杀、shell 起不来）同样要留痕，
+        // 否则"命令跑了很久然后没了"在审计里查不到任何东西。
+        await reportAudit(opts, {
+          kind: 'bash',
+          command,
+          exit_code: null,
+          elapsed_ms: Date.now() - started,
+        });
+        throw e;
+      }
     },
   };
 }

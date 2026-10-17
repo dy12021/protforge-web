@@ -19,6 +19,9 @@ import { Type } from 'typebox';
 /** report_step 的文本上限，按**码点**算（不是 UTF-16 长度）。 */
 const MAX_STEP_CODEPOINTS = 80;
 
+/** 审计命令原文的上限，与服务端 AuditIn.command 的 max_length 对齐。 */
+const MAX_COMMAND_CODEPOINTS = 8000;
+
 /** 单次 POST 的硬超时。回传不能拖慢计算。 */
 const POST_TIMEOUT_MS = 5000;
 
@@ -84,6 +87,34 @@ export function createReporter(cfg) {
       return post('finish', {
         summary: String(summary ?? ''),
         artifacts: (artifacts ?? []).map((a) => String(a)).slice(0, 50),
+      });
+    },
+
+    /**
+     * 上报一条命令审计，落 audit_log（规格 §9.2 / §14 的"全量审计"）。
+     *
+     * 三条刻意的决定：
+     *
+     * 1. **不受 `finished` 闸约束。** step 必须在 finish 之后闭嘴，因为那是
+     *    往时间线上加噪音；审计恰恰相反——命令是在 finish 之前跑完的，
+     *    它的退出码和耗时只有在事后才有意义。在收口那一刻丢掉它们，
+     *    等于把"最后跑的那几条命令"变成查无实据，正是审计要防的事。
+     * 2. **失败只回 ok:false，不抛。** 与回传层同一条原则：记账失败不该让
+     *    模型以为自己命令执行失败了，进而换个写法把同一件事再跑一遍。
+     *    真正的风险是"审计没记上"，所以这里把失败原样交回给调用方去告警。
+     * 3. **命令原文按码点截断到服务端上限**，只截一次、不改写内容——
+     *    追责时要判断"里面有没有 rm"，被悄悄改过的原文比没有原文更糟。
+     */
+    async audit(kind, command, exitCode, elapsedMs) {
+      const text = String(command ?? '');
+      const chars = Array.from(text);
+      return post('audit', {
+        kind: String(kind ?? 'bash'),
+        command: chars.length <= MAX_COMMAND_CODEPOINTS
+          ? text
+          : `${chars.slice(0, MAX_COMMAND_CODEPOINTS - 1).join('')}…`,
+        exit_code: exitCode === undefined ? null : exitCode,
+        elapsed_ms: elapsedMs === undefined ? null : elapsedMs,
       });
     },
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import sqlite3
@@ -278,8 +279,42 @@ def bearer_token(request: Request) -> str:
     return parts[1].strip()
 
 
+#: 临时调试开关：设成用户名（user:xxx 或 admin:xxx）之后，current_user 不再要求
+#: Bearer 令牌，直接以该账号身份放行。**默认关闭**，只在真机联调时用。
+#:
+#: 为什么要有它：自动化测试驱动浏览器时会卡在登录表单上——登录要人输口令，
+#: 而口令进对话记录就等于泄密。所以留这个后门，让界面联调不必经过真人登录。
+#:
+#: 风险：设了它就等于**这个进程上所有接口都不需要凭证**。所以
+#:   - 默认不设，必须显式开；
+#:   - 开了就在启动日志里喊出来，不让人忘了它还开着；
+#:   - 只认进程环境变量，配置文件里没有开关，不会跟着 .env 一起被提交。
+DEV_LOGIN_ENV = "PROTFORGE_WEB_DEV_LOGIN"
+
+
+def dev_login_user() -> dict | None:
+    """返回旁路账号；没开这个开关就返回 None。"""
+    raw = (os.environ.get(DEV_LOGIN_ENV) or "").strip()
+    if not raw:
+        return None
+    role, _, name = raw.partition(":")
+    if not name:
+        role, name = "user", role
+    user = get_user(name.strip())
+    if user is None:
+        raise Unauthorized(f"{DEV_LOGIN_ENV} 指定的账号不存在：{name}")
+    return {**user, "role": role.strip() or user.get("role", "user")}
+
+
 def current_user(request: Request) -> dict:
-    """FastAPI 依赖：无令牌 / 令牌过期 / 账号停用一律 401。"""
+    """FastAPI 依赖：无令牌 / 令牌过期 / 账号停用一律 401。
+
+    旁路开关开着时（见 :data:`DEV_LOGIN_ENV`）例外——那是临时联调用的，
+    启动时已经喊过了。
+    """
+    dev = dev_login_user()
+    if dev is not None:
+        return dev
     user = resolve_token(bearer_token(request))
     if user is None:
         raise Unauthorized("登录已失效，请重新登录")
@@ -299,4 +334,5 @@ __all__ = [
     "set_disabled", "authenticate", "locked_out", "reset_lockouts",
     "issue_token", "revoke_token", "resolve_token", "token_expires_at",
     "bearer_token", "current_user", "require_admin",
+    "dev_login_user", "DEV_LOGIN_ENV",
 ]

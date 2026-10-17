@@ -271,10 +271,24 @@ def test_pending_rows_show_path_and_size_and_offer_both_verdicts():
 
 
 def test_verify_posts_to_the_verify_endpoint_with_task_id():
-    """确认动作打 /artifacts/{id}/verify，且带上 task_id（后端按它定位产物）。"""
+    """确认动作打 artifacts/{id}/verify，且带上 task_id（后端按它定位产物）。
+
+    **这里曾经断言错了方向。** 早先这条断言找的是 ``"/api/admin/artifacts/"``，
+    也就是把**有 bug 的写法**当成了标准：管理员面板的 ``apiBase()`` 已经自带
+    ``/api/admin``，调用处再写一遍会拼成 ``/api/admin/api/admin/artifacts/…``，
+    「确认归属」按钮在真机上是点不动的——而这条测试一直是绿的。
+
+    所以现在钉的是"调用处写相对路径"这条契约。相对路径 + apiBase() 的前缀
+    才是它真正会打的地址，那条地址真的存在与否由
+    ``test_frontend_url_contract.py::test_every_admin_panel_url_exists_in_the_admin_app``
+    拿服务端路由表核对。
+    """
     body = _fn("doVerify")
-    assert '"/api/admin/artifacts/"' in body, "确认动作没打 verify 端点"
+    assert '"/artifacts/"' in body, "确认动作没打 artifacts/{id}/verify"
     assert "task_id:" in body, "确认动作没带 task_id"
+    assert "/api/admin/artifacts/" not in body, (
+        "调用处又写了全路径 /api/admin/artifacts/…，会与 apiBase() 的 /api/admin "
+        "重复，拼成 /api/admin/api/admin/… —— 确认按钮在真机上点不动")
 
 
 def test_verified_artifact_is_removed_from_the_pending_list():

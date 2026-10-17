@@ -26,7 +26,8 @@ const ACTIVE_STATUSES = new Set(ACTIVE);
 
 /* 显示层翻译。服务端 message 是 API 契约不能改，裸字段名的翻译放这里。 */
 const KIND_LABEL = {
-  bash: "命令调用", tool: "技能调用", admin_rpc: "管理员干预",
+  bash: "命令调用", bash_denied: "守卫拦截", tool: "技能调用",
+  admin_rpc: "管理员干预",
   login: "登录", admin: "管理员操作", spawn: "启动进程", abort: "中止",
   rpc: "干预命令",
 };
@@ -133,7 +134,12 @@ function fmtMs(ms) {
 }
 
 function fmtSize(bytes) {
-  const n = Number(bytes || 0);
+  // n 必须用 let：下面那个循环要靠它自己递减值。
+  // 写成 const 时，任何一条**大小非零**的待确认产物都会在这里抛
+  // "Assignment to constant variable."——而 pendRow 是 load() 里的一环，
+  // 于是整个 boot() 半路夭折：用户列表不拉、任务表不画，只留下一条错误提示。
+  // 症状与真因隔了三层，全靠翻代码是翻不出来的。
+  let n = Number(bytes || 0);
   if (!Number.isFinite(n) || n <= 0) return "";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
@@ -479,7 +485,7 @@ async function doVerify(row, ok) {
   const yes = await confirmAction(spec);
   if (!yes) return;
   try {
-    const got = await api("POST", "/api/admin/artifacts/" + row.id + "/verify",
+    const got = await api("POST", "/artifacts/" + row.id + "/verify",
                           { task_id: Number(row.task_id), ok: !!ok });
     row.verified = got.artifact.verified;
     row.__done = !!ok;
@@ -532,7 +538,12 @@ function taskRow(t) {
   tr.append(el("td", "c-step", t.step || "—"));
   tr.append(el("td", "c-owner", ownerName(t.owner_id)));
   tr.append(el("td", "c-time", fmtTime(t.created_at)));
-  tr.append(el("td", "c-act", taskActs(t)));
+  // 操作列装的是**元素**，不能走 el(tag, cls, text)：
+  // 那个 text 参数会进 textContent，于是整列被字面渲染成
+  // "[object HTMLDivElement]"，三个按钮一个都按不到。
+  const act = el("td", "c-act");
+  act.append(taskActs(t));
+  tr.append(act);
   return tr;
 }
 
@@ -578,7 +589,7 @@ async function doAbort(t) {
   });
   if (!yes) return;
   try {
-    const got = await api("POST", "/api/admin/tasks/" + t.id + "/abort", {});
+    const got = await api("POST", "/tasks/" + t.id + "/abort", {});
     stopStream(t.id);
     await load();
     // 内部通道不通时中止照样落地（状态已是失败），但进程树可能还在——
@@ -615,7 +626,7 @@ async function doStatus(t) {
   const chosen = await confirmBody(body, "确认改状态", () => sel.value);
   if (!chosen) return;
   try {
-    await api("POST", "/api/admin/tasks/" + t.id + "/status",
+    await api("POST", "/tasks/" + t.id + "/status",
               { status: chosen, note: "值班台强制改状态" });
     await load();
     setMsg(document.getElementById("board-msg"),
@@ -639,7 +650,7 @@ async function doRetry(t) {
   });
   if (!yes) return;
   try {
-    await api("POST", "/api/admin/tasks/" + t.id + "/retry", {});
+    await api("POST", "/tasks/" + t.id + "/retry", {});
     await load();
     setMsg(document.getElementById("board-msg"), "已把 #" + t.id + " 放回队列", "ok");
   } catch (e) {
@@ -791,7 +802,10 @@ function userRow(u) {
     u.disabled ? "已停用" : "可用"));
   tr.append(st);
   tr.append(el("td", "c-time", fmtTime(u.created_at)));
-  tr.append(el("td", "c-act", userActs(u)));
+  // 同上：userActs 返回的是元素，走 text 会被字面渲染成 [object HTML…]
+  const act = el("td", "c-act");
+  act.append(userActs(u));
+  tr.append(act);
   return tr;
 }
 
@@ -887,7 +901,14 @@ async function sendRpc(t, command, ta, note, extra) {
     note.textContent = "已发给计算进程（" + (CMD_LABEL[command] || command) + "）";
     if (ta) ta.value = "";
   } catch (e) {
-    note.textContent = e.message || "发送失败";
+    const why = e.message || "发送失败";
+    note.textContent = why;
+    /* 失败还要往顶部长提示条上再写一份。卡片里的 note 活不过这一轮轮询：
+     * 任务刚好在这 10 秒里收口，整张卡片连同 note 一起被移除，
+     * 管理员点完插话转个身，失败提示就没了——一个干预动作的**结果**消失了，
+     * 而不是"没发生过"。这条板级提示不会随卡片移除而消失。 */
+    setMsg(document.getElementById("board-msg"),
+      "#" + t.id + " 干预失败（" + (CMD_LABEL[command] || command) + "）：" + why, "bad");
   }
 }
 
@@ -1125,6 +1146,7 @@ function showLogin(msg) {
 
 function signedOut(msg) {
   setToken("");
+  state.me = null;                 // 身份没了：兜底轮询与重试都以它为闸，不清就一直空转
   state.streams.forEach((ctl, id) => stopStream(id));
   state.streams.clear();
   if (state.clockTimer) { clearInterval(state.clockTimer); state.clockTimer = null; }
@@ -1231,7 +1253,7 @@ document.addEventListener("keydown", e => {
 /* 兜底轮询：值班台不能靠实时流单独活着（通道会断、反代会掐）。
  * 页面在后台标签时不跑，省得空转。 */
 setInterval(() => {
-  if (!token()) return;
+  if (!state.me) return;          // 还没通过 /me 确认身份（含没登录）就别空转
   if (document.visibilityState !== "visible") return;
   load().catch(() => {});
   if (state.tab === "audit") loadAudit().catch(() => {});
@@ -1249,8 +1271,17 @@ function startClock() {
   state.clockTimer = setInterval(tick, 1000);
 }
 
+/* 下面这份名单是给控制台调试用的。
+ *
+ * **名单里写错一个名字，整份脚本就废了。** 它是顶层语句，引用到不存在的标识符
+ * 会抛 ReferenceError，而那是在模块求值阶段——后面的 boot() 根本不会执行。
+ * 症状极其有欺骗性：页签能切（那些监听器挂在前面，已经绑好了），但一个接口都
+ * 不发、看板永远是空的，看起来像"后端没数据"。
+ *
+ * 曾经就有一个 `render` 留在名单里：渲染早就拆成 renderLive / renderTasks 等
+ * 几个函数，render 这个名字早就不存在了。整个值班台于是从来没活过。 */
 Object.assign(window, {
-  api, state, el, render, load, reload: load, loadUsers, loadAudit,
+  api, state, el, load, reload: load, loadUsers, loadAudit,
   renderLive, renderPending, renderTasks, renderAudit, renderUsers,
   fmtTime, fmtMs, fmtSize, STATUS_ORDER, STATUS_LABEL, ROLE_LABEL,
   SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL, apiBase, token,
@@ -1258,8 +1289,10 @@ Object.assign(window, {
   exportAuditCsv, doVerify, doAbort, doRetry, sendRpc, showTab,
 });
 
+/* 登录与否问服务端，不问 localStorage —— 理由同用户面板那边：令牌只说明
+ * "上次点过登录"。旁路下压根没有令牌，/me 却是通的，早先那句
+ * if (!token()) return showLogin() 会让面板永远停在登录框。 */
 async function boot() {
-  if (!token()) return showLogin();
   try {
     state.me = await api("GET", "/me");
     document.getElementById("who").textContent =
@@ -1268,8 +1301,11 @@ async function boot() {
     await loadUsers().catch(() => {});   // 用户列表失败不该挡住值班台本身
     startClock();
   } catch (e) {
-    if (e && e.status === 401) signedOut("登录已过期，请重新登录");
-    else setMsg(document.getElementById("board-msg"), (e && e.message) || "连不上服务", "bad");
+    if (e && e.status === 401) {
+      signedOut(token() ? "登录已过期，请重新登录" : "请登录");
+    } else {
+      setMsg(document.getElementById("board-msg"), (e && e.message) || "连不上服务", "bad");
+    }
   }
 }
 

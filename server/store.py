@@ -331,7 +331,12 @@ def _insert_event(c, task_id: int, kind: str, actor: str, message: str = "",
             (int(task_id), kind, from_status, to_status, actor,
              message or "", db.now_iso()),
         )
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as e:
+        # CHECK 与外键都是 IntegrityError。混成一句话的话，"任务不存在"会被报成
+        # "事件类型或来源不合法"——排查的人会去翻 kind/actor 白名单，而真因在
+        # 任务那一侧（后台线程跨过了测试的库边界、或任务已被删）。
+        if "FOREIGN KEY" in str(e):
+            raise NotFound("任务不存在")
         raise Invalid("事件类型或来源不合法")
     if cur.rowcount == 0:
         raise NotFound("任务不存在")

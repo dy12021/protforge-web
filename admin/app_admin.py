@@ -319,7 +319,16 @@ def require_admin_token(request: Request) -> tuple[dict, str]:
 
     转发到内部端口时要用的就是它：内部端点校验的是管理员 Bearer，
     不是 agent_token（agent_token 在主服务进程内，这里看不到也用不上）。
+
+    临时登录旁路开着时（见 ``auth.DEV_LOGIN_ENV``）直接放行。转发给内部的
+    那个令牌此时没有意义——内部端口同样认旁路——所以给一个显式的占位串，
+    而不是伪装成某个真令牌。
     """
+    dev = auth.dev_login_user()
+    if dev is not None:
+        if dev.get("role") != "admin":
+            raise auth.Forbidden("需要管理员权限")
+        return dev, "dev-login-bypass"
     token = auth.bearer_token(request)
     user = auth.resolve_token(token)
     if user is None:

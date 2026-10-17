@@ -121,7 +121,14 @@ async function main() {
   await reporter.step('计算进程已启动，正在准备环境');
 
   // ---- 命令守卫 ----
-  const guardOpts = { workDir: WORK_DIR };
+  const guardOpts = {
+    workDir: WORK_DIR,
+    // 每条命令（含被守卫拦下的）都上报审计，落 audit_log。
+    // 这是规格 §14「所有 bash 调用全量记入审计日志」在 agent 侧的一半；
+    // 另一半是 server/app.py 的 POST /api/internal/agent/{id}/audit。
+    // 少了任何一边，审计表就恒为空——而管理端不会报任何错。
+    onAudit: (row) => reporter.audit(row.kind, row.command, row.exit_code, row.elapsed_ms),
+  };
   const guard = {
     bash: createGuardedBashOperations(guardOpts),
     // PowerShellOperations 就是 BashOperations（pi 里是同一个类型别名），
