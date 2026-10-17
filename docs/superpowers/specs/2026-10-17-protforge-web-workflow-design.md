@@ -42,7 +42,7 @@
 - `janitor` 只扫 `work` / `uploads` / `logs` / `packages`，新增的 `workflows/` 目录不会被误清。
 - `python-multipart 0.0.32`、`openpyxl 3.1.5` 均已安装。
 
-**本文所有 `文件:行号` 锚点已逐条回核过当前代码**（2026-10-17，HEAD `1dccd56`）。回核改了 6 处漂移的行号、纠正了 1 处写反的事实断言（见 8.4）。写计划时**仍以函数名为准**：本项目文件还在动，行号第二次就会过期。
+**本文所有 `文件:行号` 锚点已逐条回核过当前代码**（2026-10-17，HEAD `1dccd56`）。回核改了 6 处漂移的行号、纠正了 1 处写反的事实断言（见 8.5）。写计划时**仍以函数名为准**：本项目文件还在动，行号第二次就会过期。
 
 ## 4. 数据模型
 
@@ -506,7 +506,31 @@ agent 退出 ≠ 这一行结束。`_settle` 之后任务先进 `packaging`，�
 
 `force_status` 的 409 守卫（6.5 守卫侧）也在这个文件里，两件事一起改。
 
-### 8.4 两处容易漏的接线
+### 8.4 新页面会整片漏出前端的静态检查（这是两个测试的硬编码造成的）
+
+`web/workflow.html` + `web/workflow.js` 是**新文件**，而现有两个前端测试都是**把文件路径写死在模块顶部**的：
+
+| 测试 | 写死的文件 | 新页面的后果 |
+| --- | --- | --- |
+| `tests/test_web_static.py:26-28` | `index.html` / `style.css` / `app.js` | `workflow.html` 与 `workflow.js` **完全不在检查范围** |
+| `tests/test_frontend_url_contract.py:34-35` | `web/app.js` / `admin-ui/app.js` | `workflow.js` 里的 URL **不做契约核对** |
+
+后果不是「新页面少几项检查」，而是**漏掉的恰好是两类已经被坑过的**：
+
+**① 禁用词没人查了。** `test_web_static.py` 的 `BANNED_WORDS = ("AI", "助手", "大模型")`（`:32`）在 `:157-158` 对三个文件全文扫。而「界面禁词」是你反复确认过的产品口径。工作流页必然要写「计算任务」「计算进程」这类文案，**正是最容易顺手写出「AI 辅助分析」的地方**，而新文件在扫描范围外——违规了也不红。
+
+**② URL 拼错没人查了。** `test_frontend_url_contract.py` 的 docstring 记着真机踩出来的那次事故：`apiBase()` 多拼一次 `/api`，**466 条后端测试全绿、静态检查全绿、端到端脚本也过了**，因为它们打的是 API 或三个已知文件。`workflow.js` 会有一整套新的 API 调用（上传、列角色、保存、预览、控制、下载），而这个测试存在的全部意义就是防「前端拼的路径服务端没有」——**它恰好防不住新文件**。
+
+**所以这两处必须显式扩，而不是顺带。** 具体动作：
+
+- `test_web_static.py` 的 `HTML/CSS/JS` 改成列表，新增 `workflow.html` / `workflow.js` 一起进 `_files()`——这样禁用词、零外链、状态色几类检查自动覆盖新页面
+- `test_frontend_url_contract.py` 的 `USER_JS` 改成列表，把 `web/workflow.js` 加进去
+- **`test_web_static.py:58` 那条会先打红**：`assert r in ("style.css", "app.js", "data:,")` 只认这三个，而 `index.html` 加了 `<a href="workflow.html">` 入口。这条打红是**对的**，扩白名单时要显式把 `workflow.html` 加进去，别为了让测试绿而放宽成"任意同源路径"——放宽了就等于放弃了「首页只准引这三个」这条约束
+- 同理 `app.py` 的 `USER_UI_FILES`（`app.py:55`）要加 `workflow.html` 和 `workflow.js`，而 `test_web_static.py` 里应有一条断言**白名单与实际存在的文件互为充要**（防止加了白名单却忘了建文件，或建了文件忘了加白名单而线上 404）
+
+**顺序上有个陷阱**：这两处扩展要在 `web/workflow.html` 落地**之前或同时**做。反过来做的话，中间会有一个窗口期——新文件已存在但不在扫描范围，而所有测试都是绿的，正是「看起来有测试、实际上没测」的最坏状态。
+
+### 8.5 两处容易漏的接线
 
 「工作流行就是带三个字段的普通任务」这个前提，会在**复用既有代码**的地方被悄悄破掉。两处：
 
@@ -544,11 +568,16 @@ assert row["workflow_row"] == 3 and row["workflow_archived"] == 0
 | --- | --- |
 | `server/workflow.py` | xlsx 读取、列角色、提示词渲染、归档回写（纯函数，好测） |
 | `server/db.py` | 三张新表 + 幂等列补齐（见 4.3） |
-| `server/store.py` | workflows / workflow_columns / workflow_skips 的 CRUD；`create_task` 接受 workflow 参数；`_update()` 白名单加三列（见 8.4） |
+| `server/store.py` | workflows / workflow_columns / workflow_skips 的 CRUD；`create_task` 接受 workflow 参数；`_update()` 白名单加三列（见 8.5） |
 | `server/dispatcher.py` | `_workflow_run_pass()` 与 `_workflow_archive_pass()` 挂进 `tick()`（见 6.2）；`_queued_tasks()` 排除工作流任务 |
 | `server/app.py` | 上传端点（落 staging → 校验解析 → 搬定，见 4.5）+ 工作流 CRUD/控制/预览/下载端点；`GET /api/tasks` 加 `scope`；`DELETE /api/tasks/{id}` 加 409 守卫；`USER_UI_FILES` 加工作流页文件 |
 | `admin/app_admin.py` | `force_status` 对行任务的 409 守卫（6.5）；值班台列表过滤工作流行任务（8.3） |
 | `web/` | 工作流页 `workflow.html` + `workflow.js`，看板加入口链接 |
+| `tests/test_web_static.py` | 扫描文件清单扩成列表，纳入工作流页两个文件；`:58` 的首页引用白名单显式加 `workflow.html`（见 8.4） |
+| `tests/test_frontend_url_contract.py` | `USER_JS` 扩成列表，纳入 `web/workflow.js`（见 8.4） |
+| `agent/run.mjs` | `PLATFORM_RULES` 补一条工作流任务的产物落点（见 7.4） |
+
+**后三项必须在 `web/workflow.html` 落地之前或同时完成**（8.4 末）。反过来做会出现一个窗口期：新文件已在磁盘上却不在任何检查范围里，而所有测试都是绿的——那正是「看起来有测试、实际没测」的状态。
 
 ### 9.1 端点清单
 
@@ -590,7 +619,10 @@ DELETE /api/workflows/{id}                先中止在跑的行任务，再删
 - **上传失败清理**：解析失败的 staging 文件必须被删掉，不留垃圾（4.5 ③）
 - **看板不混入**：常规 `scope=regular` 的列表里绝不出现工作流任务
 - **值班台不混入**：值班台列表同样筛掉工作流行任务（8.3）
-- **三列真的写进去了**：建完行任务**立刻从库里读回来**断言 `workflow_row` 等于预期值（不是断言 `create_task` 返回成功——8.4 那个白名单是静默失败的）
+- **三列真的写进去了**：建完行任务**立刻从库里读回来**断言 `workflow_row` 等于预期值（不是断言 `create_task` 返回成功——那种断言在「白名单缺列」和「白名单对了但忘传参」两种坏写法下都会绿，见 8.5）
+- **新页面进静态检查**：把 `web/workflow.html` 与 `web/workflow.js` 塞进禁用词与零外链的扫描范围，往里放一个「AI」字样必须打红（钉死 8.4——不扩扫描范围的话这两条测试对新文件恒绿）
+- **新页面进 URL 契约**：在 `web/workflow.js` 里故意写一个服务端不存在的路径，契约测试必须打红（钉死 8.4——`/api/api/xxx` 那次事故骗过了所有自动化手段）
+- **`USER_UI_FILES` 与实际文件互为充要**：白名单里有而磁盘上没有 → 红；磁盘上有而白名单里没有 → 红（防止线上 404 而测试全绿）
 - **删除守卫**：`DELETE /api/tasks/{id}` 打在工作流行任务上必须 409（钉死 6.5 洞三：不挡就静默丢结果 + 留僵尸进程）
 - **重跑要重新归档**：重跑一行 → 跑完 → **打开 result.xlsx 断言那行是新值**。断言任务 `status='done'` 是不够的（6.5 末：漏清 `workflow_archived` 时状态是 done、表里是旧值）
 - **归档逐行置位**：造一批 5 行里中间一行写失败，断言前两行已是 `archived=1`、失败行仍是 0（钉死 7.2——「全批统一置位」会把一次失败放大成 N 次重写）
