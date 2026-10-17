@@ -19,3 +19,7 @@ __pycache__/
 # 编辑器
 .vscode/
 .idea/
+
+# 服务的 stdout/stderr：scripts\start-services.ps1 起服务时落到仓库里的 logs\。
+# 跟 data\ 分开——data\ 是要备份的产物，这里是本机运行痕迹，拷走没有意义。
+logs/

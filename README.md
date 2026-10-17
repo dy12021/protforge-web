@@ -23,8 +23,34 @@
 2. 需要联网搜索时，把 `MINIMAX_API_KEY` 配到 `.env`（从 `.env.example` 复制改名）。
    不配也能跑，只是 agent 不会联网。
 
-> 第一次用会先撞上两个已知缺口（**没有初始管理员**、**用户面板前端还没被主服务发出来**），
-> 细节见下面「已验证 / 尚未验证」。这两个是当前实现的真实状态，不是你装错了。
+> 第一次用要先在 `.env` 里配 `PROTFORGE_ADMIN_USER` / `PROTFORGE_ADMIN_PASSWORD`
+> 建一个管理员（平台**不开放注册**，没人建管理员就谁也登不进去），细节见下面
+> 「常见排查」。
+
+### 不想开窗口：后台起 / 开机自启
+
+`scripts\` 下有两个 PowerShell 脚本，**无窗口**，适合登录自启：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-services.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop-services.ps1
+```
+
+`start-services.ps1` **按监听端口幂等**：已经在听就直接跳过，不会起第二套占端口失败、
+然后让旧版本继续对外服务。日志落仓库的 `logs\`（已 gitignore，不入版本库），
+每次启动都追加一行到 `logs\start-services.log`。
+
+本机已注册登录自启任务 **`protforge-web-services`**（触发器 = 用户登录时，
+动作 = 上面的 `start-services.ps1`）：
+
+```powershell
+Get-ScheduledTask -TaskName protforge-web-services      # 看状态
+Start-ScheduledTask -TaskName protforge-web-services    # 立刻起一次
+Unregister-ScheduledTask -TaskName protforge-web-services -Confirm:$false   # 取消自启
+```
+
+任务只在**登录时**触发（不是开机时）——服务要有人登录才跑得起来，这是本项目的定位。
+它**不会**设置 `PROTFORGE_WEB_DEV_LOGIN`，鉴权始终开着。
 
 ---
 
@@ -250,18 +276,17 @@ agent 需要读允许根之外的输入文件，这是刻意留的口子。路�
 
 ### 仍然未验证 / 未接线
 
-1. **管理员面板的干预动作没做过真机联调** —— 内部 RPC 转发端点
-   `/api/internal/admin/rpc/{task_id}` 已实现并有测试（含形状翻译、白名单、
-   409/504 故障路径），但**没有对着真实运行中的 agent 按过按钮**。
-   abort 走「直接杀进程树」而不是透传给 agent（面板上那个按钮的意思是"停掉这个
-   计算"，不是"让当前这轮回答先说完"），这一点尤其值得在真机上确认一次。
-2. **超时档位只实测了 pesto / esm 两个** —— 其余技能仍按「秒级 / 对接类 / 生成类」
+1. **超时档位只实测了 pesto / esm 两个** —— 其余技能仍按「秒级 / 对接类 / 生成类」
    三档的归类给值。生成类那档（`TIMEOUT_SLOW_S` 8h）是给 rfdiffusion / bindcraft /
    gromacs / proteinmpnn 的，**未实测**。pesto / esm 那两次也是**热容器 + 小输入**，
    冷启动没有单独计时。
-3. ~~**调度器重启恢复只在测试里验过**~~ → 已在真机上验过（见下）。
+2. ~~**调度器重启恢复只在测试里验过**~~ → 已在真机上验过（见下）。
    期间还因此发现并修掉了一个真机才会暴露的缺陷：补扫收尾后没把认领锁还回去，
    导致同一个任务**永远**进不了第二次补扫。
+3. ~~**管理员面板的干预动作没做过真机联调**~~ → 已在真机上按过（2026-10-17）。
+   插话 / 追加要求 / 切换档位三项都打通，审计记为 `admin_rpc` actor=admin；
+   「中止 / 重跑 / 改状态」三个按钮也都验过（中止是两步确认后杀进程树，
+   与透传给 agent 是两回事，这点与原先的判断一致）。
 
 ### 真机验证记录（2026-10-16）
 
@@ -278,8 +303,7 @@ agent 需要读允许根之外的输入文件，这是刻意留的口子。路�
   扫不掉了。记录那条路（`_recover_one`）本来就有 `finally` 释放，只有新加的
   补扫漏了。已修（`e12ffa4`），并加了「锁被还回去」「同一条任务连扫两次都
   能收尾」两条用例；围栏验证：摘掉释放那行，13 条挂 2。
-- `run/` 下那 4 个旧残锁仍在，对应任务现在都是终态、补扫不看终态，属惰性垃圾。
-  本机删除受安全策略限制，留着不影响运行；要清可以手动删那四个文件。
+- 那 4 个旧残锁已在 2026-10-17 清掉（对应任务都是终态，纯惰性垃圾）。
 
 ### 全分支 review 修过一轮（2026-10-16）
 
