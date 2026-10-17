@@ -36,11 +36,13 @@
 这些不是推测，是对着当前代码查出来的：
 
 - `server/app.py` 的 `create_public_app()` **没有任何上传端点**。`uploads` 表、`uploads/<task_id>/` 目录、janitor 的 7 天保留策略都已存在，但**接线没做**。上传 Excel 是从零新建。
-- `tasks.priority` 字段存在，但**没有任何代码写过它**，默认全 0，所以队列实际是纯 FIFO。排序语句在 `dispatcher.py:1135`：`rows.sort(key=lambda r: (-priority, id))`。
+- `tasks.priority` 字段存在，但**没有任何代码写过它**，默认全 0，所以队列实际是纯 FIFO。排序语句在 `dispatcher._queued_tasks()` 里（`dispatcher.py:1143`）：`rows.sort(key=lambda r: (-priority, id))`。
 - `_queued_tasks()` 拉的是 `limit=200`，且**不分用户**，是全局队列。
 - `POLL_INTERVAL = 1.0`，`tick()` 每秒一次；`self._wake.set()` 只在 `stop()` 里调用，**没有事件驱动的唤醒**。所以上一行归档后放行下一行的延迟 ≤ 1 秒。
 - `janitor` 只扫 `work` / `uploads` / `logs` / `packages`，新增的 `workflows/` 目录不会被误清。
 - `python-multipart 0.0.32`、`openpyxl 3.1.5` 均已安装。
+
+**本文所有 `文件:行号` 锚点已逐条回核过当前代码**（2026-10-17，HEAD `1dccd56`）。回核改了 6 处漂移的行号、纠正了 1 处写反的事实断言（见 8.4）。写计划时**仍以函数名为准**：本项目文件还在动，行号第二次就会过期。
 
 ## 4. 数据模型
 
@@ -292,7 +294,7 @@ def tick(self):
      → cursor += 1 → spawn
 ```
 
-**① 是必须的，不是保险。** `_admit` 有 `if len(self.running) >= self.limit: return []`（`dispatcher.py:1140`），而 `_spawn` **没有**这道检查。工作流任务被 6.1 排除在常规队列之外，所以除了这条闸门它们没有任何容量约束——两个 running 的工作流，或者一个工作流加一个刚被 `_admit` 放出去的常规任务，会在同一 tick 里各自放行，超发 GPU 槽，全部变慢。
+**① 是必须的，不是保险。** `dispatcher._admit()` 有 `if len(self.running) >= self.limit: return []`（`dispatcher.py:1148`），而 `_spawn`（`dispatcher.py:1175`）**没有**这道检查——我把 `_spawn` 从头到尾读过一遍，它只做写 brief、发令牌、起进程，没有读 `self.running`。工作流任务被 6.1 排除在常规队列之外，所以除了这条闸门它们没有任何容量约束——两个 running 的工作流，或者一个工作流加一个刚被 `_admit` 放出去的常规任务，会在同一 tick 里各自放行，超发 GPU 槽，全部变慢。
 
 **② 是「先归档再下一个」的实现**（判据必须是 `workflow_archived = 0`，理由和推演见 6.3）。它同时天然覆盖了「当前行还在跑」——在跑的行也未归档——所以 **⑤ 在实现上是冗余的**，但保留为可读的契约：一条专讲串行的断言，比让读者去推「② 是不是也管了跑着的行」可靠。**真要把 ⑤ 删掉，串行保证不受影响**，所以它不会掩盖 ② 的缺陷（围栏里两条都钉）。
 
@@ -304,9 +306,9 @@ def tick(self):
 
 审计现有能力时发现三个洞，都是「复用现有能力」的反例——**能力接上了，但接上之后语义是错的**：
 
-**洞一：管理员「重跑」让行任务 stranded。** `admin/app_admin.py:485` 把任务改回 `queued`。而 `_queued_tasks()` 按 6.1 要排除 `workflow_id IS NOT NULL`，于是这条任务**永远没人认领**，永远停在「已排队」，且不报错。
+**洞一：管理员「重跑」让行任务 stranded。** `admin/app_admin.py:486` 的 `retry` 把任务改回 `queued`。而 `_queued_tasks()` 按 6.1 要排除 `workflow_id IS NOT NULL`，于是这条任务**永远没人认领**，永远停在「已排队」，且不报错。
 
-**洞二：「强制改状态」比洞一更严重。** `app_admin.py:471-483` 的 `force_status` 原样写入管理员选的目标，只校验 `target in db.VALID_STATUSES`——而 `VALID_STATUSES` 含 `running` 和 `packaging`。管理员改成这两个值，库里就真写成非终态。`claim_queued` 只吃 `WHERE status='queued'`（`store.py:299`），接不走；闸门⑤「有其他非终态行任务」从此恒真 → **整个工作流从这一行起永久卡死**，界面显示「正在跑第 N 行」而没有任何进程。
+**洞二：「强制改状态」比洞一更严重。** `admin/app_admin.py:472` 的 `force_status` 原样写入管理员选的目标，只校验 `target not in db.VALID_STATUSES` 就抛（`:475`）——而 `VALID_STATUSES = STATUS_KEYS + ["failed"]`（`db.py:41`）含 `running` 和 `packaging`。管理员改成这两个值，库里就真写成非终态。`store.claim_queued()`（`store.py:281`）的 CAS 只吃 `WHERE status = 'queued'`（`store.py:341`），接不走；闸门⑤「有其他非终态行任务」从此恒真 → **整个工作流从这一行起永久卡死**，界面显示「正在跑第 N 行」而没有任何进程。
 
 **洞三：`DELETE /api/tasks/{id}` 让工作流的账对不上。** `server/app.py:420` 没有任何守卫。删掉一个行任务后有两种后果，都不报错：
 
@@ -325,7 +327,7 @@ def tick(self):
   否则                        → 按 6.4 走新建游标行的流程
 ```
 
-**但两级放行只解决「认领得到」，还差半步：`retry` 必须把 `workflow_archived` 清回 0。** `admin/app_admin.py:485` 现在只写 `status='queued'`。不清这个标记的话，被重跑的那一行带着 `archived=1`，闸门② 放行、④ 认领、它跑完也进终态——但归档 pass 扫的是「终态 且 `archived=0`」，于是**这行的新结果永远不写回表**，而平台上看起来一切正常（任务是 done 的，只是表里的值还是上一轮的）。
+**但两级放行只解决「认领得到」，还差半步：`retry` 必须把 `workflow_archived` 清回 0。** `admin/app_admin.py:486` 的 `retry` 现在只写 `status='queued'`。不清这个标记的话，被重跑的那一行带着 `archived=1`，闸门② 放行、④ 认领、它跑完也进终态——但归档 pass 扫的是「终态 且 `archived=0`」，于是**这行的新结果永远不写回表**，而平台上看起来一切正常（任务是 done 的，只是表里的值还是上一轮的）。
 
 **这是全篇最安静的一种失效**：不报错、不卡住、界面上「已完成」，唯独 Excel 里的结果是旧的。所以围栏必须是端到端的——重跑一行、跑完、然后**打开 result.xlsx 断言那一行的值是新值**，断言任务状态是 done 是不够的。
 
@@ -345,7 +347,7 @@ def tick(self):
 
 | 动作 | 语义 | 现状 |
 | --- | --- | --- |
-| 中止在跑的行任务 | `app.py:435` 写成 `failed` → 归档照常推进 | **已通，不用改** |
+| 中止在跑的行任务 | `abort` 路由（`app.py:428`）在 `:487` 写成 `failed` → 归档照常推进 | **已通，不用改** |
 | **暂停** | 改 `workflows.status='paused'`，**不碰正在跑的那一行** | 需实现 |
 | **中止整批** | `status='paused'` + `abort_requested=1`，杀掉在跑的行任务 | 需实现 |
 | 重跑一个终态行任务 | 回到 `queued` 且清 `archived`，被 6.5 的④接住 | 需 6.5 的两级放行 |
@@ -445,7 +447,9 @@ def tick(self):
 
 ### 7.5 归档时机：必须等打包结束，不能等 agent 退出
 
-agent 退出 ≠ 这一行结束。`_settle` 之后任务先进 `packaging`，由 `_pack_scan_once`（每 2 秒扫一次）打包完才到 `done`/`failed`。
+agent 退出 ≠ 这一行结束。`_settle` 之后任务先进 `packaging`，由 `_pack_scan_once`（`app.py:668`，`PACK_SCAN_INTERVAL = 2.0` 在 `app.py:544`）打包完才到 `done`/`failed`。
+
+**这一条比看上去更关键，因为 `packaging` 可能停在非终态**。`_pack_scan_once` 自己把失败的任务打成 `failed`（所以打包失败不卡流程），但它 `limit=50`（`app.py:672`）且每轮只扫一批——一行任务的产物特别多时，一个工作流同时不会有超过一行在 packaging（串行），所以量不是问题。真正要防的是「某行的打包器挂了、任务永远停在 packaging」：那种情况下闸门② 会一直挡着下一行，**界面必须显示「第 N 行停在打包中」**而不是笼统的「正在跑」——否则用户看到的是「平台卡住了」，而实际差的是一次 repack。
 
 `_workflow_archive_pass()` 的归档条件因此是 **`status IN ('done','failed')` 且 `workflow_archived = 0`**，不是「进程退出了」。好处是归档时 `summary` / `error` / 产物清单都已经是最终值；而且 `packaging` 卡住不会让整批错乱——`_pack_scan_once` 失败会把任务打成 `failed`，归档照常进行。
 
@@ -504,14 +508,35 @@ agent 退出 ≠ 这一行结束。`_settle` 之后任务先进 `packaging`，�
 
 ### 8.4 两处容易漏的接线
 
-「工作流行就是带两个字段的普通任务」这个前提，会在**复用既有代码**的地方被悄悄破掉。两处：
+「工作流行就是带三个字段的普通任务」这个前提，会在**复用既有代码**的地方被悄悄破掉。两处：
 
 | 位置 | 漏了会怎样 |
 | --- | --- |
-| `store._update()` 的字段白名单 | `workflow_id` / `workflow_row` 写不进任务行 → 调度器筛不出行任务 → 工作流永远不放行，**且不报错** |
+| `store._update()` 的字段白名单 | `workflow_id` / `workflow_row` / `workflow_archived` 写不进任务行 |
 | 行任务的 `created` 事件 | 详情页时间线第一行是空的，行任务看起来像凭空出现的 |
 
-`_update()` 白名单那处是**静默失败**的典型：字段名不在白名单里时该函数不抛异常，只是这一列没写进去。所以围栏要断言「创建行任务后立刻从库里读回来，`workflow_row` 等于预期值」，而不是断言 `create_task()` 返回成功。
+**先纠正我自己的一个错误断言**：我原本写「`_update()` 白名单是静默失败的典型，字段不在白名单里时不抛异常、只是这一列没写进去」。**核对代码后确认这是错的**——`server/store.py:164-171` 是这样的：
+
+```python
+allowed = {"title", "brief", "status", ..., "done_at"}
+bad = set(fields) - allowed
+if bad:
+    raise Invalid(f"不能更新这些字段：{', '.join(sorted(bad))}")
+```
+
+**它是响的**——多传一个字段就抛 `Invalid`。所以漏加白名单的后果不是「静默写不进去」，而是**建行任务这一步直接失败**。这个区别很重要：
+
+- **响的失败**会在第一次真跑时立刻炸出来，不会流到线上
+- 我原本描述的那条静默链路（写进去了但值不对 → 调度器筛不出行任务 → 永远不放行）**在 `_update()` 这条路上不成立**
+
+但**测试写法仍然要按「静默」来写**，因为真正的危险在别处：围栏若只断言 `create_task()` 不抛异常，那它在白名单正确时绿、在白名单错误时也**因为异常而绿**（`pytest.raises` 之外的情形，或异常被上层 try 吞掉）。所以断言必须是**读回数据库核对值**：
+
+```python
+row = store.get_task(task_id)
+assert row["workflow_row"] == 3 and row["workflow_archived"] == 0
+```
+
+这条断言在两种坏写法下都会红：白名单缺列（抛异常 → 红），白名单加了但 `create_task` 忘了传参（值为 None → 红）。**断言函数返回成功是最容易恒真的那种断言**，而恒真的断言在围栏里等于没有。
 
 ## 9. 待建的东西
 
