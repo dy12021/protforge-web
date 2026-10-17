@@ -53,6 +53,7 @@ function makeStub(label = 'stub') {
 function makeEl(tag, id) {
   let text = '';
   const node = {
+    _on: {},
     tagName: tag, id: id || '', children: [], value: '',
     className: '', hidden: false, disabled: false, open: false, rows: 0,
     placeholder: '', title: '', type: '', href: '',
@@ -62,7 +63,17 @@ function makeEl(tag, id) {
     options: [],
     append(...a) { node.children.push(...a); },
     appendChild(c) { node.children.push(c); return c; },
-    remove() {}, addEventListener() {}, removeEventListener() {},
+    remove() {},
+    // 监听器要**存住**，光 addEventListener 空实现的话，下面重放「登录」那一步
+    // 就触发不了任何东西——而那一步恰恰是本文件最要紧的复现入口。
+    addEventListener(type, fn) { (node._on[type] = node._on[type] || []).push(fn); },
+    removeEventListener() {},
+    /** 手动触发一类监听器，返回各处理器的返回值（async 的就是 promise，要等）。 */
+    fire(type, ev = {}) {
+      return (node._on[type] || []).map((fn) => fn({
+        type, preventDefault() {}, stopPropagation() {}, ...ev,
+      }));
+    },
     setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
     // querySelector 必须给回一个元素：buildCols() 靠它拿 .col-count，
     // 给 null 的话 render() 第一行就炸——那是桩的锅，不是前端的锅。
@@ -146,7 +157,7 @@ function routeOf(url) {
   return s.replace(/^https?:\/\/[^/]+/, '');
 }
 
-function stubFetch(calls) {
+function stubFetch(calls, ctl = {}) {
   return async (url) => {
     calls.push(String(url));
     const path = routeOf(url);
@@ -154,6 +165,20 @@ function stubFetch(calls) {
       // SSE：立刻结束，读帧循环随之收尾。不要让它挂住。
       return { ok: true, status: 200, statusText: 'OK', body: null,
                json: async () => ({}), headers: new Map() };
+    }
+    // 「还没登录」这一态要能演出来：第一次 /api/me 必须 401，boot() 才会走
+    // signedOut() 弹登录框。不这样的话，页面加载就一路走到底，
+    // 而真正的复现入口（登录成功后 boot() 再跑一遍）压根不会发生。
+    if (path === '/api/me' && ctl.notLoggedIn) {
+      return { ok: false, status: 401, statusText: 'Unauthorized', body: null,
+               json: async () => ({ detail: '登录已失效，请重新登录' }),
+               headers: new Map() };
+    }
+    if (path === '/api/auth/login') {
+      return { ok: true, status: 200, statusText: 'OK', body: null,
+               json: async () => ({ token: 'stub-token',
+                                    user: { username: 'stub', role: 'user' } }),
+               headers: new Map() };
     }
     const key = Object.keys(FIXTURES).find(
       (k) => path === k || path.startsWith(k + '/') || path.startsWith(k + '?'));
@@ -206,11 +231,22 @@ function stringifyLeaks(byId) {
   return hits;
 }
 
+/** #board 里真正的列有几个。className 是 buildCols() 里 el("section", "col") 给的。 */
+function boardColumns(byId) {
+  const b = byId.get('board');
+  if (!b) return 0;
+  return (b.children || []).filter((c) => c && c.className === 'col').length;
+}
+
 async function smoke(file) {
   const code = readFileSync(file, 'utf8');
   const errors = [];
   const calls = [];
   const byId = new Map();
+  // 用户面板的第一跑必须是"还没登录"：boot() 先建列、再问 /api/me，
+  // 于是列已经建好才弹登录框。登录成功后 boot() 又跑一遍——这一步才是复现入口。
+  const isWeb = /web[\\/]app\.js$/.test(file);
+  const ctl = { notLoggedIn: isWeb };
   // async 函数（boot 就是）抛出的错会变成**没人处理的 rejection**：页面上什么都
   // 不显示，控制台的 uncaught 里也未必好找。必须当失败收掉，不能让它悄悄过去。
   const onUnhandled = (reason) => {
@@ -227,7 +263,7 @@ async function smoke(file) {
     console: { log() {}, info() {}, warn() {}, error() {}, debug() {} },
     // 用**形状与真接口一致**的数据喂它：只答 401 的话 boot() 会在 load() 之前
     // 就返回，渲染路径一行都不执行——而"拿到数据之后渲染时才炸"正是最难查的那类。
-    fetch: stubFetch(calls),
+    fetch: stubFetch(calls, ctl),
     setTimeout: (fn) => 0, clearTimeout: () => {},
     setInterval: () => 0, clearInterval: () => {},
     queueMicrotask,
@@ -258,6 +294,21 @@ async function smoke(file) {
     // 顶层跑完了，把微任务与 promise 里的错也收一收
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
+
+    // 重放用户真机上点的那一步：登录框里登进去。
+    // 没有这一步的话，第一跑就一路走到底，上面那个「还没登录」的态等于白设，
+    // 而看板重复建列的洞恰好只在这条路径上现形。
+    if (isWeb) {
+      // 走 document.getElementById 而不是直接查 byId：桩是按需建节点的，
+      // 只有真的调过 getElementById 的 id 才会进 Map。
+      const form = sandbox.document.getElementById('login-form');
+      ctl.notLoggedIn = false;              // 登录成功之后 /api/me 才该通
+      sandbox.document.getElementById('l-user').value = 'stub';
+      sandbox.document.getElementById('l-pass').value = 'stub';
+      await Promise.all(form.fire('submit'));
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+    }
   } catch (e) {
     errors.push(e);
   } finally {
@@ -265,7 +316,11 @@ async function smoke(file) {
     process.off('uncaughtException', onUnhandled);
   }
 
-  return { errors, calls, byId, sandbox };
+  return {
+    errors, calls, byId, sandbox,
+    cols: boardColumns(byId),
+    expectCols: isWeb ? (sandbox.COLUMNS || []).length : null,
+  };
 }
 
 const files = process.argv.slice(2);
@@ -305,6 +360,13 @@ for (const f of files) {
     const leaks = stringifyLeaks(r.byId);
     if (leaks.length) {
       errs.push(new Error(`有元素被当成文本渲染出来了：\n        ${leaks.join('\n        ')}`));
+    }
+    // 看板列只能有一套。重复的那一套不会报错、不抛异常，只是第一排永远停在 0——
+    // 真机上表现为「两排一模一样的列，上面一排全是 0」。
+    if (r.expectCols && r.cols !== r.expectCols) {
+      errs.push(new Error(
+        `看板列建了 ${r.cols} 套，应该 ${r.expectCols} 套：`
+        + 'buildCols() 被跑了两遍（页面加载一次、登录成功再一次）'));
     }
   } catch (e) {
     errs.push(e);

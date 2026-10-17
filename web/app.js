@@ -280,6 +280,13 @@ function paintCard(c, t) {
 
 function buildCols() {
   const board = document.getElementById("board");
+  /* 建过就别再建。boot() 会跑两次：页面加载一次，登录成功后再一次——
+   * 而 boot() 是先建列、后问 /api/me 的，所以没登录的那一次已经把五列建出来了
+   * （signedOut 只清列里的内容，不删列本身）。
+   * 第二次建完是**十列**，并且 state.cols 这个 Map 被第二套覆盖，于是第一排五列
+   * 再没有任何代码往里写数字，永远停在 0——看着像"没数据"，实际数据都在第二排。
+   */
+  if (state.cols.size) return;
   COLUMNS.forEach(col => {
     const box = el("section", "col");
     box.style.setProperty("--c", "var(--st-" + col.key + ")");
