@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+import logging
+import subprocess
 import sys
 import time
 import zipfile
@@ -286,6 +288,99 @@ def test_finished_marker_on_failed_task_is_not_called_a_crash(
         assert any("保持不变" in t for t in texts), \
             f"终态收尾应当如实记一句中性事实：{texts}"
     finally:
+        disp.stop()
+
+
+# ---------------------------------------- 派活时进程已经退了：不得误报成「启动失败」
+
+def _already_exited_proc(tmp_path):
+    """真起一个进程，等它**确实退出并被回收**，再把句柄交出去。
+
+    必须等到 exit 才有 EINVAL：子进程还活着时写 stdin 不会报错，那条窄缝复现不出来。
+    「自然地偶发」也算复现不了——本轮 12 跑只中 2 次，围栏必须是确定的。
+    """
+    script = tmp_path / "instant_exit_agent.py"
+    script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert proc.wait(timeout=30) is not None, "假 agent 没有退出"
+    return proc
+
+
+def test_dispatch_prompt_leaves_an_already_exited_agent_to_the_settle_path(
+        tmp_path, agent_task, caplog):
+    """需求还没发出去，计算进程就已经退了——这不是「启动失败」，是一次正常收口。
+
+    派活失败会被 claim_queued 一律记成「计算进程启动失败：无法把需求发给计算进程 N」。
+    但进程明明起来了，是它自己走完退掉的：真相在退出码和 stdout/stderr 里，
+    收尾路径会把它们如实记下来。这条路径下 _spawn 抛异常，还会顺手把任务判死——
+    用户看到的是「启动失败」，真实原因（日志在哪、退出码多少）反倒没人写。
+
+    Windows 上这里拿到的是 EINVAL 而不是 EPIPE：子进程的读端一关，父进程写就报错，
+    认异常类型没用，只能靠 poll() 判活。
+    """
+    disp = dispatcher.Dispatcher(
+        db, db.data_root(), node_exe=sys.executable,
+        agent_script=tmp_path / "agent.py",
+        gpu_probe=lambda: 0, max_concurrency=1)
+    try:
+        proc = _already_exited_proc(tmp_path)
+        ap = dispatcher.AgentProc(
+            task_id=agent_task, pid=proc.pid, argv=["x"], env={},
+            work_dir=tmp_path / "work", token="t", log_path=tmp_path / "a.log",
+            stderr_path=tmp_path / "a.err", started_at=db.now_iso(),
+            brief_path=tmp_path / "brief.md", proc=proc)
+
+        with caplog.at_level(logging.INFO):
+            # 撤掉修复（不加 poll 判活）→ 这里抛 DispatcherError，任务被误判启动失败
+            disp._dispatch_prompt(ap, "算一下")
+
+        said = [r.getMessage() for r in caplog.records]
+        assert any("已退出" in m and "收尾" in m for m in said), \
+            f"应当如实记一句「已退出、交给收尾路径解释」：{said}"
+    finally:
+        disp.stop()
+
+
+def test_dispatch_prompt_still_reports_a_broken_pipe_on_a_live_process(
+        tmp_path, agent_task):
+    """反方向：进程**还活着**却写不进去，仍然必须报派活失败。
+
+    上面那条是给「进程已退出」开了个口，不是把异常一律吞掉。若无差别 except 掉，
+    管道真坏了也没人知道，任务会一直停在「正在准备环境」——不报错、不退出、心跳照跳。
+    """
+    disp = dispatcher.Dispatcher(
+        db, db.data_root(), node_exe=sys.executable,
+        agent_script=tmp_path / "agent.py",
+        gpu_probe=lambda: 0, max_concurrency=1)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        ap = dispatcher.AgentProc(
+            task_id=agent_task, pid=proc.pid, argv=["x"], env={},
+            work_dir=tmp_path / "work", token="t", log_path=tmp_path / "a.log",
+            stderr_path=tmp_path / "a.err", started_at=db.now_iso(),
+            brief_path=tmp_path / "brief.md", proc=proc)
+
+        class _BrokenPipe:
+            """进程是活的、管道是坏的——只坏这一项，才测得到那一条分支。"""
+
+            def write(self, _b):
+                raise BrokenPipeError("pipe is gone")
+
+            def flush(self):
+                raise BrokenPipeError("pipe is gone")
+
+        assert ap.proc.poll() is None, "进程得是活的，这条分支才有意义"
+        ap.proc.stdin = _BrokenPipe()
+
+        with pytest.raises(dispatcher.DispatcherError):
+            disp._dispatch_prompt(ap, "算一下")
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
         disp.stop()
 
 

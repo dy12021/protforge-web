@@ -1294,12 +1294,27 @@ class Dispatcher:
             "type": "prompt",
             "message": text,
         }]
+        # 需求送不出去有两种**完全不同**的原因，混在一起会把一次正常收口说成事故：
+        #   · 进程已经自己退了（启动即崩、或活得太短没接到活）。prompt 本来就无处可发，
+        #     真相在退出码和 stdout/stderr 里，收尾路径会把它们如实记下来——由它去解释。
+        #   · 进程还活着，可管道/句柄写不进去。这才是「起废了」，该报启动失败。
+        # Windows 上子进程一退，父进程往那条管道写拿到的是 EINVAL 而不是 EPIPE，
+        # 认不出异常类型，只能靠 poll() 判活。两次都判：poll 在前能挡掉绝大多数，
+        # 异常后再判一次，挡住「判活之后、写之前」那一瞬退掉的窄缝。
+        if ap.proc.poll() is not None:
+            log.info("计算进程 %s 在接到需求前已退出（退出码 %s），交给收尾路径解释",
+                     ap.task_id, ap.proc.returncode)
+            return
         try:
             for payload in lines:
                 ap.proc.stdin.write(
                     (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
             ap.proc.stdin.flush()
         except Exception:                         # noqa: BLE001 - 派不出活就是起废了
+            if ap.proc.poll() is not None:
+                log.info("需求写进 %s 时进程已退出（退出码 %s），交给收尾路径解释",
+                         ap.task_id, ap.proc.returncode)
+                return
             log.exception("把需求发给计算进程 %s 失败", ap.task_id)
             raise DispatcherError(f"无法把需求发给计算进程 {ap.task_id}")
         _notify()
