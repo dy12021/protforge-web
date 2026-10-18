@@ -370,12 +370,12 @@ def _add_missing_columns(c) -> None:
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `pytest tests/test_workflow_schema.py -q --no-header -p no:cacheprovider`
-Expected: PASS（9 passed）
+Expected: PASS（8 passed）
 
 - [ ] **Step 6: 跑全量确认没打破既有测试**
 
 Run: `pytest tests -q --no-header -p no:cacheprovider`
-Expected: 全绿，条数 = 改动前 + 9
+Expected: 全绿，条数 = 改动前 + 8
 
 - [ ] **Step 7: 提交**
 
@@ -387,7 +387,7 @@ git add server/db.py tests/test_workflow_schema.py
 git -c user.name=mavis -c user.email=mavis@local commit -F .git\MSG_t1.txt
 ```
 
-message：工作流数据模型：三张新表 + tasks 三列，含幂等迁移。围栏 9 条，其中竞态容忍是确定性测分支（不靠多进程碰运气），多进程那条只是整合检查。
+message：工作流数据模型：三张新表 + tasks 三列，含幂等迁移。围栏 8 条，其中竞态容忍是确定性测分支（不靠多进程碰运气），多进程那条只是整合检查。
 
 ---
 
