@@ -1574,7 +1574,6 @@ def test_write_back_multiple_rows(tmp_path):
     assert [ws.cell(row=r, column=3).value for r in (2, 3, 4)] == \
         ["done", "failed", "done"]
 
-```python
 def test_write_back_is_atomic(tmp_path):
     """写一半时下载，拿到的必须是完整的旧版或新版，不能是半个文件。"""
     src = _src(tmp_path)
