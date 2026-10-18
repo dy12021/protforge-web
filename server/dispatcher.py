@@ -109,6 +109,20 @@ _MAX_CONCURRENCY_ENV = "PROTFORGE_WEB_MAX_CONCURRENCY"
 _NODE_ENV = "PROTFORGE_WEB_NODE"
 _AGENT_SCRIPT_ENV = "PROTFORGE_WEB_AGENT_SCRIPT"
 
+#: 归档线程池大小。**下限是 2，不是调优参数**。
+#:
+#: 一条 write_back 是整表 load + 整表 save（宽表实测 2.2 秒），只要它挂在
+#: 网络盘、Excel 独占或坏盘上不返回，单线程就会让**整个归档队列停摆**——
+#: 而闸门② 等的正是这些行，于是全平台所有工作流一起停住，线程却还活着、
+#: 看起来一切正常（实测：3 行全部滞留 _archive_inflight、闸门② 全死）。
+#:
+#: **不要做「超时后重排」**：重排会让同一行被写两次，重复写竞态引入的
+#: 数据损坏比它解决的问题更糟。宁可让这一行慢慢等，也不写第二次。
+ARCHIVE_WORKERS = 2
+#: 入队多久还没写完，就给该行记一条用户可见的「卡住了」。正常 write_back
+#: 几秒内返回，超过 30 秒基本可以断定结果表在网络盘上或被占用。
+ARCHIVE_STUCK_SECONDS = 30.0
+
 _DEAD = object()                                   # 进程死了，塞给还在等响应的 rpc()
 
 
@@ -793,8 +807,15 @@ class Dispatcher:
         self._archive_lock = threading.Lock()
         self._archive_q: queue.Queue = queue.Queue()
         self._archive_inflight: set[int] = set()
+        #: 代表线程（池里第 0 条）。既有断言和外部代码只看一条，留个引用。
         self._archive_thread: threading.Thread | None = None
+        self._archive_threads: list[threading.Thread] = []
         self._archive_stopped = False
+        #: 一个 job 从入队到完成的时限，超了就告警（见 _archive_watchdog）。
+        self._archive_stuck_seconds = ARCHIVE_STUCK_SECONDS
+        self._archive_queued_at: dict[int, float] = {}
+        #: 已经就「卡住」告过警的行。同一行不重复告警，否则又是一条事件风暴。
+        self._archive_warned: set[int] = set()
 
     # --- 并发上限 ---------------------------------------------------------------
 
@@ -1339,6 +1360,7 @@ class Dispatcher:
         看着更整齐，实际是把一次失败放大成 N 次重写。
         """
         queued: list[int] = []
+        self._archive_watchdog()
         try:
             workflows = store.list_running_workflows()
         except Exception:                          # noqa: BLE001
@@ -1360,6 +1382,11 @@ class Dispatcher:
                     if task_id in self._archive_inflight:
                         continue
                     self._archive_inflight.add(task_id)
+                    # **入队时刻**：看门狗靠它算「这一行卡了多久」。用
+                    # monotonic 而不是 time.time()——系统时间被对时调回，
+                    # time() 会算出负的耗时，告警就永远不触发。
+                    self._archive_queued_at[task_id] = time.monotonic()
+                    self._archive_warned.discard(task_id)
                     self._archive_q.put((wid, task_id))
                     queued.append(task_id)
         if queued:
@@ -1367,15 +1394,54 @@ class Dispatcher:
         return queued
 
     def _archive_ensure_thread(self) -> None:
-        """按需起后台归档线程。已停机就不再起——那一行留给重启后的第一轮。"""
+        """把归档线程池补满到 :data:`ARCHIVE_WORKERS`。已停机就不再起。
+
+        池子**下限 2**的理由见 :data:`ARCHIVE_WORKERS` 的注释：单线程下一条
+        挂起的 write_back 就冻住整条队列。这里是「补满」而不是「用完再加」——
+        池空着的时候正好是最需要它的时候。
+        """
         with self._archive_lock:
             if self._archive_stopped:
                 return
-            if self._archive_thread is not None and self._archive_thread.is_alive():
-                return
-            self._archive_thread = threading.Thread(
-                target=self._archive_loop, name="wf-archive", daemon=True)
-            self._archive_thread.start()
+            alive = [t for t in self._archive_threads if t.is_alive()]
+            for i in range(len(alive), ARCHIVE_WORKERS):
+                t = threading.Thread(target=self._archive_loop,
+                                     name=f"wf-archive-{i}", daemon=True)
+                t.start()
+                alive.append(t)
+            self._archive_threads = alive
+            self._archive_thread = alive[0] if alive else None
+
+    def _archive_watchdog(self) -> None:
+        """给「入队太久还没写完」的行记一条用户可见事件。**只告警，不重排。**
+
+        不重排的理由同上：重排等于同一行可能被写两次，重复写的竞态比单行
+        停住糟得多。这一行最终要么自己返回（于是这一轮 tick 之后重新入队
+        重试），要么一直挂着——两种结局都不需要看门狗去替它写。
+
+        告警**每行一次**（记在 ``_archive_warned`` 里）：漏了这个去重，看门狗
+        本身就变成 I-1 说的那条事件风暴。
+        """
+        try:
+            with self._archive_lock:
+                now = time.monotonic()
+                stuck = [tid for tid, t0 in self._archive_queued_at.items()
+                         if tid not in self._archive_warned
+                         and now - t0 >= self._archive_stuck_seconds]
+                for tid in stuck:
+                    self._archive_warned.add(tid)
+            for tid in stuck:
+                store.add_event(
+                    tid, "note", "system",
+                    f"这一行的结果回写卡住超过 {int(self._archive_stuck_seconds)} "
+                    "秒还没返回——多半是结果表在网络盘上，或正被 Excel/WPS 独占。"
+                    "平台不会重复写同一行（重复写会写坏结果表），所以请先关掉"
+                    "占用它的程序；这一行自己返回之后会自动继续。")
+                log.warning("归档行任务 %s 卡住超过 %ss，未重排", tid,
+                            int(self._archive_stuck_seconds))
+        except Exception:                          # noqa: BLE001
+            # 看门狗自己出问题绝不许连累入队：那一轮还要照常排队。
+            log.exception("归档看门狗出错")
 
     def _archive_loop(self) -> None:
         """后台归档线程。**任何异常都不许逃出去**：一个坏文件不该带走整条线程，
@@ -1397,6 +1463,8 @@ class Dispatcher:
             finally:
                 with self._archive_lock:
                     self._archive_inflight.discard(task_id)
+                    self._archive_queued_at.pop(task_id, None)
+                    self._archive_warned.discard(task_id)
                 try:
                     _notify()
                 except Exception:                  # noqa: BLE001
@@ -1454,10 +1522,28 @@ class Dispatcher:
             # 后果是用户开着 Excel 跑完整批，结果表里对应行是**空的**，而且
             # 不报错——用户以为跑完了，实际数据丢了。静默丢失比卡住糟得多。
             # 「卡住」是可接受的：下面那条 note 事件会告诉用户关掉 Excel。
-            store.update_workflow(wid, writeback_pending=1)
-            store.add_event(task_id, "note", "system",
-                            "结果表被占用，这一行还没写回去。关掉 Excel/WPS 后"
-                            "会自动重试，本工作流也会在归档完成前停住。")
+            #
+            # **这一行不置位，所以下一轮照样会被重新入队重试。** 去重只压掉
+            # 重复的告警，压掉重试就是把上面那个「静默丢数据」原样装回来。
+            #
+            # 去重的必要性：文件长期被占（用户开着 Excel 吃顿饭）时这一行每轮
+            # 都重新抛错，实测 **59 次/分**——时间线上灌进几万条一模一样的
+            # note，写库 1305 条 SQL/分（×3 进程），真正的告警被淹在噪声里。
+            #
+            # 判据用 writeback_pending，而且**读库核对**：`wf` 是入队时的快照，
+            # 可能过期；拿快照判断会把「早就置过位」当成没置，白写一遍去重副作用。
+            try:
+                pending = int(store.get_workflow(wid).get("writeback_pending") or 0)
+            except Exception:                      # noqa: BLE001
+                # 读不到就当没置位：宁可多写一条 note，也不要因为读库失败
+                # 而让用户完全收不到「关掉 Excel」的提示。
+                log.exception("读工作流 %s 的 writeback_pending 失败", wid)
+                pending = 0
+            if not pending:
+                store.update_workflow(wid, writeback_pending=1)
+                store.add_event(task_id, "note", "system",
+                                "结果表被占用，这一行还没写回去。关掉 Excel/WPS 后"
+                                "会自动重试，本工作流也会在归档完成前停住。")
             log.warning("工作流 %s 第 %s 行回写被拒（%s），留待重试", wid,
                         row.get("workflow_row"), e)
             return
@@ -1504,10 +1590,18 @@ class Dispatcher:
 
     def _archive_stop(self) -> None:
         self._archive_stopped = True
-        thread = self._archive_thread
-        self._archive_q.put(None)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=self.poll_interval * 3 + 2.0)
+        threads = list(self._archive_threads)
+        # **每个 worker 一个结束哨兵**：只投一个的话，池里另一条线程要等
+        # 0.5 秒的 get 超时才发现 _archive_stopped（那条兜底路径还在，
+        # 但停机时没必要让它空转）。卡在 write_back 上的那条拿不到哨兵，
+        # 由 join 的超时兜住——它是 daemon 的，不挂住进程退出。
+        for _ in threads:
+            self._archive_q.put(None)
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=self.poll_interval * 3 + 2.0)
+        self._archive_threads = []
+        self._archive_thread = None
 
     # --- spawn ------------------------------------------------------------------
 

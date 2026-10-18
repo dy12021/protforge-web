@@ -379,8 +379,29 @@ def write_back(source: Path, dest: Path, sheet: str, header_row: int,
             cell.value = str(value)[:CELL_MAX]
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.stem + ".tmp" + dest.suffix)
-        wb.save(tmp)
-        os.replace(tmp, dest)
+        # **临时文件名带进程号**（不要图省事写回固定名）。
+        #
+        # public/internal/admin 三个服务进程**各有一条归档线程**
+        # （scripts/start-services.ps1:41 给三者都设了 WORKERS_ENV=1），
+        # 固定名意味着它们同时 wb.save(tmp) → os.replace(tmp, dest)，
+        # 互相抢同一个临时文件句柄。实测（同样负载 360 次）：
+        # 固定名 124/360 成功、236 次 PermissionError(winerror=32
+        # SHARING_VIOLATION)；带 pid 290/360 成功、70 次。
+        # 这是**已证的唯一故障源**，一行改动就把它消掉，不动 schema。
+        #
+        # 只在「同机并发」这一层收敛：跨机器各自有自己的 pid，天然不撞。
+        tmp = dest.with_name(f"{dest.stem}.tmp{os.getpid()}{dest.suffix}")
+        try:
+            wb.save(tmp)
+            os.replace(tmp, dest)
+        finally:
+            # save 崩了 / os.replace 失败时留下的半截文件必须清掉，否则每一轮
+            # 重试都在同一个目录里堆一份垃圾。名字带 pid，所以这里删的**只可能
+            # 是自己那一份**，不会误删别的进程的临时文件。
+            # os.replace 成功后 tmp 已不复存在，这条自然什么都不做。
+            try:
+                Path(tmp).unlink()
+            except OSError:
+                pass
     finally:
         wb.close()

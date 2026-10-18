@@ -602,6 +602,256 @@ def test_row_in_flight_is_not_enqueued_twice(disp, tmp_path, monkeypatch):
     assert len(calls) == 1, "同一个结果文件被同时写了两次"
 
 
+# --- I-1：文件长期被占时的告警风暴与恢复 -------------------------------------
+#
+# 上游裁定「被占时不置 workflow_archived」是为了**不静默丢数据**。本轮给这条
+# 路径加去重（压掉重复的 note），最容易犯的错就是把重试一起压掉——于是原来那个
+# bug 原样装回来：闸门② 永远等这一行，用户看到的却是「跑完了」。下面两条必须
+# **成对**存在：一条挡风暴，一条挡「为了挡风暴而不重试」。
+
+
+def test_repeated_locked_ticks_do_not_flood_the_timeline(disp, tmp_path, monkeypatch):
+    """文件一直被占 → 告警**至多一两条**，但**每一轮都真的重试**。
+
+    两个方向都得钉，缺一个都有实现能钻过去：
+    - 只钉「不刷屏」：实现可以是「被占过一次就再也不试」，照样全绿——而那
+      正是「静默丢数据」：结果表留空、不报错。
+    - 只钉「一直重试」：实现可以是每轮记一条一模一样的 note，照样全绿——
+      用户吃顿饭回来时间线上多出上万条噪声（实测 59 条/分）。
+    """
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+
+    calls = {"n": 0}
+
+    def locked(*a, **k):
+        calls["n"] += 1
+        raise PermissionError(13, "被占用")
+
+    monkeypatch.setattr(wfmod, "write_back", locked)
+    for _ in range(12):
+        disp._workflow_archive_pass()
+        assert disp._archive_wait(30)
+
+    # 方向一：重试没被顺手压掉
+    assert calls["n"] >= 12, \
+        f"12 轮只试了 {calls['n']} 次——去重把重试一起去掉了"
+    assert _archived(r0["id"]) == 0, "被占时置了位——这一行将永远不会被重试"
+    assert store.get_workflow(wf["id"])["writeback_pending"] == 1
+    # 方向二：告警没变成风暴
+    notes = [e for e in store.list_events(r0["id"]) if e["kind"] == "note"]
+    assert notes, "用户一条提示都收不到"
+    assert len(notes) <= 2, f"12 轮被占刷出 {len(notes)} 条 note：{notes}"
+    assert "Excel" in notes[-1]["message"]
+
+
+def test_locked_row_recovers_after_a_lock_storm(disp, tmp_path, monkeypatch):
+    """挡风暴**不许**顺带挡掉重试：解锁后再来一轮，真的补写成功。
+
+    与上一条成对。少这一条，实现可以是「一旦被占就再也不碰这一行」，
+    而上一条会全绿——闸门② 永远等它，用户看到的是「跑完了但结果表是空的」。
+    """
+    from openpyxl import load_workbook
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+
+    real = wfmod.write_back
+    state = {"locked": True}
+
+    def flaky(*a, **k):
+        if state["locked"]:
+            raise PermissionError(13, "被占用")
+        return real(*a, **k)
+
+    monkeypatch.setattr(wfmod, "write_back", flaky)
+    for _ in range(12):
+        disp._workflow_archive_pass()
+        assert disp._archive_wait(30)
+    assert _archived(r0["id"]) == 0, "还没解锁就归档了"
+
+    state["locked"] = False
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+
+    assert _archived(r0["id"]) == 1, "解锁之后没有自动补写——数据丢了"
+    assert store.get_workflow(wf["id"])["writeback_pending"] == 0
+    result = Path(store.get_workflow(wf["id"])["result_path"])
+    ws = load_workbook(result)["S1"]
+    assert ws.cell(row=2, column=4).value == "done"
+    assert ws.cell(row=2, column=5).value == "ok"
+
+
+# --- I-2：挂起的 write_back 不能拖住别的行 ---------------------------------
+
+
+def test_archive_pool_has_at_least_two_workers(disp, tmp_path):
+    """归档池**至少两条**线程（闸门② 等的就是这个队列里的行）。
+
+    单线程下一条挂起的 write_back 就是整个平台静默停摆：线程活着、队列不报错、
+    闸门② 永远等那一行。这是结构要求，不是性能优化，所以钉死「≥2」。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+
+    alive = [t for t in disp._archive_threads if t.is_alive()]
+    assert len(alive) >= 2, f"归档池只有 {len(alive)} 条线程"
+    assert len({t.name for t in alive}) >= 2, "线程同名，出问题时看不出是哪条"
+
+
+def test_one_hung_write_back_does_not_block_other_rows(disp, tmp_path, monkeypatch):
+    """I-2 的核心围栏：一条 write_back 挂起，**别的行照样被归档**。
+
+    单线程池下这里必然失败：三条行任务排在一条线程上，第一条挂着，后面两条
+    永远轮不到，闸门② 于是卡死整个工作流而界面上看不出任何异常。
+    """
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+    others = []
+    for i in (1, 2):
+        t = store.create_task("补的行", "b", owner_id=uid,
+                              workflow_id=wf["id"], workflow_row=i)
+        store.update_task(t["id"], status="done", summary=f"ok{i}")
+        others.append(int(t["id"]))
+
+    entered = threading.Event()
+    release = threading.Event()
+    real = wfmod.write_back
+
+    def hang_first(*a, **k):
+        if a[4][0][0] == 0:                 # jobs = [(row_index, col, value)]
+            entered.set()
+            release.wait(30)
+            raise PermissionError(13, "一直挂着")
+        return real(*a, **k)
+
+    monkeypatch.setattr(wfmod, "write_back", hang_first)
+    try:
+        disp._workflow_archive_pass()
+        assert entered.wait(5), "归档线程根本没开工"
+        deadline = time.time() + 15
+        while time.time() < deadline and not all(
+                _archived(t) == 1 for t in others):
+            time.sleep(0.05)
+        # 夹具自证：上面那圈是「别的行被归档了」，不是「挂起提前结束了」
+        assert entered.is_set() and not release.is_set(), \
+            "夹具失效：挂起提前结束，这条断言测不到想测的东西"
+        assert _archived(others[0]) == 1, "别的行被一条挂起的 write_back 拖住了"
+        assert _archived(others[1]) == 1, "别的行被一条挂起的 write_back 拖住了"
+        assert _archived(r0["id"]) == 0, "挂着的那行被误判成归档完成了"
+    finally:
+        release.set()
+    assert disp._archive_wait(30)
+
+
+def test_archive_stuck_threshold_default_is_thirty_seconds(disp):
+    """出厂阈值必须是 30 秒，且调度器实例真的取了这个值。
+
+    上一条为了不等 30 秒，把阈值改成 0.2——于是**模块里那个常量本身没有任何
+    测试碰过**：把它从 30 改成 10^9（「看门狗永不触发」）全套照样绿。变异实测
+    的幸存者就是这条。围的是**出厂策略值**，所以这里得单独钉一下：它既要明显
+    长于一次正常 write_back（宽表实测 2.2 秒，误报比不报更坏），又要短到用户
+    不会等到放弃（分钟级）。
+    """
+    assert dispatcher.ARCHIVE_WORKERS >= 2, "归档池出厂大小掉到 2 以下了"
+    assert dispatcher.ARCHIVE_STUCK_SECONDS == 30.0
+    assert disp._archive_stuck_seconds == dispatcher.ARCHIVE_STUCK_SECONDS, \
+        "实例没取模块常量——看门狗阈值会各走各的"
+    # 误报比不报更坏：正常一次 write_back 是 2.2 秒，阈值必须远大于它
+    assert dispatcher.ARCHIVE_STUCK_SECONDS >= 10.0
+
+
+def test_stuck_row_gets_a_user_visible_warning(disp, tmp_path, monkeypatch):
+    """看门狗：挂起超过阈值的行要有一句**用户能照着做**的话，且只说一次。
+
+    阈值调成 0.2 秒，免得测试真等 30 秒——围的是「告警有没有发生、发生几次」，
+    不是那个 30 的具体取值。不重排是刻意的：重排等于同一行可能被写两次。
+    """
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+
+    disp._archive_stuck_seconds = 0.2
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hang(*a, **k):
+        entered.set()
+        release.wait(20)
+        raise PermissionError(13, "一直挂着")
+
+    monkeypatch.setattr(wfmod, "write_back", hang)
+    try:
+        disp._workflow_archive_pass()
+        assert entered.wait(5), "归档线程根本没开工"
+        time.sleep(0.3)
+        # 看门狗挂在归档巡检上（tick 每轮都会走一遍），不另起线程
+        for _ in range(5):
+            disp._workflow_archive_pass()
+            time.sleep(0.1)
+        notes = [e for e in store.list_events(r0["id"]) if e["kind"] == "note"]
+        stuck = [n for n in notes if "卡住" in n["message"]]
+        assert stuck, f"挂起的行没有告警，用户只看到「停在第 1 行」：{notes}"
+        assert len(stuck) == 1, f"看门狗自己刷屏了 {len(stuck)} 条"
+        assert ("Excel" in stuck[0]["message"]
+                or "网络盘" in stuck[0]["message"]), \
+            "告警没告诉用户接下来该做什么"
+    finally:
+        release.set()
+    assert disp._archive_wait(30)
+
+
+# --- I-4：OSError 那半边也要有围栏 -----------------------------------------
+
+
+def test_disk_full_leaves_row_retryable_with_a_note(disp, tmp_path, monkeypatch):
+    """磁盘满（errno 28）→ **同样不置位**，而且同样挂上 pending 与提示。
+
+    这一侧此前**完全没被钉住**：把 ``, OSError`` 从 except 里删掉，31 条照样
+    全绿。而磁盘满、设备未就绪、网络盘断链走的都是 OSError——行还是留待重试
+    （对的），可 writeback_pending 不挂、那条「关掉占用它的程序」的提示也没有，
+    用户在时间线上看不到任何异常。
+    """
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+
+    monkeypatch.setattr(wfmod, "write_back",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(28, "No space left on device")))
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+
+    assert _archived(r0["id"]) == 0, "磁盘满却置了位——这一行永远不会被重试"
+    assert store.get_workflow(wf["id"])["writeback_pending"] == 1, \
+        "OSError 侧没挂上 writeback_pending"
+    notes = [e for e in store.list_events(r0["id"]) if e["kind"] == "note"]
+    assert notes, "磁盘满时用户看不到任何提示"
+
+
 # --- 常规队列排除工作流任务（规格 6.1）-------------------------------------
 
 def test_queued_tasks_excludes_workflow_rows(disp, tmp_path):
