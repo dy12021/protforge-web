@@ -485,6 +485,65 @@ button { cursor: pointer; }
 /* 抽屉本身与两条提示条都靠 hidden 开关，display 规则旁边必须各配一条伴生规则 */
 .drawer[hidden], .drawer-msg[hidden], .board-msg[hidden], .login-error[hidden] { display: none; }
 
+/* ------------------------------------------------------- 工作流页（规格 8.2）
+ *
+ * 全部挂在 .wf- 前缀上，**不碰上面任何既有规则的行为**：首页看板与工作流页
+ * 共用一张表，而两者的表长得很不一样（一个是流转轨卡片，一个是数据表）。
+ *
+ * 状态色一律引 :root 那五个变量，不另起色值——test_web_static.py 的
+ * 「五色齐全」「绑到变量」两条就在盯着这张表。
+ */
+
+/* 步骤指示 ①②③。已过的站灰掉、当前站强调，没到的站保持最淡。 */
+.wf-steps { display: flex; align-items: center; gap: .2rem; list-style: none; margin: 0; padding: 0; }
+.wf-step { color: var(--fg-dim); font-size: .78rem; padding: .1rem .2rem; }
+.wf-step::after { content: "›"; color: var(--border); margin: 0 .45rem; }
+.wf-step:last-child::after { content: ""; }
+.wf-step.is-done { color: var(--fg); }
+.wf-step.is-now { color: var(--accent); font-weight: 600; }
+
+/* 卡片进度条：把「第 N / M 行」从一行文字变成一条能一眼看出比例的条。
+   零填充而不是边框：0% 要真的看不见，1px 的边框会让「没跑过」看着像跑过。 */
+.wf-bar { width: 100%; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; margin: .4rem 0 .25rem; }
+.wf-bar-fill { height: 100%; width: 0; border-radius: 999px; background: var(--st-done); }
+.wf-bar.is-running .wf-bar-fill { background: var(--st-running); }
+.wf-failed.is-bad { color: var(--st-failed); font-weight: 600; }
+
+/* 表格预览：规格 8.2 点名的四件——行号列、表头粘顶、当前行高亮、状态色点。
+   **必须滚在 .wf-table-wrap 里**：粘顶是相对滚动容器生效的，
+   让整页滚的话 thead 会一直贴在视口顶上，把上面的工具条盖住。 */
+.wf-table-wrap { max-height: 30rem; overflow: auto; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.wf-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: .78rem; }
+.wf-table th, .wf-table td { padding: .3rem .5rem; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.wf-table thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--panel); color: var(--fg-dim);
+  font-weight: 600; border-bottom: 1px solid var(--border);
+}
+.wf-table tbody tr { cursor: pointer; }
+.wf-table tbody tr:hover td { background: var(--panel); }
+/* 当前行（点了它、下方显示它渲染出来的提示词的那一行） */
+.wf-table tbody tr.is-current td,
+.wf-table tbody tr.is-current .wf-rownum { background: var(--lift); }
+/* 行号列：横向也粘住，横着看长表时不会把「第几行」滚没 */
+.wf-rownum {
+  position: sticky; left: 0; z-index: 1;
+  background: var(--card); color: var(--fg-dim);
+  font-family: var(--mono); font-weight: 400; text-align: right; min-width: 2.6rem;
+}
+.wf-table thead th.wf-rownum { z-index: 3; background: var(--panel); }
+/* 状态色点：与流转轨、看板列头、时间线上的状态点说同一件事，
+   所以颜色直接引同一批变量，不另调色。 */
+.wf-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: .35rem; background: var(--st-queued); vertical-align: baseline;
+}
+.wf-dot[data-status="queued"]    { background: var(--st-queued); }
+.wf-dot[data-status="running"]   { background: var(--st-running); }
+.wf-dot[data-status="packaging"] { background: var(--st-packaging); }
+.wf-dot[data-status="done"]      { background: var(--st-done); }
+.wf-dot[data-status="failed"]    { background: var(--st-failed); }
+
 /* 动效只做一处（流转轨滑动），其余不加；并全部服从 prefers-reduced-motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }

@@ -19,6 +19,9 @@
     <button id="new-btn" class="primary" type="button">＋ 提交计算任务</button>
     <span class="toolbar-gap"></span>
     <span id="who" class="who"></span>
+    <!-- 工作流入口（规格 8.2 第 523 行）。少了这一行，工作流页就只能手敲 URL 到达：
+         路由是单段 + 白名单，页面做得再好，没人找得到就等于没有。 -->
+    <a class="who" href="workflow.html" title="表格每行一个计算任务，逐行串行跑">工作流 →</a>
     <button id="logout-btn" class="secondary" type="button">退出</button>
   </header>
 

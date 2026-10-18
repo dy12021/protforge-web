@@ -34,17 +34,25 @@
 
   <!-- 详情 -->
   <section id="wf-detail" hidden>
+    <!-- 步骤指示（规格 8.2 第 519 行的三步）。当前站在哪一步由真实状态算出来，
+         不是画上去的装饰：模板没配好就停在第 2 步，开跑过才是第 3 步。 -->
+    <div class="toolbar"><ol class="wf-steps" id="wf-steps"></ol></div>
+
     <div class="toolbar">
       <button id="wf-back" class="secondary" type="button">← 全部工作流</button>
       <span class="who" id="wf-name"></span>
       <span class="who" id="wf-sheet"></span>
       <span class="toolbar-gap"></span>
+      <span class="who" id="wf-failed"></span>
       <span class="who" id="wf-progress-text"></span>
     </div>
 
     <div class="toolbar">
       <button id="wf-start" class="primary" type="button">开始</button>
       <button id="wf-pause" class="secondary" type="button">暂停（当前行跑完再停）</button>
+      <!-- 少这一颗按钮是一条死路：界面上点完暂停就再也回不去了，
+           只能改库或者自己调接口（服务端 WORKFLOW_ACTIONS 本来就认 resume）。 -->
+      <button id="wf-resume" class="secondary" type="button">继续（接着跑下一行）</button>
       <button id="wf-abort" class="secondary" type="button">中止整批（立刻停掉当前行）</button>
       <!-- href 由 JS 在跑完之后才填：没跑完就没有结果表。
            与其挂一个指向本页的占位死链，不如让它暂时还不是链接。 -->
@@ -57,20 +65,28 @@
     <div id="wf-cols"></div>
 
     <div class="toolbar">
-      <span class="who">提示词模板（列绑定的变量写成两个大括号，例如 序列）</span>
+      <span class="who">提示词模板（列绑定的变量写成两个大括号包起来，例如 {{seq}}）</span>
     </div>
     <div class="toolbar">
       <textarea id="wf-template" rows="4" style="flex:1 1 40rem"
-                placeholder="例：请按下面的条件计算，序列号是 序列。"></textarea>
+                placeholder="例：请按下面的条件计算，序列号是 {{seq}}。"></textarea>
       <button id="wf-save" class="primary" type="button">保存映射</button>
     </div>
 
-    <!-- 表格预览：点任意一行，下面显示那一行渲染出来的提示词 -->
-    <div class="toolbar"><span class="who">每一行</span></div>
-    <table>
-      <thead><tr id="wf-head"></tr></thead>
-      <tbody id="wf-body"></tbody>
-    </table>
+    <!-- 表格预览：点任意一行，下面显示那一行渲染出来的提示词。
+         表头粘顶、行号列、当前行高亮、状态色点的样式都挂在 .wf-table 上。 -->
+    <div class="toolbar">
+      <span class="who">每一行</span>
+      <label class="toggle"><input id="wf-only-failed" type="checkbox"> 只看失败行</label>
+      <span class="toolbar-gap"></span>
+      <span class="who" id="wf-filter-note"></span>
+    </div>
+    <div class="wf-table-wrap">
+      <table class="wf-table">
+        <thead><tr id="wf-head"></tr></thead>
+        <tbody id="wf-body"></tbody>
+      </table>
+    </div>
 
     <div class="toolbar">
       <span class="who">第 <span id="wf-preview-row">1</span> 行渲染出来的提示词</span>

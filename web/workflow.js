@@ -99,6 +99,40 @@ const ROW_STATUS_LABEL = {
 
 let wfId = null;
 let wfSheet = "";
+/* 详情页最近一次拿到的整份数据。「只看失败行」切的是**重绘**，所以得留一份，
+   否则点一下筛选就得重新打一次接口——而筛选本身不该产生任何副作用。 */
+let lastDetail = null;
+
+/* 三步向导的步骤名（规格 8.2 第 519 行）。做成**指示**而不是拦路的分屏向导：
+   每一站在哪一步由真实状态算（见 renderSteps），不是画上去的一串假按钮。 */
+const WF_STEPS = ["上传表格", "配列与模板", "确认开跑"];
+/* 上传时服务端先落一句占位模板（server/app.py 的 PROMPT_PLACEHOLDER），
+   它不是用户写的提示词，不能算「第 2 步已配好」。 */
+const PROMPT_PLACEHOLDER = "（还没配置提示词模板）";
+
+/** 第 2 步算不算过：判据与 validate_binding 是同一套——模板不是那句占位文本，
+    且每一条输入/上下文列都绑了变量名。 */
+function mappingConfigured(wf, cols) {
+  const t = (wf.prompt_template || "").trim();
+  if (!t || t === PROMPT_PLACEHOLDER) return false;
+  const bound = cols.filter((c) => c.role === "input" || c.role === "context");
+  return bound.every((c) => (c.slot || "").trim() !== "");
+}
+
+function renderSteps(wf, cols) {
+  const box = $("#wf-steps");
+  box.innerHTML = "";
+  const done = [true, mappingConfigured(wf, cols || []), wf.status !== "draft"];
+  let now = done.indexOf(false);
+  if (now === -1) now = WF_STEPS.length - 1;
+  WF_STEPS.forEach((label, i) => {
+    const li = document.createElement("li");
+    li.className = "wf-step"
+      + (i < now ? " is-done" : "") + (i === now ? " is-now" : "");
+    li.textContent = `${i + 1} ${label}`;
+    box.appendChild(li);
+  });
+}
 
 /* ---------------------------------------------------------------- 列表 */
 
@@ -119,10 +153,18 @@ async function loadList() {
     el.className = "card";
     el.innerHTML = `<h3 class="card-title"></h3>
       <div class="card-meta"><span class="card-id"></span></div>
+      <div class="wf-bar"><div class="wf-bar-fill"></div></div>
       <div class="card-meta"><span class="card-time"></span></div>`;
     el.querySelector(".card-title").textContent = wf.name;
     el.querySelector(".card-id").textContent =
       `${WF_STATUS_LABEL[wf.status] || wf.status} · ${done} / ${total} 行`;
+    // 进度条不是装饰：宽度真按 cursor / total 算，空表也不会除出 NaN。
+    // 在跑的用暖色、停了的用绿色——一眼分得出「还在干」和「停了但已收工」。
+    const bar = el.querySelector(".wf-bar");
+    bar.className = "wf-bar" + (wf.status === "running" ? " is-running" : "");
+    bar.title = `已跑 ${done} / ${total} 行`;
+    el.querySelector(".wf-bar-fill").style.width =
+      (total > 0 ? Math.round(done * 100 / total) : 0) + "%";
     el.querySelector(".card-time").textContent =
       (wf.abort_requested ? "已请求中止" : "")
       + (wf.writeback_pending ? " · 结果表待补写" : "");
@@ -146,6 +188,16 @@ async function openDetail(id) {
   const total = Number(wf.total_rows) || 0;
   $("#wf-progress-text").textContent =
     `${done} / ${total} 行` + (wf.abort_requested ? " · 已请求中止" : "");
+
+  // 失败数从**详情这份行数据**里数出来。列表端点不返回失败数——workflows 表
+  // 没有这个字段（GET /api/workflows 就是 SELECT *），所以卡片上不编一个数；
+  // 真要有总数得多打一次详情接口，代价是每张卡片一次往返。
+  const rows = d.rows || [];
+  const failed = rows.filter((r) => r.status === "failed").length;
+  const failedBox = $("#wf-failed");
+  failedBox.textContent = failed > 0 ? `失败 ${failed} 行` : "没有失败行";
+  failedBox.className = failed > 0 ? "who wf-failed is-bad" : "who";
+
   $("#wf-template").value = wf.prompt_template || "";
 
   // 下载链接按 **status === 'finished'** 判，不按 writeback 判：
@@ -156,10 +208,15 @@ async function openDetail(id) {
   $("#wf-download").href = `/api/workflows/${id}/result.xlsx`;
 
   // 动作按状态开关：跑完了再点开始没有意义，422/静默空转都不好看。
+  // 「继续」只在 paused 可点——它在别的状态下要么 422 要么是空转，
+  // 而缺了这颗按钮的话，用户点了暂停就在界面上再也回不去了。
   $("#wf-start").disabled = wf.status === "running" || wf.status === "finished";
   $("#wf-pause").disabled = wf.status !== "running";
+  $("#wf-resume").disabled = wf.status !== "paused";
   $("#wf-abort").disabled = wf.status === "draft";
 
+  lastDetail = d;
+  renderSteps(wf, d.columns);
   renderCols(d.columns);
   renderRows(d);
   await loadPreview(0);
@@ -194,7 +251,10 @@ function renderCols(cols) {
     slot.type = "text";
     slot.dataset.slot = "1";
     slot.value = col.slot || "";
-    slot.placeholder = "变量名";
+    // 变量名的**写法**就写在这个框上：服务端槽位语法是双花括号，
+    // 而整页没有别处讲这件事——写错了服务端不报错，只是每一行都拿
+    // 同一句提示词去跑，结果原封不动出现在下一行。
+    slot.placeholder = "变量名，模板里写成 {{变量名}}";
     row.appendChild(slot);
 
     const field = document.createElement("select");
@@ -250,32 +310,51 @@ function renderRows(d) {
   const cols = d.columns;
   const head = $("#wf-head");
   head.innerHTML = "";
-  head.appendChild(document.createElement("th"));
+  const headNum = document.createElement("th");
+  headNum.className = "wf-rownum";
+  headNum.textContent = "行";
+  head.appendChild(headNum);
   for (const col of cols) {
     const th = document.createElement("th");
     th.textContent = `${col.header || "列" + (col.col_index + 1)}（${ROLE_LABEL[col.role] || col.role}）`;
     head.appendChild(th);
   }
+  // 「只看失败行」是**真筛**：非失败的行根本不进 DOM，不是给它们调透明度
+  // ——筛完还让人以为「整批只有这几行跑过」比筛不出来更坏。
+  const onlyFailed = !!$("#wf-only-failed").checked;
+  let shown = 0;
   for (const row of d.rows) {
+    if (onlyFailed && row.status !== "failed") continue;
+    shown++;
     const tr = document.createElement("tr");
     tr.dataset.row = String(row.workflow_row);
     tr.addEventListener("click", () => guard("预览这一行", () => loadPreview(row.workflow_row)));
-    const th = document.createElement("th");
-    th.textContent = String(row.workflow_row + 1);
-    th.title = row.title || "";
-    tr.appendChild(th);
+    const num = document.createElement("th");
+    num.className = "wf-rownum";
+    num.textContent = String(row.workflow_row + 1);
+    num.title = row.title || "";
+    tr.appendChild(num);
     for (const col of cols) {
       const td = document.createElement("td");
       td.dataset.col = String(col.col_index);
       if (col.role === "output") {
-        // 结果列放行任务的状态：格子的值在表格里，归档回 Excel 才有；
-        // 这里显示状态，不是假装已经读到结果。
-        td.textContent = ROW_STATUS_LABEL[row.status] || row.status || "";
+        // 结果列放行任务的状态，前面缀一颗状态色点：格子里的值在表格里，
+        // 归档回 Excel 才有；这里显示状态，不是假装已经读到结果。
+        const dot = document.createElement("span");
+        dot.className = "wf-dot";
+        dot.dataset.status = row.status || "queued";
+        td.appendChild(dot);
+        td.appendChild(document.createTextNode(
+          ROW_STATUS_LABEL[row.status] || row.status || ""));
       }
       tr.appendChild(td);
     }
     body.appendChild(tr);
   }
+  // 筛掉了多少行要写出来：筛完不给对账，用户会以为表坏了。
+  $("#wf-filter-note").textContent = onlyFailed
+    ? `只看失败行：显示 ${shown} / ${d.rows.length} 行`
+    : "";
 }
 
 /** 预览第 rowIndex 个数据行：既取渲染后的提示词，也把那行的单元格填回表格。 */
@@ -315,10 +394,41 @@ async function control(action) {
   await openDetail(wfId);
 }
 
+/* 下载结果表走 fetch + blob，**不是**让 <a> 直接导航过去。
+ *
+ * 原因：令牌在 localStorage 里，不在 Cookie 里（app.js 同一条口径），而
+ * <a href> 的导航请求不会带 Authorization 头 —— 实测点了只会拿到一个
+ * 401 的 JSON，页面不会报任何错，用户看到的是「点了没反应」。
+ * 同一个地址带上 Bearer 头就是 200，所以这条路是死的，不是服务端的问题。 */
+async function downloadResult() {
+  const r = await fetch(apiBase() + `/api/workflows/${wfId}/result.xlsx`,
+                        { headers: authHeaders() });
+  if (!r.ok) throw await errFrom(r);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "结果表.xlsx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+$("#wf-download").addEventListener("click", (e) => {
+  e.preventDefault();
+  guard("下载结果表", downloadResult);
+});
+
 $("#wf-back").addEventListener("click", () => guard("返回列表", loadList));
 $("#wf-save").addEventListener("click", () => guard("保存映射", saveMapping));
 $("#wf-start").addEventListener("click", () => guard("开始", () => control("start")));
 $("#wf-pause").addEventListener("click", () => guard("暂停", () => control("pause")));
+$("#wf-resume").addEventListener("click", () => guard("继续", () => control("resume")));
+/* 切筛选只是重绘：不该打接口，更不该顺手改任何一行任务的状态。 */
+$("#wf-only-failed").addEventListener("change", () => {
+  if (lastDetail) renderRows(lastDetail);
+});
 
 /* 中止是危险动作：点一下就停掉正在跑的那行。所以要两步——
    第一下只把按钮改成「再点一下就中止」，第二下才真发请求。

@@ -418,3 +418,141 @@ def test_every_dom_id_the_script_touches_exists_in_the_html(
     # 反过来也钉一下：HTML 上的控件没人引用，多半是只写了壳忘了绑事件
     assert not (have - used), \
         f"{html_name} 里有没人用的 id：{sorted(have - used)}"
+
+
+# --- 工作流页（规格 8.2 / 8.3 / 8.4）-----------------------------------
+#
+# 下面每一条都在补 Task 9 漏掉的规格条目。漏掉它们的后果分两类：
+# 一类是**死路**（界面上点了暂停就再也回不去），一类是**静默失效**
+# （页面能开、能点、能跑，就是少了规格点名的那几样东西，测试全绿）。
+#
+# 第二类更坏：没有围栏就等于没有测试，所以每条都必须真的红过一次。
+
+
+def test_workflow_page_shows_the_real_slot_syntax():
+    """提示词模板的示例必须真的是双花括号。
+
+    这条不是洁癖：Task 9 那一版整份 HTML 一个花括号都没有（多半是通过
+    Python 之类的格式化把它吃掉了），而**写错了服务端不报错**——
+    `extract_slots()` 扫不到槽位 → `validate_binding()` 没东西可拒 →
+    `render()` 原样返回，于是每一行都拿同一句提示词去跑，
+    表里一行的结果原封不动出现在下一行，全程零报错。
+
+    服务端槽位语法见 server/workflow.py 的 _SLOT_RE。
+    """
+    html = _html("workflow.html")
+    assert "{{" in html and "}}" in html, (
+        "工作流页没有出现双花括号 —— 变量语法示例被吞了。"
+        "服务端槽位语法是 {{名称}}（server/workflow.py 的 _SLOT_RE）")
+    js = _js("workflow.js")
+    assert "{{" in js, "workflow.js 里也没有双花括号，界面上无处可查这个语法"
+
+
+def test_workflow_page_has_all_four_controls():
+    """开始 / 暂停 / 继续 / 中止整批（规格 8.2 第 518 行）。
+
+    少「继续」是一条死路：界面上点完暂停就再也回不去了，只能改库或者
+    自己调接口——而服务端 WORKFLOW_ACTIONS 本来就认 resume。
+    """
+    html = _html("workflow.html")
+    for b in ("wf-start", "wf-pause", "wf-resume", "wf-abort"):
+        assert f'id="{b}"' in html, f"缺控制按钮 {b}"
+    js = _js("workflow.js")
+    for act in ("start", "pause", "resume", "abort"):
+        assert f'control("{act}")' in js, f"JS 里没有接 {act}"
+
+
+def test_workflow_cards_have_a_progress_bar_and_the_detail_a_failure_count():
+    """卡片要有**条**（规格 8.2 第 513 行），失败数要真的按行数出来。
+
+    失败数只能落在详情页：列表端点是 `SELECT * FROM workflows`，而
+    workflows 表根本没有失败计数这个字段（`server/` 冻结，不能加），
+    所以卡片上不许编一个数出来。
+    """
+    js = _js("workflow.js")
+    assert "wf-bar" in js, "卡片上没有进度条，只有一行「第 N / M 行」"
+    assert re.search(r"\.style\.width\s*=", js), "进度条宽度没有被算出来"
+    assert 'id="wf-failed"' in _html("workflow.html"), "详情页没有失败数的位置"
+    assert re.search(r'status\s*===\s*"failed"', js), \
+        "失败数没有真的按 failed 的行数数出来"
+
+
+def test_workflow_table_is_styled_as_the_spec_demands():
+    """表格预览的四件：行号列、表头粘顶、当前行高亮、状态色点（规格 8.2 第 515 行）。
+
+    **断言一律带作用域**（.wf-table / .wf-rownum / .wf-dot[data-status=...]）。
+    写成 `assert "sticky" in css` 是恒真的：.toolbar 早就有 position: sticky
+    （style.css 的工具条那条），A4 一点没修它也是绿的——这种围栏比没有更坏，
+    它让人以为这件事有人管。
+    """
+    css = _read(CSS)
+    html = _html("workflow.html")
+    js = _js("workflow.js")
+    assert 'class="wf-table"' in html, \
+        "表格没有工作流自己的类，样式无处可挂（首页的 .card/.chip 都不是它）"
+    assert re.search(r"\.wf-table[^{]*thead[^{]*\{[^}]*position:\s*sticky", css), \
+        "表头没有粘顶"
+    assert re.search(r"\.wf-rownum[^{]*\{[^}]*position:\s*sticky", css), \
+        "行号列没有横向粘住"
+    assert re.search(r"\.wf-table[^{]*is-current[^{]*\{[^}]*background", css), \
+        "当前行没有高亮"
+    assert re.search(
+        r'\.wf-dot\[data-status="failed"\][^{]*\{[^}]*var\(--st-failed\)', css), \
+        "状态色点没有绑到既有的 --st-failed 上（不许另起一套色值）"
+    assert "wf-rownum" in js and "wf-dot" in js, \
+        "JS 没有给行号与状态点挂上这两个类，样式等于没挂"
+
+
+def test_homepage_links_to_the_workflow_page():
+    """两边都要有入口：首页进得去（规格 8.2 第 523 行），工作流页回得来。
+
+    上一版是零入口——页面能打开，但没人找得到。
+    """
+    assert 'href="workflow.html"' in _html("index.html"), \
+        "首页没有工作流入口，页面只能靠手敲 URL 到达"
+    assert 'href="index.html"' in _html("workflow.html"), \
+        "工作流页没有回到首页的链接"
+
+
+def test_workflow_detail_can_filter_to_failed_rows_only():
+    """规格 8.3 第 534 行：行任务的故障排查走工作流详情页，那里有「只看失败行」的筛选。"""
+    html = _html("workflow.html")
+    assert 'id="wf-only-failed"' in html, "详情页没有「只看失败行」的开关"
+    js = _js("workflow.js")
+    assert re.search(r'onlyFailed\s*&&\s*row\.status\s*!==\s*"failed"', js), \
+        "开关没有真的在筛行（不是只染个色或者只在文案里写「只看失败行」）"
+    assert re.search(r'\$?\(\s*["\']#wf-only-failed["\']\s*\)', js) \
+        and "change" in js, "开关没有绑 change 事件，点了不重绘"
+
+
+def test_workflow_download_carries_the_bearer_token():
+    """「下载结果表」不能是 <a> 直接导航过去。
+
+    实机踩到的：令牌在 localStorage 不在 Cookie 里，而导航请求不带
+    Authorization 头 —— 点了只会拿到一个 401 的 JSON，界面上**不报任何错**，
+    看着就是「按钮点不动」。同一个地址带上头就是 200，所以这条是死路。
+    """
+    js = _js("workflow.js")
+    m = re.search(r"/api/workflows/\$\{wfId\}/result\.xlsx", js)
+    assert m, "找不到结果表的地址"
+    tail = js[m.end(): m.end() + 200]
+    assert "authHeaders()" in tail, \
+        "结果表是用导航去取的，没有 Authorization 头 —— 实机点它只会拿到 401"
+    assert re.search(r'\$\(\s*["\']#wf-download["\']\s*\)', js) \
+        and "preventDefault" in js, \
+        "下载链接没有拦下默认导航，改成 fetch 取字节"
+
+
+def test_workflow_detail_shows_the_three_step_indicator():
+    """规格 8.2 第 519 行的三步：上传 → 选列配模板 → 确认开跑。
+
+    这里钉的是**指示**（步骤条会随真实状态重画），不是拦路的分屏向导——
+    后者需要一整套步骤状态机，本轮没有做，见 task-9b-report.md。
+    """
+    assert 'id="wf-steps"' in _html("workflow.html"), "详情页没有步骤指示"
+    js = _js("workflow.js")
+    m = re.search(r"const\s+WF_STEPS\s*=\s*\[([^\]]*)\]", js)
+    assert m, "找不到 WF_STEPS"
+    steps = m.group(1)
+    for label in ("上传表格", "配列与模板", "确认开跑"):
+        assert label in steps, f"步骤条少了「{label}」"
