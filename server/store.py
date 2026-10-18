@@ -74,7 +74,8 @@ def _work_dir(task_id: int) -> str:
 
 # ---------------------------------------------------------------- tasks
 
-def create_task(title: str, brief: str, owner_id: int, actor: str = "human") -> dict:
+def create_task(title: str, brief: str, owner_id: int, actor: str = "human",
+                *, workflow_id=None, workflow_row=None) -> dict:
     """建任务，初始状态恒为 queued。
 
     **不自动写 'created' 事件**——事件流由 API 层负责（用户点了提交才有一条，
@@ -82,6 +83,10 @@ def create_task(title: str, brief: str, owner_id: int, actor: str = "human") -> 
     调一次 add_event 后 list_events 必须是 1。
 
     brief 原样保存不截断：agent 据此决定调哪些技能、填什么参数，截断了它就自己编。
+
+    workflow_id / workflow_row 是**只在尾部加的关键字参数**，默认 None：既有调用点
+    一个字都不用改，落库也就是 NULL——「NULL = 不属于任何工作流」是常规任务的
+    契约，闸门⑥ 的 `workflow_id IS NULL` 就靠它。**不要**给它们设非 None 的默认值。
     """
     title = (title or "").strip()
     brief = brief or ""
@@ -101,9 +106,10 @@ def create_task(title: str, brief: str, owner_id: int, actor: str = "human") -> 
             cur = c.execute(
                 """INSERT INTO tasks
                    (title, brief, status, step, owner_id, priority,
-                    uploads_dir, output_dir, created_at, updated_at)
-                   VALUES (?, ?, 'queued', '', ?, 0, '', '', ?, ?)""",
-                (title, brief, int(owner_id), now, now),
+                    uploads_dir, output_dir, created_at, updated_at,
+                    workflow_id, workflow_row)
+                   VALUES (?, ?, 'queued', '', ?, 0, '', '', ?, ?, ?, ?)""",
+                (title, brief, int(owner_id), now, now, workflow_id, workflow_row),
             )
             tid = cur.lastrowid
             # 目录只写路径不 mkdir：真建目录是上传/打包那一刻的事，
@@ -165,6 +171,8 @@ def _update(task_id: int, **fields) -> dict:
         "title", "brief", "status", "step", "priority", "uploads_dir",
         "output_dir", "package_path", "summary", "error", "session_id",
         "done_at",
+        # 工作流三列。放行 pass 与归档 pass 全靠它们，改白名单就是给闸门断供。
+        "workflow_id", "workflow_row", "workflow_archived",
     }
     bad = set(fields) - allowed
     if bad:
@@ -580,3 +588,283 @@ class _Audit:
 
 artifacts = _Artifacts()
 audit = _Audit()
+
+
+# --- 工作流 -----------------------------------------------------------------
+# 业务 SQL 全部集中在本模块（见模块 docstring 第 1 条），工作流这一段也遵守：
+# 别在旁边另起一个 workflow.py，那会让「改了一份另一份还在跑」从十几次变成更多次。
+
+_WORKFLOW_FIELDS = {
+    "name", "sheet", "source_path", "prompt_template", "header_row", "key_col",
+    "total_rows", "cursor", "writeback", "writeback_pending",
+    "abort_requested", "result_path", "status",
+}
+_ROLES = ("key", "input", "context", "output", "ignore")
+
+
+def create_workflow(owner_id: int, name: str, prompt_template: str, *,
+                    sheet: str = "", source_path: str = "", header_row: int = 1,
+                    key_col: int = 0, total_rows: int = 0,
+                    writeback: int = 0) -> dict:
+    """建工作流。**不设 status**——它恒为表默认值 'draft'。
+
+    cursor 恒从 0 起：它表示「下一个尚未放行的数据行序号」，建工作流时还没有任何
+    行被放行。abort_requested / writeback_pending 同理，由默认值兜住。
+    """
+    name = (name or "").strip()
+    if not name:
+        raise Invalid("工作流名称不能为空")
+    if not (prompt_template or "").strip():
+        raise Invalid("提示词模板不能为空")
+    if owner_id is None:
+        raise Invalid("工作流缺少归属用户")
+    now = db.now_iso()
+    c = db.connect()
+    try:
+        with c:
+            cur = c.execute(
+                """INSERT INTO workflows
+                   (owner_id, name, sheet, source_path, prompt_template,
+                    header_row, key_col, total_rows, cursor, writeback,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                (int(owner_id), name, sheet, source_path, prompt_template,
+                 int(header_row), int(key_col), int(total_rows),
+                 1 if writeback else 0, now, now))
+            wid = cur.lastrowid
+        row = c.execute("SELECT * FROM workflows WHERE id = ?", (wid,)).fetchone()
+    finally:
+        c.close()
+    return dict(row)
+
+
+def list_workflows(owner_id=None, *, is_admin: bool = False) -> list[dict]:
+    sql = "SELECT * FROM workflows"
+    where, args = [], []
+    if not is_admin and owner_id is not None:
+        where.append("owner_id = ?")
+        args.append(int(owner_id))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC"
+    c = db.connect()
+    try:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+    finally:
+        c.close()
+
+
+def get_workflow(workflow_id: int, owner_id=None, is_admin: bool = False) -> dict:
+    """越权抛 NotFound（不抛 403）——与 get_task 同约定，不承认 id 存在。"""
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM workflows WHERE id = ?",
+                        (int(workflow_id),)).fetchone()
+    finally:
+        c.close()
+    if row is None:
+        raise NotFound("工作流不存在")
+    if not is_admin and owner_id is not None and int(row["owner_id"]) != int(owner_id):
+        raise NotFound("工作流不存在")
+    return dict(row)
+
+
+def update_workflow(workflow_id: int, **fields) -> dict:
+    """白名单更新。**不做归属校验**——调用方（HTTP 层）必须先 get_workflow 验过
+    owner，否则这里等于把别人的工作流开着改。"""
+    bad = set(fields) - _WORKFLOW_FIELDS
+    if bad:
+        raise Invalid(f"不能更新这些字段：{', '.join(sorted(bad))}")
+    if not fields:
+        return get_workflow(workflow_id)
+    if "status" in fields and fields["status"] not in ("draft", "running", "paused", "finished"):
+        raise Invalid(f"未知的工作流状态：{fields['status']}")
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    c = db.connect()
+    try:
+        with c:
+            cur = c.execute(f"UPDATE workflows SET {cols} WHERE id = ?",
+                            list(fields.values()) + [int(workflow_id)])
+            if cur.rowcount == 0:
+                raise NotFound("工作流不存在")
+        row = c.execute("SELECT * FROM workflows WHERE id = ?",
+                        (int(workflow_id),)).fetchone()
+    finally:
+        c.close()
+    return dict(row)
+
+
+def list_workflow_columns(workflow_id: int) -> list[dict]:
+    c = db.connect()
+    try:
+        rows = c.execute(
+            "SELECT * FROM workflow_columns WHERE workflow_id = ? ORDER BY col_index",
+            (int(workflow_id),)).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def set_workflow_columns(workflow_id: int, cols: list[dict]) -> list[dict]:
+    """整体替换一列组。靠 UNIQUE(workflow_id, col_index) 保证幂等。"""
+    seen = set()
+    for col in cols:
+        if col.get("role", "ignore") not in _ROLES:
+            raise Invalid(f"未知的列角色：{col.get('role')}")
+        idx = int(col["col_index"])
+        if idx in seen:
+            raise Invalid(f"第 {idx} 列出现了两次")
+        seen.add(idx)
+    c = db.connect()
+    try:
+        with c:
+            c.execute("DELETE FROM workflow_columns WHERE workflow_id = ?",
+                      (int(workflow_id),))
+            for col in cols:
+                c.execute(
+                    """INSERT INTO workflow_columns
+                       (workflow_id, col_index, header, role, slot, field)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (int(workflow_id), int(col["col_index"]),
+                     col.get("header", ""), col.get("role", "ignore"),
+                     col.get("slot", ""), col.get("field", "")))
+    finally:
+        c.close()
+    return list_workflow_columns(workflow_id)
+
+
+def delete_workflow(workflow_id: int) -> None:
+    """只删数据库。tasks.workflow_id 的 ON DELETE CASCADE 会带走行任务记录；
+    磁盘由 janitor 负责（规格 6.7 要求先中止在跑的行任务，那是 app 层的事）。"""
+    c = db.connect()
+    try:
+        with c:
+            c.execute("DELETE FROM workflows WHERE id = ?", (int(workflow_id),))
+    finally:
+        c.close()
+
+
+def skip_workflow_row(workflow_id: int, row_index: int, reason: str = "") -> None:
+    c = db.connect()
+    try:
+        with c:
+            c.execute(
+                """INSERT OR IGNORE INTO workflow_skips
+                   (workflow_id, row_index, reason, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (int(workflow_id), int(row_index), reason, db.now_iso()))
+    finally:
+        c.close()
+
+
+def list_workflow_skips(workflow_id: int) -> set[int]:
+    c = db.connect()
+    try:
+        return {int(r[0]) for r in c.execute(
+            "SELECT row_index FROM workflow_skips WHERE workflow_id = ?",
+            (int(workflow_id),)).fetchall()}
+    finally:
+        c.close()
+
+
+# --- 调度器闸门要问的问题（规格 6.3 / 6.4）---------------------------------
+
+_LIVE = ("queued", "running", "packaging")
+_TERMINAL_SQL = ("done", "failed")
+
+
+def list_running_workflows() -> list[dict]:
+    c = db.connect()
+    try:
+        rows = c.execute(
+            "SELECT * FROM workflows WHERE status = 'running' ORDER BY id").fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def workflow_has_unarchived(workflow_id: int) -> bool:
+    """闸门②。判据是**行自己的标记**，与 cursor 无关。
+
+    写成 `workflow_row < cursor` 会把所有历史行都算成没归档（含早已归档过的），
+    于是②恒真、整批永不放行——而且只在管理员用过重跑之后才发作。
+    """
+    c = db.connect()
+    try:
+        return c.execute(
+            "SELECT 1 FROM tasks WHERE workflow_id = ? AND workflow_archived = 0"
+            " LIMIT 1", (int(workflow_id),)).fetchone() is not None
+    finally:
+        c.close()
+
+
+def workflow_has_live_rows(workflow_id: int) -> bool:
+    """闸门⑤：在跑 / 排队 / 打包中的行任务。"""
+    marks = ",".join("?" * len(_LIVE))
+    c = db.connect()
+    try:
+        return c.execute(
+            f"SELECT 1 FROM tasks WHERE workflow_id = ? AND status IN ({marks})"
+            " LIMIT 1", (int(workflow_id), *_LIVE)).fetchone() is not None
+    finally:
+        c.close()
+
+
+def workflow_queued_rows(workflow_id: int) -> list[dict]:
+    """闸门④：要认领的 queued 行任务。管理员重跑产生的就在这里。"""
+    c = db.connect()
+    try:
+        rows = c.execute(
+            "SELECT * FROM tasks WHERE workflow_id = ? AND status = 'queued'"
+            " ORDER BY workflow_row", (int(workflow_id),)).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def workflow_unarchived_terminal_rows(workflow_id: int) -> list[dict]:
+    """归档 pass 的取数：终态且还没写回表的行。"""
+    marks = ",".join("?" * len(_TERMINAL_SQL))
+    c = db.connect()
+    try:
+        rows = c.execute(
+            f"SELECT * FROM tasks WHERE workflow_id = ?"
+            f" AND status IN ({marks}) AND workflow_archived = 0"
+            " ORDER BY workflow_row",
+            (int(workflow_id), *_TERMINAL_SQL)).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def list_workflow_rows(workflow_id: int, row_index=None) -> list[dict]:
+    c = db.connect()
+    try:
+        if row_index is None:
+            rows = c.execute(
+                "SELECT * FROM tasks WHERE workflow_id = ? ORDER BY workflow_row",
+                (int(workflow_id),)).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM tasks WHERE workflow_id = ? AND workflow_row = ?",
+                (int(workflow_id), int(row_index))).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def user_has_live_regular_tasks(owner_id: int) -> bool:
+    """闸门⑥。注意 workflow_id IS NULL —— 行任务自己不能把自己挡住。
+
+    这一句写反（漏掉 IS NULL）的后果没有任何报错：闸门永远为真，工作流永远不放行。
+    """
+    marks = ",".join("?" * len(_LIVE))
+    c = db.connect()
+    try:
+        return c.execute(
+            f"SELECT 1 FROM tasks WHERE owner_id = ? AND workflow_id IS NULL"
+            f" AND status IN ({marks}) LIMIT 1",
+            (int(owner_id), *_LIVE)).fetchone() is not None
+    finally:
+        c.close()
+
