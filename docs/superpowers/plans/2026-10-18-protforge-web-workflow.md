@@ -2072,7 +2072,13 @@ def test_archive_marks_every_row_individually(disp, tmp_path):
 
 
 def test_archive_survives_locked_result_file(disp, tmp_path):
-    """文件被 Excel 占住 → 降级，但**照样置位**、不卡住。"""
+    """文件被 Excel 占住 → 降级为待补写、**不置位**，下一轮重试。
+
+    规格 7.1（用户已拍板）：置位等于宣告「这一行完事了」而结果根本不在表里，
+    待归档行的取数带 `AND workflow_archived = 0`，置位之后没有任何代码会再碰
+    它——用户跑完整批、结果表里对应行是空的、且不报错。**静默丢数据比暂时
+    卡住糟得多**，而卡住是有解的：note 事件告诉用户关掉 Excel，下一轮重试。
+    """
     uid = _user()
     wf = _workflow(uid, tmp_path)
     disp._workflow_run_pass()
@@ -2089,7 +2095,8 @@ def test_archive_survives_locked_result_file(disp, tmp_path):
     finally:
         wfmod.write_back = monkey
 
-    assert store.get_task(r0["id"])["workflow_archived"] == 1
+    assert store.get_task(r0["id"])["workflow_archived"] == 0, \
+        "被占时置了位——这一行将永远不会被重试"
     assert store.get_workflow(wf["id"])["writeback_pending"] == 1
 
 
@@ -2395,23 +2402,33 @@ import workflow as workflow_mod
                        for c in store.list_workflow_columns(wid)
                        if c["role"] == "output" and c.get("field")]
         marked = False
-        if output_cols:
+        if output_cols and int(wf.get("writeback") or 0):
+            # **回写开关关着时也要置位**（规格 7.1 第 5 步）：闸门② 等的是
+            # 「这一行不用再写了」，跳过置位整批就永远停在那一行。
             try:
                 self._write_back_row(wf, output_cols, fields, int(row["workflow_row"]))
                 marked = True
-            except PermissionError:
-                # 文件被 Excel/WPS 独占锁住：**降级不重试**（规格 7.1）。
-                # 置位照做，否则整批卡在这一行；只把回写标成待补写。
+            except (PermissionError, OSError):
+                # 文件被 Excel/WPS 独占锁住（或磁盘满）：**降级为待补写**。
+                #
+                # **不置 workflow_archived**（规格 7.1，用户已拍板）：置了位就
+                # 再没人查得到这一行——待归档行的取数带
+                # `AND workflow_archived = 0`，writeback_pending 永远挂着没人清，
+                # 用户开着 Excel 跑完整批，结果表里对应行是**空的**且不报错。
+                # 静默丢数据比暂时卡住糟得多。批次停在那一行，界面上明写
+                # 「结果表被占用，待补写」，关掉 Excel 后下一轮自动重试。
+                # 去重只压重复的 note，**压掉重试就是把上面那个 bug 装回来**。
                 store.update_workflow(wid, writeback_pending=1)
+                marked = False
+            except store.Invalid as e:
+                # 源表被改短/损坏，或结果表打不开：重试一万次也等不到。
+                # **必须置位**，否则闸门② 会永远等这一行，整批永久死锁。
+                # 记一条 error 事件说清原因，让用户在工作流详情页看得见。
+                store.add_event(task_id, "error", "system", f"归档失败：{e}")
                 marked = True
-            except (store.Invalid, OSError) as e:
-                # 源表被改短/损坏：记一条失败原因并继续，不要抛——
-                # 抛了会经 tick 的 except 变成一行静默日志。
-                store.add_event(task_id, "error", "system",
-                                f"归档失败：{e}")
-                marked = True
-        if not marked:
-            marked = True                      # 没有 output 列也算归档完成
+        else:
+            # 没有 output 列、或回写开关关着 —— 都算归档完成。
+            marked = True
         if marked:
             store.update_task(task_id, workflow_archived=1)
 
@@ -2454,7 +2471,12 @@ message 写进 `.git\MSG_t5.txt` 后 `git -F`：
 且只在管理员用过重跑之后才发作。
 
 归档逐行置 workflow_archived，不做「全批统一置位」——后者把一次失败
-放大成 N 次重写。被 Excel 占住时降级不重试。
+放大成 N 次重写。被 Excel 占住时降级为待补写：本行**不置位**、挂
+writeback_pending=1，下一轮归档重试；批次停在那一行并在界面上明写「结果表
+被占用，待补写」。置位就等于宣告「这一行完事了」而结果根本不在表里——
+待归档行的取数带 `AND workflow_archived = 0`，置位之后那一行永远不会被
+重试，用户跑完整批、结果表里对应行是空的、且不报错。静默丢结果比暂时卡住
+糟得多，而卡住在这里是有解的：note 事件告诉用户关掉 Excel，下一轮自动补写。
 
 tick 里两个 pass 各自 try/except：_loop 是 try: tick() except，
 一次异常会让整轮 _admit 都没机会执行，用户看到的是所有常规任务停在

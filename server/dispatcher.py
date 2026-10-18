@@ -1259,14 +1259,25 @@ class Dispatcher:
         wid = int(wf["id"])
         if wf.get("status") != "running" or int(wf.get("abort_requested") or 0):
             return None
+        # **放行侧也要读 workflow_skips**（规格 6.5 / §10）。原来只有闸门④ 间接
+        # 看它，而④ 只管「管理员重跑产生的 queued 行」；按 cursor 放行的那条路
+        # 整个文件都不读它——于是「跳过先于放行」时那一行照跑不误，白烧一次
+        # 完整计算，而用户点它的用意正是「这行序列是坏的，别跑」。
+        skips = store.list_workflow_skips(wid)
 
         # ④ 先认领 queued 的行任务（管理员重跑产生的唯一落点），认领完就返回。
         #    排这么前是因为它一旦被②盖住就永远走不到，而"重跑"只有这一条路。
         queued = store.workflow_queued_rows(wid)
         if queued:
             row = queued[0]
-            return self._spawn_workflow_row(wf, int(row["workflow_row"]),
-                                            int(row["id"]))
+            row_index = int(row["workflow_row"])
+            if row_index in skips:
+                # 跳过**晚于**放行：这一行已经有任务了（重跑把它退回 queued）。
+                # 跳过的行不再跑一遍，直接置终态，交给归档 pass 写「已跳过」。
+                store.set_status(int(row["id"]), "failed", actor="system",
+                                 message="用户跳过，未运行")
+                return None
+            return self._spawn_workflow_row(wf, row_index, int(row["id"]))
 
         # ⑤ 串行：有非终态行任务就不放下一行。**故意不过滤 workflow_archived**——
         #    已经归档但尚未进终态的行（重跑后又被置回 queued 之外的状态）会同时
@@ -1281,6 +1292,26 @@ class Dispatcher:
         cursor = int(wf["cursor"])
         if cursor >= int(wf["total_rows"]):
             store.update_workflow(wid, status="finished")
+            return None
+        if cursor in skips:
+            # 跳过**先于**放行：这一行还没有任务，照样不许建任务、照常烧一次计算。
+            #
+            # 但它**必须有**一条终态行任务：闸门② 等的是「每一行都不用再写了」，
+            # 连任务都没有的行在它眼里根本不存在，而结果列也得有一格写着「已跳过」
+            # （规格 6.5 / §10）。所以这里补一条**建出来就已经是终态、不排队**
+            # 的任务——它从不存在 queued 状态，所以④ 也认领不到它，不存在
+            # 「建完又被放行一次」的回头路。下一轮归档 pass 把它当普通终态行
+            # 写回结果表，然后闸门② 解除，下一行照常放行。
+            task = store.create_task(
+                f"[工作流 {wf['name']}] 第 {cursor + 1} 行 · 已跳过",
+                workflow_mod.render(wf["prompt_template"], {}),
+                owner_id=int(wf["owner_id"]), actor="system",
+                workflow_id=wid, workflow_row=cursor)
+            store.set_status(int(task["id"]), "failed", actor="system",
+                             message="用户跳过，未运行")
+            store.add_event(int(task["id"]), "note", "system",
+                            "用户跳过了这一行，没有运行计算。")
+            store.update_workflow(wid, cursor=cursor + 1)
             return None
         # ⑥ 排在常规任务之后（顺序层之外再加一道可读、可测的契约）
         if store.user_has_live_regular_tasks(int(wf["owner_id"])):
@@ -1358,13 +1389,18 @@ class Dispatcher:
         「逐行入队」不是省事写法（规格 7.2）：一批 5 行里第 3 行失败时，前两行
         必须已经各自置位，否则下一轮会把它们连同第 3 行一起重来。「整批统一置位」
         看着更整齐，实际是把一次失败放大成 N 次重写。
+
+        取数范围是 **running + paused**（store.list_open_workflows）：中止与暂停
+        都把 status 写成 paused，而被中止那一刻正在跑的那一行会变成**终态却
+        未归档**——只扫 running 的话它永远排在取数范围之外，用户点完中止，
+        已经算出来的那一行既不进表也下不到。
         """
         queued: list[int] = []
         self._archive_watchdog()
         try:
-            workflows = store.list_running_workflows()
+            workflows = store.list_open_workflows()
         except Exception:                          # noqa: BLE001
-            log.exception("读取 running 工作流失败")
+            log.exception("读取待归档工作流失败")
             return queued
         for wf in workflows:
             wid = int(wf["id"])
@@ -1389,9 +1425,45 @@ class Dispatcher:
                     self._archive_warned.discard(task_id)
                     self._archive_q.put((wid, task_id))
                     queued.append(task_id)
+            self._converge_if_aborted(wf)
         if queued:
             self._archive_ensure_thread()
         return queued
+
+    def _converge_if_aborted(self, wf: dict) -> None:
+        """中止之后，**自己**收敛到终态，不需要用户再点一次「继续」。
+
+        中止把 status 置成 paused，而 ``finished`` 只在闸门③ 产生、闸门① 又
+        只放行 running 的工作流——于是中止后**没有任何代码能推到终态**，
+        唯一出路是用户手动点「继续」。这条死路已经实测过：连跑 5 轮 tick 之后
+        仍是 ``status=paused``。
+
+        判据：**abort_requested=1**（真的点过中止，不是普通暂停）且没有非终态
+        行、也没有未归档的终态行。后两条意味着「所有已算出来的结果都已经落表」
+        ——在归档真正完成之前就置 finished，用户看到的仍是「跑完了」而表是空的，
+        那正是 C-1 那种静默丢数据的形状。
+
+        **为什么复用 finished 而不改 CHECK**：workflows.status 的 CHECK 是
+        ('draft','running','paused','finished')，只有 finished 一个终态（规格
+        6.6 明确不新增 aborted 值，理由是 SQLite 改 CHECK 要重建表）。复用它
+        不会误导用户：pause 与 abort 在本系统里的区别是**要不要把在跑的那行
+        杀掉**，而不是「结局叫什么」；中止之后用户看到的是一份已经收到手的
+        部分结果，语义上就是「这一批到此为止」，而不是「全部跑完了」——
+        跑没跑完由 cursor/total_rows 如实显示。
+        """
+        try:
+            wid = int(wf["id"])
+            if wf.get("status") != "paused" or not int(wf.get("abort_requested") or 0):
+                return
+            if store.workflow_has_live_rows(wid):
+                return
+            if store.workflow_unarchived_terminal_rows(wid):
+                return
+            store.update_workflow(wid, status="finished")
+            log.info("工作流 %s 中止后收敛到终态（无存活行、无未归档行）", wid)
+        except Exception:                          # noqa: BLE001
+            # 收敛失败绝不能把归档 pass 一起带走——下一轮还会再来一次。
+            log.exception("工作流 %s 中止后收敛到终态失败", wf.get("id"))
 
     def _archive_ensure_thread(self) -> None:
         """把归档线程池补满到 :data:`ARCHIVE_WORKERS`。已停机就不再起。
@@ -1508,10 +1580,28 @@ class Dispatcher:
         output_cols = [workflow_mod.OutputCol(int(c["col_index"]), c["field"])
                        for c in store.list_workflow_columns(wid)
                        if c["role"] == "output" and c.get("field")]
-        if not output_cols:
+        # **回写开关（规格 2 决策表 / 7.1 / 9.1）**：writeback=0 时结果只留在
+        # 平台内，不生成也不更新 result.xlsx。
+        #
+        # **关掉时照样要归档、照样要置 workflow_archived=1**——这里最容易踩：
+        # 闸门② 等的是「每一行都不用再写了」，跳过置位的话开关一关整批就永远
+        # 停在那一行，而且界面显示「运行中」但一行都不动。关掉开关改变的是
+        # 「结果去哪」，不是「这一行处理完了没有」。
+        if not output_cols or not int(wf.get("writeback") or 0):
             # 没有 output 列也算归档完成：闸门② 等的是「这一行不用再写了」。
             store.update_task(task_id, workflow_archived=1)
             return
+        # 被跳过的行写「已跳过」而不是它的 status（规格 6.5 / §10）：
+        # status 在这一行是 failed，读起来像「跑失败了」，而用户的本意是
+        # 「这行序列是坏的，我故意没跑」——这两件事在结果表里必须分得开。
+        #
+        # 跳过原因写进 **summary**（结果说明列）而不是 error：跳过不是错误，
+        # error 列留给真失败。用户看表时「已跳过 + 为什么」在一行里就读完了。
+        if int(row["workflow_row"]) in store.list_workflow_skips(wid):
+            reason = store.workflow_skip_reason(wid, int(row["workflow_row"]))
+            fields["status"] = "已跳过"
+            fields["summary"] = f"用户跳过：{reason}" if reason else "用户跳过"
+            fields["error"] = ""
         try:
             self._write_back_row(wf, output_cols, fields, int(row["workflow_row"]))
         except (PermissionError, OSError) as e:

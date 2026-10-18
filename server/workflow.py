@@ -341,16 +341,44 @@ def _sheet_row_number(view: SheetView, row_index: int) -> int:
     return view.row_numbers[row_index]
 
 
+def _load_base_workbook(source: Path, dest: Path):
+    """取回写的**基底工作簿**：已经存在的 ``dest``，否则 ``source``。
+
+    规格 7.1 要的是「**同一个** result.xlsx 累积出当前进度」，所以基底必须是
+    已经写过几轮的那一份。**无条件从 source 重载就是 C-1 那个静默丢数据的
+    形态**：调度器每次只传一行 jobs，于是每归档一行就把之前写进 dest 的结果
+    整片擦掉——500 行的批次结果表里只剩一格有值，不报错、不卡住，界面还显示
+    「已完成」。
+
+    ``dest`` 在但**打不开**（损坏 / 是目录 / 格式不对）时**不许退回 source**：
+    退回正是这个 bug 的形态，而且这次连症状都没有了。抛 :class:`store.Invalid`
+    ——与「源表被改短」同一条处置：记一条看得见的失败原因、置
+    workflow_archived=1、继续，绝不静默重建。
+    """
+    if Path(dest).is_file():
+        try:
+            return load_workbook(dest)
+        except Exception as e:                      # noqa: BLE001 - openpyxl 抛什么算什么
+            raise store.Invalid(
+                f"结果表打不开（{e}）。已经写进去的那些行都在这一份文件里，"
+                "不能拿源表重建覆盖——请关掉 Excel/WPS 后重试，或手工修好它。"
+            ) from e
+    return load_workbook(source)
+
+
 def write_back(source: Path, dest: Path, sheet: str, header_row: int,
                jobs: list[tuple[int, OutputCol, str]]) -> None:
     """把一批 (数据行序号, 输出列, 值) 写进 dest.xlsx。
 
+    - **累积**：基底是**已有的 dest**，只有 dest 还不存在时才用 source
+      （见 :func:`_load_base_workbook`）。调用方一次传一行，所以调用几次之后
+      结果表里应该每一行都有值——这正是规格 7.1 的「当前进度」。
     - **原子**：先写同目录临时文件再 ``os.replace``，用户在浏览器下载的同时
       平台在写，不原子就会下载到半个文件。
     - **被占则抛**：Windows 上 Excel/WPS 开着会独占，``openpyxl.save()`` 与
-      ``os.replace()`` 都会 PermissionError。**这里不重试**——重试到调度
-      tick 里会让整个工作流被一个文件锁卡住，而用户看到的只是「停在第 N 行」。
-      调用方负责降级（记 writeback_pending=1）。
+      ``os.replace()`` 都会 PermissionError。**这里不重试**——调用方按规格
+      7.1 的裁定处置（记 writeback_pending=1，本行不置 workflow_archived，
+      下一轮重试；批次停在那一行，界面上明写「结果表被占用，待补写」）。
     - **越界抛 store.Invalid**：源表被改短了。这不是文件锁，是数据损坏，
       调用方要记失败原因并**仍然置 workflow_archived=1**，否则闸门②会一直
       等着这一行。
@@ -363,11 +391,15 @@ def write_back(source: Path, dest: Path, sheet: str, header_row: int,
     # ——用户看到结果表里有值，只是不在预期的位置，而且没有任何异常可查。
     # v1 只支持第一个 sheet（加多 sheet 选择要动 Task 3 已验收的契约），所以
     # 调用方应当传 ``view.sheet``；传别的一律当场拒绝。
+    #
+    # **行号永远按 source 算**，哪怕基底文件是 dest：源表才是「哪一行是哪
+    # 一行」的唯一事实，result.xlsx 是它的派生物。拿 dest 算行号的话，用户
+    # 在 Excel 里插一行就把结果整体错位了，而且没有任何异常可查。
     if sheet and sheet != view.sheet:
         raise store.Invalid(
             f"回写目标工作表是「{sheet}」，但行号是按第一张表「{view.sheet}」算的。"
             "本版本只支持单张表，请把工作表改回第一张后重试。")
-    wb = load_workbook(source)
+    wb = _load_base_workbook(source, dest)
     try:
         if sheet and sheet in wb.sheetnames:
             ws = wb[sheet]

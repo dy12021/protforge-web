@@ -798,6 +798,22 @@ def list_workflow_skips(workflow_id: int) -> set[int]:
         c.close()
 
 
+def workflow_skip_reason(workflow_id: int, row_index: int) -> str:
+    """跳过某一行的原因（没跳过 / 没写原因时是空串）。
+
+    结果列要写「已跳过」——带上原因，用户在表里一眼就知道**为什么**这一行没跑，
+    而不是面对一个没有解释的「已跳过」。
+    """
+    c = db.connect()
+    try:
+        row = c.execute(
+            "SELECT reason FROM workflow_skips WHERE workflow_id = ? AND row_index = ?",
+            (int(workflow_id), int(row_index))).fetchone()
+    finally:
+        c.close()
+    return str(row[0]) if row else ""
+
+
 # --- 调度器闸门要问的问题（规格 6.3 / 6.4）---------------------------------
 
 _LIVE = ("queued", "running", "packaging")
@@ -809,6 +825,29 @@ def list_running_workflows() -> list[dict]:
     try:
         rows = c.execute(
             "SELECT * FROM workflows WHERE status = 'running' ORDER BY id").fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def list_open_workflows() -> list[dict]:
+    """归档 pass 的取数范围：**running 与 paused 都算**。
+
+    闸门① 的取数只能是 running（放行只对 running 的工作流有意义），所以这一份
+    与 :func:`list_running_workflows` 分开而不是把那个放宽——放宽了闸门① 就
+    会去放行 paused 的工作流，暂停立刻失效。
+
+    为什么归档要连 paused 一起扫：中止与暂停都把 status 写成 ``paused``，而被
+    中止那一刻**正在跑的那一行会被写成终态 failed 却还没归档**。只扫 running
+    的话这一行永远排在取数范围之外，于是「已算出的那一行」既不进结果表、
+    也下不到——用户点完中止，已有的结果凭空消失。归档与「能不能放行下一行」
+    是两件事：暂停之后没有任何行在跑，但已经跑完的那几行仍然要落表。
+    """
+    c = db.connect()
+    try:
+        rows = c.execute(
+            "SELECT * FROM workflows WHERE status IN ('running', 'paused')"
+            " ORDER BY id").fetchall()
     finally:
         c.close()
     return [dict(r) for r in rows]

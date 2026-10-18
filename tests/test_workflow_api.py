@@ -18,7 +18,9 @@
 4. 不从请求体透传 ``workflow_id``（``test_skip_ignores_workflow_id_in_body``）
 5. ``{action}`` 白名单（``test_unknown_action_changes_nothing``）
 6. ``scope`` 白名单（``test_scope_invalid_is_422``）
-7. ``writeback`` 不对外暴露（``test_writeback_is_not_a_switch``）
+7. ``writeback`` **是**可开关的（规格 2 决策表 / 7.1 / 9.1）：接口接受、视图
+   返回、真的落库，归档路径也真的读它（``test_writeback_switch_is_accepted_and_returned``、
+   ``test_result_xlsx_is_404_when_writeback_is_off``）
 8. 行任务身份：归属工作流的主人、事件 actor=system（调度器侧已钉，这里钉
    「HTTP 层不许改归属、不许写非法 actor」）
 """
@@ -331,16 +333,25 @@ def test_create_sets_name_when_given(client, auth_headers, uploaded):
     assert store.get_workflow(wid)["name"] == "第一批抗体"
 
 
-def test_writeback_is_not_a_switch(client, auth_headers, uploaded):
-    """裁定 7：既不接受也不返回。配了 output 列就一定回写，与 writeback 无关。"""
+def test_writeback_switch_is_accepted_and_returned(client, auth_headers, uploaded):
+    """回写是**可开关的**（规格 2 决策表 / 7.1 / 9.1）：接口接受、视图返回、
+    而且真的落库。
+
+    三处缺任何一处，用户勾上的框就只是个装饰——比没有这个框更危险：
+    用户以为自己关掉了回写，实际磁盘上照样整表复制、照样能下载。
+    """
     wid = uploaded["workflow"]["id"]
-    wf = _configure(client, auth_headers, wid, writeback=1)
-    assert "writeback" not in wf, "响应里不该出现一个后端根本不读的开关"
-    assert "writeback" not in client.get(f"/api/workflows/{wid}",
-                                        headers=auth_headers).json()["workflow"]
-    assert "writeback" not in client.get("/api/workflows",
-                                        headers=auth_headers).json()["workflows"][0]
-    assert store.get_workflow(wid)["writeback"] == 0, "请求体里的 writeback 被写库了"
+    on = _configure(client, auth_headers, wid, writeback=1)
+    assert on["writeback"] == 1, "响应里看不到开关，前端就没法回显用户的选择"
+    assert store.get_workflow(wid)["writeback"] == 1, "请求体里的 writeback 没落库"
+    detail = client.get(f"/api/workflows/{wid}", headers=auth_headers).json()
+    assert detail["workflow"]["writeback"] == 1
+    assert client.get("/api/workflows", headers=auth_headers).json()[
+        "workflows"][0]["writeback"] == 1
+
+    off = _configure(client, auth_headers, wid, writeback=0)
+    assert off["writeback"] == 0
+    assert store.get_workflow(wid)["writeback"] == 0, "关掉之后库里还是 1"
 
 
 # ---------------------------------------------------------------- 列表 / 详情
@@ -599,12 +610,32 @@ def test_result_xlsx_not_generated_yet_is_404(client, auth_headers, one_workflow
     assert r.status_code == 404 and is_chinese(r.json()["detail"])
 
 
-def test_result_xlsx_ignores_writeback_flag(client, auth_headers, one_workflow):
-    """裁定 7 的另一半：`writeback` 恒为 0（生产里没有任何代码把它置 1），
-    下载绝不能因此永远 404。"""
+def test_result_xlsx_is_404_when_writeback_is_off(client, auth_headers,
+                                                  one_workflow):
+    """规格 9.1「开关打开时才有」：关掉回写就不该有可下的结果表。
+
+    即使磁盘上**碰巧**有一份（比如用户先跑了几行才关掉），这个端点也必须
+    404 ——否则「关掉回写」就只是不更新、既有的整表副本照样能被下载，
+    用户要的根本不是这个。
+    """
+    wid = one_workflow["id"]
+    _make_result(wid)                                  # 文件确实在
+    store.update_workflow(wid, writeback=0)
+    r = client.get(f"/api/workflows/{wid}/result.xlsx", headers=auth_headers)
+    assert r.status_code == 404 and is_chinese(r.json()["detail"])
+    assert b"PK" not in r.content
+
+
+def test_result_xlsx_downloads_when_writeback_is_on(client, auth_headers,
+                                                    one_workflow):
+    """配套围栏：开关打开时该下的就要下得掉。
+
+    少了这条，上面那条「关掉就 404」可以靠「永远 404」蒙混过关——
+    而用户已经跑完的批次就此永远拿不到结果表。
+    """
     wid = one_workflow["id"]
     _make_result(wid)
-    assert store.get_workflow(wid)["writeback"] == 0
+    assert store.get_workflow(wid)["writeback"] == 1
     r = client.get(f"/api/workflows/{wid}/result.xlsx", headers=auth_headers)
     assert r.status_code == 200, r.text
 

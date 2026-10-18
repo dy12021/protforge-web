@@ -54,8 +54,8 @@
            只能改库或者自己调接口（服务端 WORKFLOW_ACTIONS 本来就认 resume）。 -->
       <button id="wf-resume" class="secondary" type="button">继续（接着跑下一行）</button>
       <button id="wf-abort" class="secondary" type="button">中止整批（立刻停掉当前行）</button>
-      <!-- href 由 JS 在跑完之后才填：没跑完就没有结果表。
-           与其挂一个指向本页的占位死链，不如让它暂时还不是链接。 -->
+      <!-- href 由 JS 按「服务端说结果表已生成」填：没生成过就没有可下的东西，
+           与其挂一个必然 404 的占位死链，不如让它暂时还不是链接。 -->
       <a id="wf-download" class="secondary" hidden>下载结果表</a>
     </div>
 
@@ -71,6 +71,14 @@
       <textarea id="wf-template" rows="4" style="flex:1 1 40rem"
                 placeholder="例：请按下面的条件计算，序列号是 {{seq}}。"></textarea>
       <button id="wf-save" class="primary" type="button">保存映射</button>
+    </div>
+
+    <!-- 回写开关（规格 2 决策表 / 7.1 / 9.1）。关掉之后结果只存在平台里
+         （任务详情与工作流详情都能看），不会生成 result.xlsx，磁盘上不留
+         整表副本。批量场景下表里有敏感序列时这是需要的。 -->
+    <div class="toolbar">
+      <label class="toggle"><input id="wf-writeback" type="checkbox" checked>
+        把结果写回 Excel（关掉后结果只存在平台里，不生成结果表）</label>
     </div>
 
     <!-- 表格预览：点任意一行，下面显示那一行渲染出来的提示词。

@@ -243,22 +243,35 @@ def _workflow_root() -> Path:
 
 
 def _wf_view(wf: dict) -> dict:
-    """对外的工作流视图：**去掉 writeback**。
+    """对外的工作流视图。
 
-    v1 不暴露这个开关（上游裁定）：归档路径从来不读它，配了 output 列就一定回写。
-    一个用户可勾可不勾、后端却不读的开关，比没有这个开关更危险——用户以为自己
-    能控制，实际控制不了。是否回写由「有没有配 output 列」决定。
+    **writeback 原样返回**（规格 2 决策表「回写是可开关」/ 7.1 / 9.1）：用户
+    要有手段关掉回写——批量场景下表里有敏感序列时，回写会整表复制到磁盘、
+    还可被下载。一个「前端能勾、后端不读」的开关比没有开关更危险，所以接口
+    接受它、返回它，归档路径也真的按它决定要不要写 result.xlsx。
+
+    另附一个 ``result_ready``：**服务端算的「结果表现在能不能下」**。前端拿它
+    决定下载入口显不显示——判据是「有没有一张已经生成的结果表」，而不是
+    ``status == 'finished'``。后者是 M-1 死路的后半段：中止之后工作流停在
+    paused，界面把下载入口永久藏起来，用户既看不到已算出的部分结果、也没有
+    任何办法拿到。而规格 7.1 要的是「随时能下载**当前进度**」。
     """
     out = dict(wf)
-    out.pop("writeback", None)
+    raw = (out.get("result_path") or "").strip()
+    out["result_ready"] = bool(raw) and Path(raw).is_file()
     return out
 
 
 def _has_output_columns(workflow_id: int) -> bool:
-    """配没配结果列。**判据只有这一个**——writeback 开关 v1 不暴露，归档路径也
-    从不读它（dispatcher._archive_one 里 `if not output_cols` 直接置归档完成）。"""
+    """配没配结果列。**判据只有这一个**——它与 writeback 开关正交：
+    「配不配结果列」决定有没有东西可写，「开不开回写」决定写不写到磁盘。"""
     return any(c["role"] == "output" and (c.get("field") or "").strip()
                for c in store.list_workflow_columns(workflow_id))
+
+
+def _writeback_enabled(wf: dict) -> bool:
+    """回写开关开没开（规格 7.1 / 9.1「开关打开时才有」）。"""
+    return bool(int(wf.get("writeback") or 0))
 
 
 def save_upload(filename: str, data: bytes, owner_id: int) -> dict:
@@ -432,9 +445,10 @@ class ColumnIn(BaseModel):
 class WorkflowIn(BaseModel):
     """配一个已上传的工作流：写模板 + **整体替换**列映射。
 
-    **没有 writeback**：v1 不暴露这个开关（上游裁定）——归档路径从来不读它，
-    配了 output 列就一定回写。一个用户可勾可不勾、后端却不读的开关比没有更
-    危险，所以既不接受它也不返回它（见 :func:`_wf_view`）。
+    **收 writeback**（规格 2 决策表 / 7.1 / 9.1）：回写是可开关的，用户在
+    批量场景下需要能关掉它（表里有敏感序列时，回写会整表复制到磁盘且可被
+    下载）。默认 True —— 与「v1 之前的行为」一致，配了结果列就回写，
+    不传这个键的老客户端不会因为升级就突然丢掉结果表。
 
     多传的键由 pydantic 静默丢掉（与 TaskPatch 同约定），但**丢掉的键绝不许
     被转手写进别的行任务**——`update_task(id, workflow_id=别人的)` 能把一行
@@ -445,6 +459,7 @@ class WorkflowIn(BaseModel):
     name: str = ""
     prompt_template: str
     columns: list[ColumnIn] = Field(default_factory=list)
+    writeback: bool = True
 
 
 class SkipIn(BaseModel):
@@ -692,7 +707,9 @@ def create_public_app() -> FastAPI:
         wf = store.get_workflow(body.workflow_id, owner_id=user["id"])
         cols = [c.model_dump() for c in body.columns]
         wfmod.validate_binding(body.prompt_template, cols)     # 服务端强校验
-        fields = {"prompt_template": body.prompt_template}
+        fields = {"prompt_template": body.prompt_template,
+                  # 回写开关：写进库，归档路径真的读它（规格 7.1 / 9.1）
+                  "writeback": 1 if body.writeback else 0}
         if (body.name or "").strip():
             fields["name"] = body.name.strip()
         store.update_workflow(body.workflow_id, **fields)
@@ -777,7 +794,14 @@ def create_public_app() -> FastAPI:
                  body: SkipIn, user=Depends(auth.current_user)):
         """跳过 = 写 workflow_skips + 把该行置终态 + 归档写「已跳过」。
 
-        置终态是必需的：不置的话闸门② 会一直等这一行，整批卡住。
+        **先写 workflow_skips，再处置行任务**，顺序不能反：放行侧
+        （dispatcher._workflow_admit_one）在按 cursor 建任务前会读这张表，
+        「跳过先于放行」是常态——表里没有这一行的话，那一行照跑不误，
+        白烧一次完整计算，而用户点它的用意正是「这行序列是坏的，别跑」。
+
+        置终态也是必需的：不置的话闸门② 会一直等这一行，整批卡住。
+        还没有行任务的那些行，调度器放行到它时会补一条**建出来就是终态**的
+        任务（同样不会被跑），由归档 pass 写「已跳过」。两种顺序都收敛。
         """
         wf = store.get_workflow(workflow_id, owner_id=user["id"])
         store.skip_workflow_row(workflow_id, row_index, body.reason)
@@ -795,11 +819,14 @@ def create_public_app() -> FastAPI:
     def download_result(workflow_id: int, user=Depends(auth.current_user)):
         wf = store.get_workflow(workflow_id, owner_id=user["id"],
                                 is_admin=user["role"] == "admin")
-        # 判据是「有没有配 output 列」，**不是 writeback**：v1 不暴露那个开关，
-        # 归档路径也从不读它（配了 output 列就一定回写）。没配 output 列时
-        # 调度器直接把该行置归档完成、根本不生成 result.xlsx。
+        # 判据两条，都是「有没有理由生成结果表」，**不是** status：
+        # ① 配了 output 列吗？没有的话调度器压根不生成 result.xlsx；
+        # ② 回写开关开着吗？规格 9.1 明写「开关打开时才有」——关掉之后结果
+        #    只存在平台内，磁盘上不会有、也不该由这个端点凭空造一份出来。
         if not _has_output_columns(workflow_id):
             raise PreciseHTTPException(404, "这个工作流没有配结果列，不生成结果表")
+        if not _writeback_enabled(wf):
+            raise PreciseHTTPException(404, "这个工作流关掉了结果回写，不生成结果表")
         # **必须先判空串再取 Path**：`Path("")` 是 "."，`.exists()` 对它为真，
         # 于是「没配结果表」会走进 FileResponse 变成 500（dispatcher.py:1561
         # 记着同一个坑）。用 is_file() 而不是 exists()：目录也得挡掉。

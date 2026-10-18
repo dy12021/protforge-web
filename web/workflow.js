@@ -199,12 +199,14 @@ async function openDetail(id) {
   failedBox.className = failed > 0 ? "who wf-failed is-bad" : "who";
 
   $("#wf-template").value = wf.prompt_template || "";
+  $("#wf-writeback").checked = !!Number(wf.writeback);
 
-  // 下载链接按 **status === 'finished'** 判，不按 writeback 判：
-  // _wf_view() 把 writeback 明确 pop 掉了（v1 不暴露这个开关），
-  // 所以 `!wf.writeback` 恒为真 —— 那个链接**永远不会出现**。
-  // 而且服务端在没配结果列时直接 404，不该让用户点一个必然失败的链接。
-  $("#wf-download").hidden = wf.status !== "finished";
+  // 下载入口的判据是**服务端算的 result_ready**（有没有一张已经生成的结果表），
+  // 不是 status === "finished"。后者是 M-1 死路的后半段：中止之后工作流停在
+  // paused，而 paused 既不满足 finished、又已经把已算出的部分结果锁在磁盘上，
+  // 用户点完中止既看不到也拿不到，只能再点一次「继续」把批次接着跑下去。
+  // 规格 7.1 要的是「随时能下载**当前进度**」——有一份就够下。
+  $("#wf-download").hidden = !wf.result_ready;
   $("#wf-download").href = `/api/workflows/${id}/result.xlsx`;
 
   // 动作按状态开关：跑完了再点开始没有意义，422/静默空转都不好看。
@@ -385,6 +387,9 @@ async function saveMapping() {
     workflow_id: wfId,
     prompt_template: $("#wf-template").value,
     columns: readCols(),
+    // 回写开关跟着一起存（规格 7.1）。服务端真的按它决定要不要写
+    // result.xlsx——一个后端不读的勾选框比没有这个框更危险。
+    writeback: $("#wf-writeback").checked,
   });
   await openDetail(wfId);
 }

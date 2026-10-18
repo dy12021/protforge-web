@@ -935,3 +935,385 @@ def test_result_path_defaults_next_to_the_source(disp, tmp_path):
     result = store.get_workflow(wf["id"])["result_path"]
     assert result and Path(result).name == "result.xlsx"
     assert Path(result).exists()
+
+
+# --- C-1：result.xlsx 必须累积（规格 7.1「当前进度」）------------------------
+#
+# 上面 4 处 result.xlsx 断言**每处只归档一行**，天然看不见累积：缺陷版本下
+# 「只有最后归档的那一行有值」与正确版本下「每一行都有值」在这 4 条里表现
+# 完全一样。所以这里补一条走完整调度器路径、**三行都跑到终态并归档**的用例，
+# 再打开 result.xlsx 逐行核对——这正是规格 §10 点名要的形状。
+
+
+def _run_and_archive_all(disp, wf, count):
+    """放行 count 行、每行跑到终态并归档——完全走调度器那条路。
+
+    每行之间 ``_running.clear()``：夹具的假进程 poll() 永远返回 None，于是
+    「并发上限」那道闸（``len(self.running) >= self.limit``，夹具里是 2）会
+    在第三行挡住我们。真机上不会这样——上一行的进程早就退出了、我们把那一行
+    置成 done 就是在说它跑完了。
+    """
+    for i in range(count):
+        disp._running.clear()
+        assert len(disp._workflow_run_pass()) == 1, f"第 {i + 1} 行没放行"
+        row = _first_row(wf, i)
+        store.update_task(row["id"], status="done", summary=f"ok{i}")
+        disp._workflow_archive_pass()
+        assert disp._archive_wait(30)
+    return [_first_row(wf, i) for i in range(count)]
+
+
+def test_result_xlsx_accumulates_every_archived_row(disp, tmp_path):
+    """C-1 的调度器层围栏：三行全部 succeeded、全部归档 → 表里三行都有值。
+
+    缺陷形态：``write_back`` 无条件从 source 重载，而唯一生产调用点每次只传
+    **一行** jobs，于是每归档一行就把前面写进去的结果整片擦掉。500 行的批次
+    结果表里只剩一格有值，``workflow_archived`` 全是 1，不报错、不卡住，
+    界面还显示「已完成」——静默丢数据，且没有任何测试看得见。
+
+    断言必须**逐行**核对。只断「最后一行有值」会被缺陷版本蒙混过去
+    （最后一行恰好是缺陷下也会对的那一格）。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    rows = _run_and_archive_all(disp, wf, 3)
+    assert [_archived(r["id"]) for r in rows] == [1, 1, 1], \
+        "三行都跑完都归档了，有一行没置位——不是本用例要查的那个缺陷"
+
+    from openpyxl import load_workbook
+    result = Path(store.get_workflow(wf["id"])["result_path"])
+    assert result.is_file(), "result.xlsx 压根没生成"
+    ws = load_workbook(result)["S1"]
+    assert [ws.cell(row=2 + i, column=4).value for i in range(3)] == \
+        ["done", "done", "done"], "历史行的结果被后来的归档静默抹掉了"
+    assert [ws.cell(row=2 + i, column=5).value for i in range(3)] == \
+        ["ok0", "ok1", "ok2"], "结果说明同样只有最后一行有值"
+
+
+def test_result_xlsx_survives_a_retry_of_the_first_row(disp, tmp_path):
+    """重跑第 0 行 → 表里既有第 0 行的新值，也**仍然有**第 1、2 行的旧值。
+
+    规格 §10 点名要「重跑要重新归档」；而「重跑不许把别的行弄丢」是同一个
+    累积性质在另一条路径上的表现——管理员重跑是批量场景里最常发生的动作。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    rows = _run_and_archive_all(disp, wf, 3)
+    store.update_task(rows[0]["id"], status="queued", workflow_archived=0)
+    disp._running.clear()
+    store.update_task(rows[0]["id"], status="running")
+    store.update_task(rows[0]["id"], status="done", summary="重跑后的新值")
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+
+    from openpyxl import load_workbook
+    ws = load_workbook(Path(store.get_workflow(wf["id"])["result_path"]))["S1"]
+    assert ws.cell(row=2, column=5).value == "重跑后的新值"
+    assert ws.cell(row=3, column=5).value == "ok1", "重跑第 0 行把第 1 行抹掉了"
+    assert ws.cell(row=4, column=5).value == "ok2", "重跑第 0 行把第 2 行抹掉了"
+
+
+# --- M-1：中止之后自己收敛到终态，被中止的那一行照样落表 ---------------------
+#
+# 中止 = status 置 paused + abort_requested=1 + 杀掉在跑的行。三个副作用叠成
+# 一条死路：① finished 只在闸门③ 产生，而闸门① 只放行 running 的工作流，
+# 于是**没有任何代码能推到终态**；② 归档 pass 只扫 running，被中止的那一行
+# （终态、未归档）永远排在取数范围之外；③ 界面把下载入口按
+# status === "finished" 判断，永久隐藏。用户点完中止，已算出的部分结果
+# 既不在表里、也下载不到，唯一出路是再点一次「继续」。
+
+
+def _abort(disp, wf):
+    """按 abort 路由的真实语义中止（app.py 的 control_workflow + _abort_live_rows）。
+
+    ``_running.clear()`` 是必须的：中止会把在跑的行置成终态并由持有它的
+    dispatcher 在下一次 ``_reap`` 里杀掉。夹具的 ``_FakeProc`` 没有 pid，
+    真去 ``kill_tree`` 会 AttributeError——清掉 ``_running`` 就是「这一行的
+    进程已经被杀掉并收尾」这件事在测试里的写法。
+    """
+    store.update_workflow(wf["id"], status="paused", abort_requested=1)
+    for row in store.list_workflow_rows(wf["id"]):
+        if row["status"] not in db.TERMINAL_STATUSES:
+            store.set_status(row["id"], "failed", actor="human",
+                             message="工作流中止")
+    disp._running.clear()
+
+
+def _settle_after_abort(disp, ticks=5):
+    """连跑若干轮 tick，**不带任何用户操作**——收敛必须是它自己做到的。"""
+    for _ in range(ticks):
+        disp.tick()
+        disp._archive_wait(30)
+
+
+def test_aborted_workflow_converges_to_a_terminal_state_on_its_own(disp, tmp_path):
+    """中止之后连跑 5 轮 tick → 状态自己到终态。
+
+    workflows.status 的 CHECK 只有 finished 一个终态（规格 6.6 明确不新增
+    aborted 值，代价是 SQLite 改 CHECK 要重建表），所以「中止后的终态」
+    只能是它。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    _abort(disp, wf)
+    _settle_after_abort(disp)
+
+    got = store.get_workflow(wf["id"])
+    assert got["status"] == "finished", (
+        f"中止之后 5 轮 tick 仍然是 {got['status']}——必须用户再点一次继续")
+    assert got["abort_requested"] == 1, "收敛不该顺手清掉中止标记"
+    # 复用 finished 不会误导：cursor 如实显示跑了几行，abort_requested 也还在。
+    assert got["cursor"] < got["total_rows"], \
+        "中止后 cursor 应当停在中止那一刻，不该假装整批跑完了"
+
+
+def test_aborted_row_is_still_archived(disp, tmp_path):
+    """被中止的那一行**照样归档**：结果进表，而且归档 pass 看得见 paused。"""
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    _abort(disp, wf)
+    _settle_after_abort(disp)
+
+    assert _archived(r0["id"]) == 1, (
+        "被中止的那一行没有归档——归档 pass 只扫 running，paused 被漏掉了")
+    result = store.get_workflow(wf["id"])["result_path"]
+    assert result and Path(result).is_file(), "被中止的这一行连结果表都没生成"
+    from openpyxl import load_workbook
+    assert load_workbook(Path(result))["S1"].cell(row=2, column=4).value == "failed"
+
+
+def test_aborted_workflow_admits_nothing_even_after_converging(disp, tmp_path):
+    """收敛到终态**不许**反过来放行新行：中止是终态，不是「暂停后自动继续」。"""
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    _abort(disp, wf)
+    _settle_after_abort(disp)
+    assert store.get_workflow(wf["id"])["status"] == "finished"
+    assert disp._workflow_run_pass() == [], "中止之后居然又放行了新行"
+    assert store.list_workflow_rows(wf["id"], 1) == []
+
+
+def test_paused_workflow_still_archives_its_finished_rows(disp, tmp_path):
+    """**普通暂停**（abort_requested=0）也不该让已跑完的行烂在库里。
+
+    归档与「能不能放行下一行」是两件事：暂停之后没有任何行在跑，但已经跑完
+    的那几行仍然要落表——规格 7.1 的「随时能下载当前进度」在暂停态同样成立。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+    store.update_workflow(wf["id"], status="paused")
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+    assert _archived(r0["id"]) == 1, "暂停态下已完成的行没有归档"
+
+
+def test_download_entry_is_open_whenever_a_result_file_exists(disp, tmp_path):
+    """下载入口的判据是「有没有可下的结果表」，不是 ``status == 'finished'``。
+
+    M-1 死路的后半段就在这里。**关键是要在 status 还不是 finished 的那一刻
+    断言**：刚放行完一行、归档落表、用户点了暂停或中止的那一刻，工作流是
+    ``paused`` 而结果表已经在磁盘上了——按 finished 判的话入口被藏起来，
+    用户连已经算出来的部分结果都拿不到。用「中止并收敛之后」来断言不行：
+    收敛之后 status 恰好就是 finished，两种判据给出同一个答案，围栏变恒真。
+    """
+    import app as svc
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+    assert Path(store.get_workflow(wf["id"])["result_path"]).is_file()
+
+    # **此刻 status 还是 running**：按 status === "finished" 判的话入口是关的。
+    view = svc._wf_view(store.get_workflow(wf["id"]))
+    assert view["status"] != "finished", "夹具失效：这一行恰好已经跑完整批了"
+    assert view["result_ready"] is True, (
+        "结果表已经生成、也已经归档，下载入口却还是关着的——"
+        "判据被写成了 status === 'finished'")
+
+    # 中止并收敛之后同样要能下（收敛复用的是 finished，不该把它排除在外）。
+    _abort(disp, wf)
+    _settle_after_abort(disp)
+    after = svc._wf_view(store.get_workflow(wf["id"]))
+    assert after["status"] == "finished"
+    assert after["result_ready"] is True
+
+    # 配套：还没有结果表时判据必须是 false，否则入口指向一个必然 404 的链接。
+    fresh = _workflow(uid, tmp_path, name="B", wid=9099)
+    assert svc._wf_view(store.get_workflow(fresh["id"]))["result_ready"] is False, \
+        "还没有结果表却说可以下载"
+
+
+def test_workflow_page_shows_the_download_entry_by_result_readiness():
+    """前端那一半：``#wf-download`` 的显隐读 ``result_ready``，**不读 status**。
+
+    服务端算对了、前端照样按 status 判，那条死路原封不动地留在界面上——
+    而真机上点得到的只有前端这条。两边必须各钉一次。
+    """
+    js = (Path(__file__).resolve().parent.parent / "web" / "workflow.js").read_text(
+        encoding="utf-8")
+    line = [ln.strip() for ln in js.splitlines()
+            if "$(\"#wf-download\").hidden" in ln]
+    assert line, "找不到 #wf-download 的显隐语句——下载入口的判据被删了？"
+    assert "result_ready" in line[0], (
+        f"下载入口按 {line[0]!r} 判——按 status 判的话中止之后入口被永久藏起来")
+    assert "finished" not in line[0]
+
+
+def test_workflow_page_has_a_writeback_checkbox_wired_to_save():
+    """前端那一半：勾选框存在、并且真的随「保存映射」发出去。
+
+    一个不发出去的勾选框比没有更糟：用户以为自己关掉了敏感序列的整表复制，
+    实际磁盘上照样躺着一份。
+    """
+    import re
+    root = Path(__file__).resolve().parent.parent / "web"
+    html = (root / "workflow.html").read_text(encoding="utf-8")
+    assert 'id="wf-writeback"' in html, "页面上没有回写开关的勾选框"
+    js = (root / "workflow.js").read_text(encoding="utf-8")
+    body = re.search(r"async function saveMapping\(\)\s*\{(.*?)\n\}", js, re.S)
+    assert body, "找不到 saveMapping"
+    assert "writeback" in body.group(1) and "$(\"#wf-writeback\")" in body.group(1), (
+        "保存映射的请求体里没有带上回写开关——勾选框是个装饰")
+    # 回显：打开详情时把库里的值读回勾选框
+    assert re.search(r'\$\("#wf-writeback"\)\.checked\s*=', js), \
+        "打开详情时没有回显回写开关，用户看不到当前设置"
+
+
+# --- M-2：跳过的那一行不许被跑，结果列写「已跳过」---------------------------
+
+
+def test_skip_before_admit_does_not_run_that_row(disp, tmp_path):
+    """跳过先于放行：那一行**不得被建任务、不得烧一次计算**。
+
+    「跳过」的用途就是「这行序列是坏的，别烧 GPU」，而放行侧按 cursor 建任务
+    的那条路原来整个文件都不读 workflow_skips——最该跳的场景（坏行还没放行）
+    恰好是唯一会失效的场景，坏序列会被真的提交一次计算。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    assert store.get_workflow(wf["id"])["cursor"] == 0
+    store.skip_workflow_row(wf["id"], 0, "序列不对")
+
+    disp._workflow_run_pass()
+    assert disp._spawned == [], "被跳过的第 0 行照样被放出去跑了"
+    rows0 = store.list_workflow_rows(wf["id"], 0)
+    assert [r["status"] for r in rows0] == ["failed"], (
+        "被跳过的行必须是终态，否则闸门② 会一直等它，整批卡住")
+
+
+def test_skipped_row_is_written_as_skipped_in_the_result_table(disp, tmp_path):
+    """规格 §10 原话：那一行的结果列写「已跳过」，而且该行是终态。
+
+    这里不能写 status（failed 读起来像「跑失败了」，而用户的本意是「我故意
+    没跑」），所以钉的是字面上的「已跳过」三个字。
+    """
+    from openpyxl import load_workbook
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    store.skip_workflow_row(wf["id"], 0, "序列不对")
+    disp._workflow_run_pass()
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+
+    r0 = store.list_workflow_rows(wf["id"], 0)[0]
+    assert _archived(r0["id"]) == 1
+    ws = load_workbook(Path(store.get_workflow(wf["id"])["result_path"]))["S1"]
+    assert ws.cell(row=2, column=4).value == "已跳过", (
+        f"结果列写的是 {ws.cell(row=2, column=4).value!r}，规格要求「已跳过」")
+    assert ws.cell(row=2, column=5).value == "用户跳过：序列不对", (
+        "跳过原因没有落进结果说明列，用户在表里看不到这一行为什么没跑")
+
+
+def test_next_row_is_admitted_normally_after_a_skip(disp, tmp_path):
+    """规格 §10：跳过一行后，**下一行照常放行**（否则整批在一行上死锁）。"""
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    store.skip_workflow_row(wf["id"], 0, "序列不对")
+
+    disp._workflow_run_pass()          # 补出第 0 行的终态任务
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+    assert len(disp._workflow_run_pass()) == 1, "跳过之后下一行没放行"
+    assert store.list_workflow_rows(wf["id"], 1), "第 1 行没有被放行"
+    assert store.get_workflow(wf["id"])["cursor"] == 2
+
+
+def test_skip_after_admit_is_not_re_run(disp, tmp_path):
+    """放行后跳过（跳过晚于放行）：那一行被置终态，**不许再跑一遍**。
+
+    闸门④ 是「管理员重跑」的唯一落点，而重跑把行退回 queued——那里不看
+    workflow_skips 的话，被用户跳过的行会被重排拉起来再烧一次。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    disp._running.clear()
+    spawned_before = list(disp._spawned)      # 第一次放行确实跑过它，取差集
+    store.skip_workflow_row(wf["id"], 0, "序列不对")
+    store.set_status(r0["id"], "failed", actor="human", message="用户跳过")
+    store.update_task(r0["id"], status="queued")     # 管理员重跑
+    assert disp._workflow_run_pass() == [], "被跳过的行被重排拉起来又跑了一遍"
+    assert disp._spawned == spawned_before, "被跳过的行又被跑了一遍"
+    assert store.get_task(r0["id"])["status"] == "failed", \
+        "跳过的那一行应当留在终态上"
+
+
+def test_skip_is_scoped_to_one_workflow(disp, tmp_path):
+    """跳过是**按行**的，不许波及另一个工作流的第 0 行。"""
+    uid = _user()
+    a = _workflow(uid, tmp_path, name="A", wid=9101)
+    b = _workflow(uid, tmp_path, name="B", wid=9102)
+    store.skip_workflow_row(a["id"], 0, "A 的第 0 行坏了")
+    disp._workflow_run_pass()
+    disp._archive_wait(30)
+    assert store.list_workflow_rows(b["id"], 0), "B 的第 0 行被 A 的跳过牵连了"
+    assert store.list_workflow_skips(b["id"]) == set()
+
+
+# --- M-4：回写开关（规格 2 决策表 / 7.1 / 9.1）--------------------------------
+
+
+def test_writeback_off_archives_every_row_but_writes_no_xlsx(disp, tmp_path):
+    """关掉开关：``workflow_archived`` 全为 1，**且没有**生成 result.xlsx。
+
+    「照样归档」这一半最容易踩：闸门② 等的是「这一行不用再写了」，跳过置位
+    的话开关一关整批就永远停在那一行，界面显示「运行中」但一行都不动。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=2)
+    store.update_workflow(wf["id"], writeback=0)
+    rows = _run_and_archive_all(disp, wf, 2)
+    assert [_archived(r["id"]) for r in rows] == [1, 1], (
+        "关掉回写就不归档——闸门② 会永远等这两行，整批死锁")
+    assert store.get_workflow(wf["id"])["result_path"] == "", (
+        "关掉回写却仍然写了 result.xlsx：用户要的就是磁盘上不留整表副本")
+    assert not list(Path(store.get_workflow(wf["id"])["source_path"]).parent
+                    .glob("result.xlsx"))
+    # 闸门② 真的解除了：cursor 照常推进到 2，批次能一路跑到终态。
+    assert store.get_workflow(wf["id"])["cursor"] == 2
+
+
+def test_writeback_on_writes_every_row_and_they_all_survive(disp, tmp_path):
+    """打开开关：同样跑完 → 有 result.xlsx 且**每行都有值**（顺手覆盖 C-1）。"""
+    from openpyxl import load_workbook
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    assert store.get_workflow(wf["id"])["writeback"] == 1
+    _run_and_archive_all(disp, wf, 3)
+    result = store.get_workflow(wf["id"])["result_path"]
+    assert result and Path(result).is_file()
+    ws = load_workbook(Path(result))["S1"]
+    assert [ws.cell(row=2 + i, column=4).value for i in range(3)] == \
+        ["done", "done", "done"]
+

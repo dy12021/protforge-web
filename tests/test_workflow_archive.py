@@ -105,7 +105,12 @@ def _assert_no_tmp_left(dest: Path) -> None:
 
 
 def test_write_back_is_atomic(tmp_path):
-    """写一半时下载，拿到的必须是完整的旧版或新版，不能是半个文件。"""
+    """写一半时下载，拿到的必须是完整的旧版或新版，不能是半个文件。
+
+    三次调用之后**三行都要有值**：这条以前只断最后一行（row=4），而最后一行
+    恰好是缺陷版本下**也会**对的那一格——C-1（每次归档都从源表重建、把之前写
+    进 dest 的结果整片擦掉）就是这么一路溜过去的。现在逐行核对。
+    """
     src = _src(tmp_path)
     dest = Path(tmp_path) / "result.xlsx"
     shutil.copyfile(src, dest)
@@ -117,14 +122,98 @@ def test_write_back_is_atomic(tmp_path):
     # glob("*.tmp.xlsx") 在带 pid 之后同样匹配不到，断言恒真——清理写错了
     # 也照样绿。通配形状由 _assert_no_tmp_left 负责，并自带自证。
     _assert_no_tmp_left(dest)
-    assert load_workbook(dest)["S1"].cell(row=4, column=3).value == "done"
+    ws = load_workbook(dest)["S1"]
+    assert [ws.cell(row=r, column=3).value for r in (2, 3, 4)] == \
+        ["done", "done", "done"], \
+        "只有最后一行有值——每次归档都在拿源表当基底，之前写的被擦掉了"
+
+
+def test_write_back_accumulates_across_calls(tmp_path):
+    """C-1 的纯函数层围栏：**多次调用、每次一行**，结果表里每行都得有值。
+
+    这正是调度器的调用形态（``_write_back_row`` 一次只传一行 jobs）。规格 7.1
+    要的是「**同一个** result.xlsx 累积出当前进度」，所以基底必须是已经写过
+    几轮的那一份，而不是每次都从 source 重载——后者会把历史行静默抹掉，
+    不报错、不卡住、界面还显示「已完成」。
+    """
+    src = _src(tmp_path, rows=5)
+    dest = Path(tmp_path) / "result.xlsx"
+    shutil.copyfile(src, dest)
+    for i in range(3):
+        workflow.write_back(src, dest, "S1", 1, [
+            (i, workflow.OutputCol(2, "status"), f"done{i}"),
+            (i, workflow.OutputCol(3, "summary"), f"说明{i}"),
+        ])
+        # **逐次断言**：一次只读刚写进去的那一行，才能定位「从哪一次开始丢」。
+        ws = load_workbook(dest)["S1"]
+        for j in range(i + 1):
+            assert ws.cell(row=2 + j, column=3).value == f"done{j}", (
+                f"第 {j} 行在第 {i} 次归档之后没了——历史行被后来的归档擦掉了")
+            assert ws.cell(row=2 + j, column=4).value == f"说明{j}", (
+                f"第 {j} 行的结果说明丢了")
+
+
+def test_write_back_keeps_previous_rows_when_source_has_no_result(tmp_path):
+    """反向围栏：源表的结果格**一直是空的**（用户没手动填过）。
+
+    缺陷版本从 source 重载时结果也确实是空的，所以这一条在缺陷版本下**照样
+    通过**——它钉的是「累积」这个正面性质，不是「不丢数据」那个反面。
+    两者缺一不可：只有反面那条，实现可以是「永远从 source 重建但源表里恰好
+    有值」，看起来对；只有正面这条，缺陷版本原样通过。
+    """
+    src = _src(tmp_path, rows=3)
+    dest = Path(tmp_path) / "result.xlsx"
+    shutil.copyfile(src, dest)
+    for i in range(3):
+        workflow.write_back(src, dest, "S1", 1,
+                            [(i, workflow.OutputCol(2, "status"), "done")])
+    # 源表自己没被动过——基底用的是 dest。
+    ws_src = load_workbook(src)["S1"]
+    assert ws_src.cell(row=2, column=3).value in ("", None), \
+        "回写把源表也改了：基底取错成 source 了"
+
+
+def test_write_back_refuses_to_rebuild_a_corrupt_result(tmp_path):
+    """dest 在但打不开 → **抛 store.Invalid，不许静默退回 source**。
+
+    退回 source 正是 C-1 的形态，而且这一次连「界面显示已完成」的症状都没有
+    ——已写进去的那些行被一份干净的源表整片覆盖，且没有任何异常可查。所以这条
+    钉的是「看得见的失败」：抛错 → 调用方记一条 error 事件 + 置归档完成
+    （规格 7.3），批次继续往下走。
+    """
+    src = _src(tmp_path)
+    dest = Path(tmp_path) / "result.xlsx"
+    junk = b"PK\x03\x04 not a zip at all"
+    dest.write_bytes(junk)
+    with pytest.raises(store.Invalid):
+        workflow.write_back(src, dest, "S1", 1,
+                            [(0, workflow.OutputCol(2, "status"), "done")])
+    # 文件**原样保留**：一条都没写进去，也就没什么可丢的。
+    assert dest.read_bytes() == junk, \
+        "打不开的结果表被覆盖了——已写进去的历史行会静默丢失"
+
+
+def test_write_back_accepts_the_first_call_when_dest_is_absent(tmp_path):
+    """dest 不存在 → 用 source 当基底（第一次归档的正常形态）。
+
+    配套围栏：少了它，「一律退回 source」也能让上面三条全绿。
+    """
+    src = _src(tmp_path)
+    dest = Path(tmp_path) / "result.xlsx"
+    assert not dest.exists()
+    workflow.write_back(src, dest, "S1", 1,
+                        [(0, workflow.OutputCol(2, "status"), "done")])
+    assert load_workbook(dest)["S1"].cell(row=2, column=3).value == "done"
+
 
 
 def test_write_back_raises_permissionerror_when_locked(tmp_path, monkeypatch):
-    """文件被占 → 抛 PermissionError，**调用方降级**，这里不重试。
+    """文件被占 → 抛 PermissionError，**这里自己绝不重试**。
 
-    重试到调度 tick 里的话，工作流会被一个文件锁卡住，而用户看到的
-    只是「停在第 N 行」。
+    重试放在调度 tick 里会让整个工作流被一个文件锁拖住，所以这一层只负责
+    「立刻把错误抛出去」。调用方按规格 7.1 的裁定处置：记
+    writeback_pending=1、本行不置 workflow_archived、下一轮归档重试；批次停在
+    那一行并在界面上明写「结果表被占用，待补写」，关掉 Excel 后自动继续。
     """
     src = _src(tmp_path)
     dest = Path(tmp_path) / "result.xlsx"
