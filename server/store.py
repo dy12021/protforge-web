@@ -706,12 +706,23 @@ def list_workflow_columns(workflow_id: int) -> list[dict]:
 
 
 def set_workflow_columns(workflow_id: int, cols: list[dict]) -> list[dict]:
-    """整体替换一列组。靠 UNIQUE(workflow_id, col_index) 保证幂等。"""
+    """整体替换一列组——**删掉本次没传的那些列**，靠 UNIQUE(workflow_id, col_index)
+    保证幂等。只 DELETE 本次传到的 col_index 是错的：用户解绑一列再保存，旧列行会
+    残留下来继续参与渲染。
+
+    col_index 缺键/不是整数都抛 :class:`Invalid`（→ 422），不能让它冒成 KeyError/
+    ValueError——那会让 Task 6 返 500，而不是「这一列填错了」这种能看懂的话。
+    """
     seen = set()
     for col in cols:
         if col.get("role", "ignore") not in _ROLES:
             raise Invalid(f"未知的列角色：{col.get('role')}")
-        idx = int(col["col_index"])
+        if "col_index" not in col:
+            raise Invalid("每一列都必须带列号（col_index）")
+        try:
+            idx = int(col["col_index"])
+        except (TypeError, ValueError):
+            raise Invalid(f"列号必须是整数：{col['col_index']!r}") from None
         if idx in seen:
             raise Invalid(f"第 {idx} 列出现了两次")
         seen.add(idx)
@@ -770,7 +781,7 @@ def list_workflow_skips(workflow_id: int) -> set[int]:
 # --- 调度器闸门要问的问题（规格 6.3 / 6.4）---------------------------------
 
 _LIVE = ("queued", "running", "packaging")
-_TERMINAL_SQL = ("done", "failed")
+# 终态**只用** db.TERMINAL_STATUSES，本文件不抄第二份——理由见下面那个函数的 docstring。
 
 
 def list_running_workflows() -> list[dict]:
@@ -823,15 +834,21 @@ def workflow_queued_rows(workflow_id: int) -> list[dict]:
 
 
 def workflow_unarchived_terminal_rows(workflow_id: int) -> list[dict]:
-    """归档 pass 的取数：终态且还没写回表的行。"""
-    marks = ",".join("?" * len(_TERMINAL_SQL))
+    """归档 pass 的取数：终态且还没写回表的行。
+
+    终态集合**直接用** db.TERMINAL_STATUSES，本文件不另抄一份。抄一份的后果不是
+    今天的 bug，而是将来某次给终态集合加了值、忘了改这里：归档 pass 扫不到那些行 →
+    闸门② 的「有未归档的行」恒真 → 整批锁死，且不报任何错（规格 6.3 那一族）。
+    同一文件另有 6 处直接用 db.TERMINAL_STATUSES，store.py:210 记着为什么必须用它。
+    """
+    marks = ",".join("?" * len(db.TERMINAL_STATUSES))
     c = db.connect()
     try:
         rows = c.execute(
             f"SELECT * FROM tasks WHERE workflow_id = ?"
             f" AND status IN ({marks}) AND workflow_archived = 0"
             " ORDER BY workflow_row",
-            (int(workflow_id), *_TERMINAL_SQL)).fetchall()
+            (int(workflow_id), *db.TERMINAL_STATUSES)).fetchall()
     finally:
         c.close()
     return [dict(r) for r in rows]

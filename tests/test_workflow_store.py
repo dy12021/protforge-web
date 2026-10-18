@@ -60,6 +60,59 @@ def test_list_workflows_is_owner_scoped():
     assert names == {"A 的"}
 
 
+# --- 改 ---------------------------------------------------------------------
+
+def test_update_workflow_writes_every_whitelisted_field():
+    """**逐字段读回核对**，不看返回值。
+
+    白名单缺一项时它抛 Invalid——而归档 pass 的 `except (store.Invalid, OSError)`
+    会把它吞成一行日志，于是 Excel 被占用时的降级写回**永远失败且不报错**。
+    少一个 `writeback_pending` 就是这种后果，所以这里把白名单整个铺开逐项断言。
+    """
+    uid = _user()
+    wf = _wf(uid)
+    fields = {"name": "改过的名字", "sheet": "Sheet1", "source_path": "C:/x.xlsx",
+              "prompt_template": "算 {{seq}} 的 {{proj}}", "header_row": 2,
+              "key_col": 3, "total_rows": 9, "cursor": 5, "writeback": 1,
+              "writeback_pending": 1, "abort_requested": 1,
+              "result_path": "out.xlsx", "status": "running"}
+    store.update_workflow(wf["id"], **fields)
+    got = store.get_workflow(wf["id"], owner_id=uid)
+    for k, v in fields.items():
+        assert got[k] == v, k
+
+
+def test_update_workflow_rejects_fields_outside_the_whitelist():
+    """白名单外的字段必须抛 Invalid。尤其 owner_id：改它等于把工作流送给别人。"""
+    uid = _user()
+    wf = _wf(uid)
+    for bad in ("owner_id", "id", "created_at", "updated_at", "nope"):
+        with pytest.raises(store.Invalid):
+            store.update_workflow(wf["id"], **{bad: 1})
+    assert store.get_workflow(wf["id"], owner_id=uid)["owner_id"] == uid
+
+
+def test_update_workflow_rejects_unknown_status():
+    uid = _user()
+    wf = _wf(uid)
+    with pytest.raises(store.Invalid):
+        store.update_workflow(wf["id"], status="runningg")
+    assert store.get_workflow(wf["id"], owner_id=uid)["status"] == "draft"
+    for ok in ("draft", "running", "paused", "finished"):
+        assert store.update_workflow(wf["id"], status=ok)["status"] == ok
+
+
+def test_update_workflow_raises_notfound_when_the_row_is_gone():
+    """rowcount == 0 那一支。空更新走的是 get_workflow，同样必须是 NotFound。"""
+    uid = _user()
+    wf = _wf(uid)
+    store.delete_workflow(wf["id"])
+    with pytest.raises(store.NotFound):
+        store.update_workflow(wf["id"], status="running")
+    with pytest.raises(store.NotFound):
+        store.update_workflow(wf["id"])          # 空 fields -> get_workflow
+
+
 # --- 列角色 -----------------------------------------------------------------
 
 def test_set_workflow_columns_replaces_and_is_idempotent():
@@ -75,6 +128,24 @@ def test_set_workflow_columns_replaces_and_is_idempotent():
     assert {c["col_index"] for c in got} == {0, 1, 2}
     ctx = [c for c in got if c["role"] == "context"][0]
     assert ctx["slot"] == "proj"
+    # 缩列：解绑一列再保存，旧列行必须**跟着没了**。若 DELETE 只按本次传到的
+    # col_index 删，上面两次调用照样对，但这里会是 3 行——用户以为已解绑的那一列
+    # 仍在参与渲染，且渲染时拿到的是已经废弃的绑定。
+    store.set_workflow_columns(wf["id"], cols[:2])
+    got = store.list_workflow_columns(wf["id"])
+    assert len(got) == 2
+    assert {c["col_index"] for c in got} == {0, 1}
+
+
+def test_set_workflow_columns_rejects_bad_col_index():
+    """缺列号 / 列号不是整数都得是 Invalid（→ 422），不能冒成 KeyError（→ 500）。"""
+    uid = _user()
+    wf = _wf(uid)
+    with pytest.raises(store.Invalid):
+        store.set_workflow_columns(wf["id"], [{"header": "编号", "role": "key"}])
+    with pytest.raises(store.Invalid):
+        store.set_workflow_columns(wf["id"], [{"col_index": "第二列", "role": "key"}])
+    assert store.list_workflow_columns(wf["id"]) == []
 
 
 def test_set_workflow_columns_rejects_bad_role():
@@ -171,12 +242,64 @@ def test_update_workflow_archived():
 
 # --- 闸门要问的那几个问题 ---------------------------------------------------
 
-def _row(wf_id, idx, status, archived=0, owner=1):
-    return store.create_task(f"r{idx}", "b", owner_id=owner, actor="system",
-                             workflow_id=wf_id, workflow_row=idx,
-                             ) and store.update_task(
-        store.list_workflow_rows(wf_id, idx)[0]["id"], status=status,
-        workflow_archived=archived) and None
+def test_list_running_workflows_returns_only_running_in_id_order():
+    """放行流程的**总入口**：`_workflow_run_pass` 每秒只拿这一个列表。
+
+    把它改成 `WHERE status = 'runin'` 或干脆漏掉 WHERE，下面 24 条用例全绿，而调度器
+    每秒拿到空列表 → 一行工作流任务都放不出去，功能整体死掉且不报任何错。
+    （双向验证实测：这两种坏写法各让**本条**转红，其余 23 条照绿。）
+
+    排序围栏里 owner 顺序与 id 顺序**故意反过来**（先给 owner 大的建工作流）：这样
+    查询一旦退化成走 (owner_id, status) 索引返回，这条会红。同一个用户建两个工作流
+    是测不出来的——那种情况下插入序恰好就是 id 序。
+    """
+    early = _user("a")      # 用户 id 小
+    late = _user("b")       # 用户 id 大
+    first = _wf(late, name="先建的")      # 工作流 id 小、owner id 大
+    second = _wf(early, name="后建的")     # 工作流 id 大、owner id 小
+    assert first["id"] < second["id"]
+    assert first["owner_id"] > second["owner_id"]
+
+    assert store.list_running_workflows() == []          # 一个 running 都没有
+
+    store.update_workflow(first["id"], status="running")
+    store.update_workflow(second["id"], status="running")
+    assert [w["id"] for w in store.list_running_workflows()] == [
+        first["id"], second["id"]]
+
+    # draft / paused / finished 三个非 running 的态，一个都不许被返回。
+    store.update_workflow(first["id"], status="draft")
+    assert [w["id"] for w in store.list_running_workflows()] == [second["id"]]
+    store.update_workflow(first["id"], status="finished")
+    store.update_workflow(second["id"], status="paused")
+    assert store.list_running_workflows() == []
+
+
+def test_list_workflow_rows_filters_by_row_index():
+    """`row_index` 那个分支是 Task 6「跳过第 N 行」端点**唯一**的依赖。
+
+    `if row_index is None:` 被改成恒真时，「跳过第 5 行」会把该工作流**所有**行
+    任务强制置 failed 并逐条写事件，而不是只动第 5 行。
+    """
+    uid = _user()
+    wf = _wf(uid)
+    made = [store.create_task(f"r{i}", "b", owner_id=uid, actor="system",
+                              workflow_id=wf["id"], workflow_row=i)
+            for i in range(3)]
+
+    every = store.list_workflow_rows(wf["id"])
+    assert [r["id"] for r in every] == [m["id"] for m in made]
+    assert [r["workflow_row"] for r in every] == [0, 1, 2]
+
+    assert [r["id"] for r in store.list_workflow_rows(wf["id"], 1)] == [made[1]["id"]]
+    assert store.list_workflow_rows(wf["id"], 99) == []
+
+    # 另一个工作流的行不许混进来（否则「跳过第 5 行」会误伤另一个工作流）。
+    other = _wf(_user("o"), name="别人的")
+    store.create_task("x", "b", owner_id=uid, actor="system",
+                      workflow_id=other["id"], workflow_row=0)
+    assert len(store.list_workflow_rows(other["id"])) == 1
+    assert [r["workflow_row"] for r in store.list_workflow_rows(wf["id"])] == [0, 1, 2]
 
 
 def test_has_unarchived_reflects_the_flag():
@@ -190,13 +313,22 @@ def test_has_unarchived_reflects_the_flag():
     assert store.workflow_has_unarchived(wf["id"]) is False
 
 
-def test_has_live_rows_ignores_archived_and_terminal():
+def test_has_live_rows_counts_non_terminal_only():
+    """闸门⑤ 只看 status，**不看** workflow_archived。
+
+    用例名里不再提 archived：规格 6.4 的闸门⑤ 原文就是「有非终态的行任务」，实现里
+    也没有 archived 过滤——审查已证明**反过来加过滤是错的**（archived=1 且非终态的行
+    会既过⑤、又不过②③，直接放行下一行，同一工作流两行同时推进）。残留风险归
+    Task 7 的 409 守卫，别把「archived」写进这条的名字里骗下一个人。
+    """
     uid = _user()
     wf = _wf(uid)
     row = store.create_task("r", "b", owner_id=uid, actor="system",
                             workflow_id=wf["id"], workflow_row=0)
     assert store.workflow_has_live_rows(wf["id"]) is True
     store.update_task(row["id"], status="done")
+    assert store.workflow_has_live_rows(wf["id"]) is False
+    store.update_task(row["id"], status="failed")
     assert store.workflow_has_live_rows(wf["id"]) is False
 
 
@@ -212,6 +344,14 @@ def test_queued_rows_and_unarchived_terminal_rows():
     store.update_task(r0["id"], status="done")
     got = store.workflow_unarchived_terminal_rows(wf["id"])
     assert [r["workflow_row"] for r in got] == [0]
+    # failed **也是**终态，归档 pass 必须扫到它——错误信息同样要写回表。
+    # 这半条是 db.TERMINAL_STATUSES 去重后唯一能咬住它的围栏：只收 done 的
+    # 归档取数会把失败行永远留在「未归档」里，闸门② 于是恒真、整批锁死。
+    r2 = store.create_task("r2", "b", owner_id=uid, actor="system",
+                           workflow_id=wf["id"], workflow_row=2)
+    store.update_task(r2["id"], status="failed")
+    got = store.workflow_unarchived_terminal_rows(wf["id"])
+    assert [r["workflow_row"] for r in got] == [0, 2]
 
 
 def test_unarchived_terminal_rows_excludes_already_archived():
@@ -249,12 +389,21 @@ def test_workflow_rows_do_not_count_as_regular_tasks():
     assert store.user_has_live_regular_tasks(uid) is False
 
 
-def test_skips_round_trip_and_block_creation():
+def test_skips_round_trip_is_idempotent():
+    """跳过集只测存取与幂等。
+
+    名字里不再提 block_creation：store 层**没有**「阻止建行」这个能力，跳过集是
+    放行时（Task 5）用来过滤数据行的，这里没有「建行」动作可挡。谁要挡，是 Task 5
+    的闸门④ 拿这个集合去比 cursor。
+    """
     uid = _user()
     wf = _wf(uid)
     store.skip_workflow_row(wf["id"], 3, reason="序列坏了")
-    store.skip_workflow_row(wf["id"], 3)          # 再来一次，不能炸
+    store.skip_workflow_row(wf["id"], 3)          # 再来一次，不能炸也不能插第二条
     assert store.list_workflow_skips(wf["id"]) == {3}
+    store.skip_workflow_row(wf["id"], 4, reason="另一条")
+    assert store.list_workflow_skips(wf["id"]) == {3, 4}
+    assert store.list_workflow_skips(_wf(_user("x"), name="别人的")["id"]) == set()
 
 
 def test_delete_workflow_cascades_rows():
