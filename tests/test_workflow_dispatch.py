@@ -180,6 +180,37 @@ def test_serial_second_row_waits(disp, tmp_path):
     assert disp._workflow_run_pass() == []      # 同一 tick 不放第二行
 
 
+def test_gate_5_holds_even_when_the_row_is_already_archived(disp, tmp_path):
+    """⑤ 与② 会互相遮蔽：未归档的行② 就挡住了，**看不出⑤ 在不在**。
+
+    能把二者区分开的只有「已归档但还没进终态」的行——闸门⑤ 故意不过滤
+    workflow_archived 正是为它准备的（加了过滤，已归档非终态的行会既过⑤又不过
+    ②③，同一个工作流两行同时推进）。少了这条围栏，⑤ 被整个删掉、或被加上
+    `workflow_archived = 0` 过滤，上面那些用例都照样全绿。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="running", workflow_archived=1)
+    assert disp._workflow_run_pass() == [], "闸门⑤ 被② 遮蔽掉了"
+    assert store.list_workflow_rows(wf["id"], 1) == []
+
+
+def test_gate_1_is_rechecked_on_the_workflow_dict_itself(disp, tmp_path):
+    """闸门① 有**两道**：取数（list_running_workflows 只给 running）与
+    :meth:`_workflow_admit_one` 里的再判一次。
+
+    后者是纵深防御，也正因为冗余，只有直接调内部方法才钉得住它——从 pass 那一层
+    看，两道少任何一道结果都一样，全绿的测试证明不了它还在。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    store.update_workflow(wf["id"], status="paused")
+    assert disp._workflow_admit_one(store.get_workflow(wf["id"])) is None
+    assert disp._spawned == []
+
+
 def test_next_row_after_previous_is_archived(disp, tmp_path):
     uid = _user()
     wf = _workflow(uid, tmp_path)
@@ -284,6 +315,9 @@ def test_paused_workflow_admits_nothing(disp, tmp_path):
     uid = _user()
     wf = _workflow(uid, tmp_path)
     store.update_workflow(wf["id"], status="paused")
+    # 闸门① 的取数侧也单独钉一下：它与 _workflow_admit_one 里的再判是冗余的，
+    # 只断言 pass 不放行的话，两道里少任何一道都看不出来。
+    assert store.list_running_workflows() == [], "闸门① 的取数侧没滤掉 paused"
     assert disp._workflow_run_pass() == []
 
 
