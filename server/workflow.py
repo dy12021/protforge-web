@@ -358,6 +358,15 @@ def write_back(source: Path, dest: Path, sheet: str, header_row: int,
     if not jobs:
         return
     view = read_source(source, header_row=header_row)
+    # **行号来自 view（只读第一个 sheet），值写进 sheet 参数指定的 sheet。**
+    # 两者不一致时不报错的话：源表第一张表算出的行号被搬到第二张表，**静默写错行**
+    # ——用户看到结果表里有值，只是不在预期的位置，而且没有任何异常可查。
+    # v1 只支持第一个 sheet（加多 sheet 选择要动 Task 3 已验收的契约），所以
+    # 调用方应当传 ``view.sheet``；传别的一律当场拒绝。
+    if sheet and sheet != view.sheet:
+        raise store.Invalid(
+            f"回写目标工作表是「{sheet}」，但行号是按第一张表「{view.sheet}」算的。"
+            "本版本只支持单张表，请把工作表改回第一张后重试。")
     wb = load_workbook(source)
     try:
         if sheet and sheet in wb.sheetnames:

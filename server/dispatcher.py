@@ -47,6 +47,7 @@ import logging
 import os
 import queue
 import secrets
+import shutil
 import signal
 import subprocess
 import threading
@@ -59,6 +60,7 @@ import db
 import guards
 import sse
 import store
+import workflow as workflow_mod
 
 log = logging.getLogger(__name__)
 
@@ -783,6 +785,17 @@ class Dispatcher:
         self._wake = threading.Event()
         self._stopping = False
 
+        # --- 归档工作线程 -----------------------------------------------------------
+        # openpyxl 不支持增量写：一次 write_back 是整表 load + 整表 save（宽表实测
+        # 2.2 秒）。放在 tick 主路径里同步做，等于每一轮调度（放行常规任务、心跳、
+        # 超时清理）都白等两秒，而 POLL_INTERVAL 只有 1 秒。所以归档**只入队**，
+        # 真正的读写发生在 :meth:`_archive_loop` 那条后台线程上。
+        self._archive_lock = threading.Lock()
+        self._archive_q: queue.Queue = queue.Queue()
+        self._archive_inflight: set[int] = set()
+        self._archive_thread: threading.Thread | None = None
+        self._archive_stopped = False
+
     # --- 并发上限 ---------------------------------------------------------------
 
     def _resolve_limit(self, manual) -> int:
@@ -1086,6 +1099,9 @@ class Dispatcher:
                 self.abort(task_id)
             except Exception:                     # noqa: BLE001 - 停机不该因单个进程失败而卡住
                 log.exception("停机时中止 %s 失败", task_id)
+        # 归档线程是 daemon 的：不等它也不会挂住进程。但排队里的行**必须留给下一轮**
+        # ——它们还没置 workflow_archived，闸门② 会让这个工作流停住等它们，正是要的行为。
+        self._archive_stop()
 
     def _loop(self) -> None:
         while not self._stopping:
@@ -1099,9 +1115,23 @@ class Dispatcher:
     # --- 队列 -------------------------------------------------------------------
 
     def tick(self) -> list:
-        """扫一轮：先收尾已退出的进程，再按并发上限接走排队任务。返回接走的 task_id。"""
+        """扫一轮：收尾 → 常规 → 工作流放行 → 工作流归档。返回接走的 task_id。"""
         self._reap()
-        return self._admit()
+        admitted = self._admit()
+        # 放行排在 _admit 之后：让路给常规任务是**顺序**带来的结构性结果，
+        # 不需要额外查库。反过来的话一个 500 行的工作流会一次占满所有槽。
+        try:
+            admitted += self._workflow_run_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("工作流放行巡检出错")
+        # 归档排在放行之后。**各自 try/except** 不是洁癖：_loop 是
+        # `try: tick() except`，一次异常就让整轮 _admit 都没机会执行——
+        # 用户会看到所有常规任务永远停在「排队中」，而原因只是一张 Excel 被占用。
+        try:
+            self._workflow_archive_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("工作流归档巡检出错")
+        return admitted
 
     def _reap(self) -> None:
         for ap in list(self.running.values()):
@@ -1131,6 +1161,9 @@ class Dispatcher:
         except Exception:                          # noqa: BLE001 - 库不可达就这一轮不接
             log.exception("读取排队任务失败")
             return []
+        # 工作流行任务有自己更严的闸门（规格 6.4），走常规通道会绕过它们——
+        # 尤其闸门②（前一行的结果必须先归档）会被直接跳过。
+        rows = [r for r in rows if r.get("workflow_id") is None]
         # store 是 id DESC（列表页要最新在前），队列要先进先出；priority 高 的插队
         rows.sort(key=lambda r: (-int(r.get("priority") or 0), int(r["id"])))
         return rows
@@ -1169,6 +1202,312 @@ class Dispatcher:
             _notify()
             admitted.append(task_id)
         return admitted
+
+    # --- 工作流 ---------------------------------------------------------------------
+
+    def _workflow_run_pass(self) -> list[int]:
+        """给每个 running 工作流放行**至多一行**。
+
+        串行是结构性保证：同一 workflow 同时最多一个非终态行任务。所以这里
+        一次只放一行，1000 行也不会把队列撑爆。
+        """
+        admitted: list[int] = []
+        try:
+            workflows = store.list_running_workflows()
+        except Exception:                          # noqa: BLE001
+            log.exception("读取 running 工作流失败")
+            return admitted
+        for wf in workflows:
+            if len(self.running) >= self.limit:
+                break
+            try:
+                task_id = self._workflow_admit_one(wf)
+            except Exception:                      # noqa: BLE001 - 单个工作流失败不影响别的
+                log.exception("工作流 %s 放行失败", wf.get("id"))
+                continue
+            if task_id:
+                admitted.append(task_id)
+        return admitted
+
+    def _workflow_admit_one(self, wf: dict):
+        """闸门 ①④⑤②③⑥，**顺序是规格的一部分**（规格 6.4）。
+
+        ④ 必须排在②前面：重跑的行同时满足②（有未归档的行）和④（有 queued
+        的行），②在前就把它挡死，而④永远走不到——整批卡死且不报错。
+        """
+        wid = int(wf["id"])
+        if wf.get("status") != "running" or int(wf.get("abort_requested") or 0):
+            return None
+
+        # ④ 先认领 queued 的行任务（管理员重跑产生的唯一落点），认领完就返回。
+        #    排这么前是因为它一旦被②盖住就永远走不到，而"重跑"只有这一条路。
+        queued = store.workflow_queued_rows(wid)
+        if queued:
+            row = queued[0]
+            return self._spawn_workflow_row(wf, int(row["workflow_row"]),
+                                            int(row["id"]))
+
+        # ⑤ 串行：有非终态行任务就不放下一行。**故意不过滤 workflow_archived**——
+        #    已经归档但尚未进终态的行（重跑后又被置回 queued 之外的状态）会同时
+        #    过⑤、不过②③；加上过滤就会让同一个工作流的两行同时推进。
+        if store.workflow_has_live_rows(wid):
+            return None
+        # ② 先归档再下一个：判据必须是 workflow_archived = 0（store 那侧已钉死），
+        #    因为「上一行的结果还没写进结果表」就不能宣称这一批推进了。
+        if store.workflow_has_unarchived(wid):
+            return None
+        # ③ 跑完了
+        cursor = int(wf["cursor"])
+        if cursor >= int(wf["total_rows"]):
+            store.update_workflow(wid, status="finished")
+            return None
+        # ⑥ 排在常规任务之后（顺序层之外再加一道可读、可测的契约）
+        if store.user_has_live_regular_tasks(int(wf["owner_id"])):
+            return None
+        return self._spawn_workflow_row(wf, cursor, None)
+
+    def _spawn_workflow_row(self, wf: dict, row_index: int,
+                            existing_task_id):
+        """渲染第 row_index 行的提示词，建/复用任务，放出去。
+
+        existing_task_id 非空 = 认领重跑产生的既有任务，不新建。
+        """
+        wid = int(wf["id"])
+        source = Path(wf["source_path"])
+        cols = store.list_workflow_columns(wid)
+        view = workflow_mod.read_source(source, header_row=int(wf["header_row"]))
+        values = workflow_mod.row_values(source, view, row_index)
+        slots: dict[str, str] = {}
+        key_text = ""
+        for col in cols:
+            role = col["role"]
+            text = values.get(int(col["col_index"]), "")
+            if role == "key":
+                key_text = text
+            elif role in ("input", "context") and col.get("slot"):
+                slots[col["slot"]] = text
+        brief = workflow_mod.render(wf["prompt_template"], slots)
+        title = f"[工作流 {wf['name']}] 第 {row_index + 1} 行" + (
+            f" · {key_text[:60]}" if key_text else "")
+
+        if existing_task_id:
+            task_id = existing_task_id
+        else:
+            created = store.create_task(
+                title, brief, owner_id=int(wf["owner_id"]), actor="system",
+                workflow_id=wid, workflow_row=row_index)
+            task_id = int(created["id"])
+            store.add_event(task_id, "created", "system",
+                            f"工作流「{wf['name']}」第 {row_index + 1} 行")
+            # 放行的同一处语句里前移游标（规格 6.3）
+            store.update_workflow(wid, cursor=row_index + 1)
+
+        if int(task_id) in self.running:
+            return int(task_id)
+        try:
+            work_dir = guards.regions(task_id)[guards.WORK]
+        except guards.Violation as e:
+            self._mark_failed(task_id, f"工作区路径不合法：{e}")
+            return None
+        try:
+            got = store.claim_queued(task_id)
+        except Exception:                          # noqa: BLE001
+            log.exception("抢占行任务 %s 失败", task_id)
+            return None
+        if got != "queued":
+            return None
+        try:
+            self._spawn(task_id, brief, work_dir)
+        except Exception as e:                     # noqa: BLE001
+            log.exception("spawn 行任务 %s 失败", task_id)
+            self._mark_failed(task_id, f"计算进程启动失败：{e}")
+            return None
+        _notify()
+        return int(task_id)
+
+    # --- 归档 ---------------------------------------------------------------------
+
+    def _workflow_archive_pass(self) -> list[int]:
+        """把终态且未归档的行**入队**，回写本身在后台线程上做。返回入队的 task_id。
+
+        这里**只查库、只入队**，一次 xlsx 都不碰：openpyxl 不支持增量写，单次
+        write_back 是整表 load + 整表 save（宽表实测 2.2 秒），而 POLL_INTERVAL
+        只有 1 秒——放在 tick 主路径里同步做，等于整个调度器每轮白等两秒。
+
+        「逐行入队」不是省事写法（规格 7.2）：一批 5 行里第 3 行失败时，前两行
+        必须已经各自置位，否则下一轮会把它们连同第 3 行一起重来。「整批统一置位」
+        看着更整齐，实际是把一次失败放大成 N 次重写。
+        """
+        queued: list[int] = []
+        try:
+            workflows = store.list_running_workflows()
+        except Exception:                          # noqa: BLE001
+            log.exception("读取 running 工作流失败")
+            return queued
+        for wf in workflows:
+            wid = int(wf["id"])
+            try:
+                rows = store.workflow_unarchived_terminal_rows(wid)
+            except Exception:                      # noqa: BLE001
+                log.exception("读取待归档行失败：工作流 %s", wid)
+                continue
+            for row in rows:
+                task_id = int(row["id"])
+                with self._archive_lock:
+                    # **在途去重**：这一行已经在队列里/正在写，就不再排一次。
+                    # 只靠 store 的 workflow_archived = 0 是不够的——那一列要等
+                    # 写完才置位，而整表重写中间有两秒。
+                    if task_id in self._archive_inflight:
+                        continue
+                    self._archive_inflight.add(task_id)
+                    self._archive_q.put((wid, task_id))
+                    queued.append(task_id)
+        if queued:
+            self._archive_ensure_thread()
+        return queued
+
+    def _archive_ensure_thread(self) -> None:
+        """按需起后台归档线程。已停机就不再起——那一行留给重启后的第一轮。"""
+        with self._archive_lock:
+            if self._archive_stopped:
+                return
+            if self._archive_thread is not None and self._archive_thread.is_alive():
+                return
+            self._archive_thread = threading.Thread(
+                target=self._archive_loop, name="wf-archive", daemon=True)
+            self._archive_thread.start()
+
+    def _archive_loop(self) -> None:
+        """后台归档线程。**任何异常都不许逃出去**：一个坏文件不该带走整条线程，
+        更不该顺着它回到 tick。"""
+        while True:
+            try:
+                job = self._archive_q.get(timeout=0.5)
+            except queue.Empty:
+                if self._archive_stopped:
+                    return
+                continue
+            if job is None:                        # stop() 投的结束哨兵
+                return
+            wid, task_id = job
+            try:
+                self._archive_job(wid, task_id)
+            except Exception:                      # noqa: BLE001
+                log.exception("归档行任务 %s 失败", task_id)
+            finally:
+                with self._archive_lock:
+                    self._archive_inflight.discard(task_id)
+                try:
+                    _notify()
+                except Exception:                  # noqa: BLE001
+                    log.exception("归档完成广播失败")
+
+    def _archive_job(self, wid: int, task_id: int) -> None:
+        """执行一次归档。**先重读这一行**：入队到真正执行之间可能已被归档过
+        （比如上一轮已经写完、这一轮才轮询到），重读是唯一的真相来源。"""
+        try:
+            wf = store.get_workflow(wid)
+            row = store.get_task(task_id)
+        except Exception:                          # noqa: BLE001
+            log.exception("重读待归档行 %s 失败", task_id)
+            return
+        if int(row.get("workflow_archived") or 0):
+            return
+        self._archive_one(wf, row)
+        try:
+            # writeback_pending 的语义就是「还有没有终态没归档的行」。写成功一
+            # 行不代表整批都补上了，所以这里重新查一次再清，而不是顺手清零。
+            if not store.workflow_unarchived_terminal_rows(wid):
+                store.update_workflow(wid, writeback_pending=0)
+        except Exception:                          # noqa: BLE001
+            log.exception("校准工作流 %s 的 writeback_pending 失败", wid)
+
+    def _archive_one(self, wf: dict, row: dict) -> None:
+        """归档**一行**：写回结果表 + 置 workflow_archived。逐行，不是整批。"""
+        wid = int(wf["id"])
+        task_id = int(row["id"])
+        fields = {
+            "status": row.get("status", ""),
+            "summary": row.get("summary", ""),
+            "error": row.get("error", ""),
+            # 复用既有的 store.artifacts.list（store.py:525），**不要**另造一个
+            # list_artifacts——这个项目已经吃过十几次「同一件事写了两份，
+            # 改了一份另一份还在跑」的亏。
+            "artifacts": ", ".join(
+                a["name"] for a in store.artifacts.list(task_id)
+                if int(a.get("verified") or 0) == 1),
+        }
+        output_cols = [workflow_mod.OutputCol(int(c["col_index"]), c["field"])
+                       for c in store.list_workflow_columns(wid)
+                       if c["role"] == "output" and c.get("field")]
+        if not output_cols:
+            # 没有 output 列也算归档完成：闸门② 等的是「这一行不用再写了」。
+            store.update_task(task_id, workflow_archived=1)
+            return
+        try:
+            self._write_back_row(wf, output_cols, fields, int(row["workflow_row"]))
+        except (PermissionError, OSError) as e:
+            # 文件被 Excel/WPS 独占、磁盘满、权限不足…… **不置 workflow_archived**。
+            #
+            # 置位了就再也没人查得到这一行：待归档行的取数带
+            # `AND workflow_archived = 0`，writeback_pending 会永远挂着没人清。
+            # 后果是用户开着 Excel 跑完整批，结果表里对应行是**空的**，而且
+            # 不报错——用户以为跑完了，实际数据丢了。静默丢失比卡住糟得多。
+            # 「卡住」是可接受的：下面那条 note 事件会告诉用户关掉 Excel。
+            store.update_workflow(wid, writeback_pending=1)
+            store.add_event(task_id, "note", "system",
+                            "结果表被占用，这一行还没写回去。关掉 Excel/WPS 后"
+                            "会自动重试，本工作流也会在归档完成前停住。")
+            log.warning("工作流 %s 第 %s 行回写被拒（%s），留待重试", wid,
+                        row.get("workflow_row"), e)
+            return
+        except store.Invalid as e:
+            # 源表被改短/损坏：重试一万次也等不到。**必须置位**，否则闸门② 会
+            # 永远等这一行，整批永久死锁。记一条 error 事件说清原因。
+            store.add_event(task_id, "error", "system", f"归档失败：{e}")
+            log.exception("工作流 %s 第 %s 行归档失败", wid, row.get("workflow_row"))
+            store.update_task(task_id, workflow_archived=1)
+            return
+        store.update_task(task_id, workflow_archived=1)
+
+    def _write_back_row(self, wf, output_cols, fields, row_index) -> None:
+        source = Path(wf["source_path"])
+        # `Path(wf["result_path"] or "")` 是 **Path(".")**，str 出来是 "." 而不是
+        # 空串——用 `if not str(result)` 判会让"没配结果表"永远走不进默认分支，
+        # 然后 dest.exists() 对一个目录为真、wb.save 撞上 ValueError。
+        result = wf.get("result_path") or ""
+        if not result:
+            result = source.parent / "result.xlsx"
+            store.update_workflow(int(wf["id"]), result_path=str(result))
+        result = Path(result)
+        if not result.exists():
+            shutil.copyfile(source, result)
+        jobs = [(row_index, oc, fields.get(oc.field, ""))
+                for oc in output_cols]
+        header_row = int(wf["header_row"])
+        # **传 view.sheet，不传 wf["sheet"]**：行号是 read_source 算的，而它只读
+        # 第一张表；wf["sheet"] 是用户填的。两者不一致时 write_back 抛
+        # store.Invalid——静默写错行比报错糟得多（v1 只支持第一张表）。
+        view = workflow_mod.read_source(source, header_row=header_row)
+        workflow_mod.write_back(source, result, view.sheet, header_row, jobs)
+
+    def _archive_wait(self, timeout: float = 30.0) -> bool:
+        """等归档队列排空（测试与停机用）。返回是否在超时前排空。"""
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            with self._archive_lock:
+                busy = bool(self._archive_inflight) or not self._archive_q.empty()
+            if not busy:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _archive_stop(self) -> None:
+        self._archive_stopped = True
+        thread = self._archive_thread
+        self._archive_q.put(None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.poll_interval * 3 + 2.0)
 
     # --- spawn ------------------------------------------------------------------
 
