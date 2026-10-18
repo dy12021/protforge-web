@@ -720,10 +720,14 @@ def create_public_app() -> FastAPI:
     def preview_workflow(workflow_id: int,
                          row: int = Query(default=0, ge=0),
                          user=Depends(auth.current_user)):
-        """预览第 row 个数据行渲染出来的提示词。**只读，所以不给管理员开**——
-        它不在「列表/详情/结果表」这三个值班台可见项里。"""
+        """预览第 row 个数据行渲染出来的提示词。
+
+        **管理员可以预览**：§9.3 的「只读」说的是不给 start/pause/resume/abort/
+        skip/delete，不是「看不见」。预览是纯读操作，不泄露任何写能力，所以跟
+        列表/详情/结果表同属值班台可见项。"""
         import workflow as wfmod
-        wf = store.get_workflow(workflow_id, owner_id=user["id"])
+        wf = store.get_workflow(workflow_id, owner_id=user["id"],
+                                is_admin=user["role"] == "admin")
         source = Path(wf["source_path"])
         view = wfmod.read_source(source, header_row=int(wf["header_row"]))
         values = wfmod.row_values(source, view, int(row))
@@ -820,7 +824,11 @@ def create_public_app() -> FastAPI:
         store.get_workflow(workflow_id, owner_id=user["id"])    # 越权 → 404
         _abort_live_rows(workflow_id)
         _settle_abort_signal(dispatcher.POLL_INTERVAL * 3)
-        store.delete_workflow(workflow_id)
+        # 归属参数必须传：store 层默认拒绝（owner_id=None → NotFound）。
+        # 刻意**不传** is_admin——管理员对别人的工作流只读，删不了（§9.3）。
+        # 上面那行 get_workflow 不能省：它挡在 _abort_live_rows 之前，store 层
+        # 的闸门在删除那一刻才生效，那时别人的计算已经被杀过了。
+        store.delete_workflow(workflow_id, owner_id=user["id"])
         sse.notify()
         return {"ok": True}
 

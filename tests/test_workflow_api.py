@@ -737,3 +737,18 @@ def test_workflow_ui_files_are_allowlisted(client):
     assert {"workflow.html", "workflow.js"} <= set(svc.USER_UI_FILES)
     r = client.get("/secret.txt")
     assert r.status_code == 404 and is_chinese(r.json()["detail"])
+
+
+def test_preview_admin_may_read_others(client, admin_headers, other_headers,
+                                      one_workflow):
+    """R-2：§9.3 的「只读」不等于「看不见」。
+
+    预览是纯读操作，不泄露任何写能力，所以跟列表/详情/结果表同属值班台可见项；
+    但**别的普通用户**仍然是 404——只读开给的是管理员，不是所有人。
+    """
+    wid = one_workflow["id"]
+    r = client.get(f"/api/workflows/{wid}/preview?row=1", headers=admin_headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["rendered"] == "查 BBB，项目 XBR"
+    assert client.get(f"/api/workflows/{wid}/preview",
+                      headers=other_headers).status_code == 404

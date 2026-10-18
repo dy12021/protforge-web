@@ -744,13 +744,33 @@ def set_workflow_columns(workflow_id: int, cols: list[dict]) -> list[dict]:
     return list_workflow_columns(workflow_id)
 
 
-def delete_workflow(workflow_id: int) -> None:
-    """只删数据库。tasks.workflow_id 的 ON DELETE CASCADE 会带走行任务记录；
-    磁盘由 janitor 负责（规格 6.7 要求先中止在跑的行任务，那是 app 层的事）。"""
+def delete_workflow(workflow_id: int, owner_id: int | None = None,
+                    is_admin: bool = False) -> None:
+    """删工作流。tasks.workflow_id 的 ON DELETE CASCADE 会带走行任务记录；
+    磁盘由 janitor 负责（规格 6.7 要求先中止在跑的行任务，那是 app 层的事）。
+
+    **归属校验放在 store 层，不只放 HTTP 层**：这是唯一破坏性的函数，而删除端点
+    漏过它一次。漏了的后果不是「删掉别人的东西」，是**杀掉别人正在跑的 GPU 计算
+    并伪造其时间线**——所以闸门必须贴着函数本身，让「HTTP 层忘了先 get_workflow」
+    这种疏漏无法再犯。越权抛 NotFound（不抛 403，与 get_workflow/get_task 同约定：
+    承认「这东西存在」本身就是信息泄露）。
+
+    **缺 owner_id 默认拒绝**（owner_id=None 且非管理员 → NotFound）：这一层存在的
+    全部意义就是拦住「新调用方忘传参数」那种疏漏，所以默认必须是拒绝。注意这里
+    不能只靠 get_workflow —— 它在 owner_id 为 None 时是**放行**的（语义是
+    「没声明是谁就当内部调用」），直接拿它当闸门的话，忘传参数恰好会删掉别人的
+    工作流，正好是这一层要防的那件事。
+    """
+    if owner_id is None and not is_admin:
+        raise NotFound("工作流不存在")
+    get_workflow(workflow_id, owner_id=owner_id, is_admin=is_admin)
     c = db.connect()
     try:
         with c:
-            c.execute("DELETE FROM workflows WHERE id = ?", (int(workflow_id),))
+            cur = c.execute("DELETE FROM workflows WHERE id = ?",
+                            (int(workflow_id),))
+            if cur.rowcount == 0:
+                raise NotFound("工作流不存在")
     finally:
         c.close()
 

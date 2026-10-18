@@ -106,7 +106,7 @@ def test_update_workflow_raises_notfound_when_the_row_is_gone():
     """rowcount == 0 那一支。空更新走的是 get_workflow，同样必须是 NotFound。"""
     uid = _user()
     wf = _wf(uid)
-    store.delete_workflow(wf["id"])
+    store.delete_workflow(wf["id"], owner_id=uid)
     with pytest.raises(store.NotFound):
         store.update_workflow(wf["id"], status="running")
     with pytest.raises(store.NotFound):
@@ -411,7 +411,72 @@ def test_delete_workflow_cascades_rows():
     wf = _wf(uid)
     row = store.create_task("r", "b", owner_id=uid, actor="system",
                             workflow_id=wf["id"], workflow_row=0)
-    store.delete_workflow(wf["id"])
+    store.delete_workflow(wf["id"], owner_id=uid)
     assert store.list_workflows(owner_id=uid) == []
     with pytest.raises(store.NotFound):
+        store.get_workflow(wf["id"], owner_id=uid, is_admin=True)
+    with pytest.raises(store.NotFound):
         store.get_task(row["id"])
+
+
+def test_delete_workflow_is_owner_scoped():
+    """围栏②：越权 owner_id 删不动，且**库里的东西一个没少**。
+
+    只断「抛了 NotFound」是不够的——实现写成「先中止在跑的行任务、再抛
+    NotFound」照样能过，而那时 A 的计算已经被杀、时间线已经被伪造了。
+    所以必须回读数据库核对值，而不是只断函数抛没抛。
+    """
+    a, b = _user("a"), _user("b")
+    wf = _wf(a)
+    row = store.create_task("r", "b", owner_id=a, actor="system",
+                            workflow_id=wf["id"], workflow_row=0)
+    with pytest.raises(store.NotFound):
+        store.delete_workflow(wf["id"], owner_id=b)
+    assert store.get_workflow(wf["id"], owner_id=a)["id"] == wf["id"], "工作流被删了"
+    assert store.get_task(row["id"], owner_id=a)["status"] == "queued", "行任务被动了"
+
+
+def test_delete_workflow_without_owner_is_refused():
+    """围栏③：缺 owner_id 且非管理员 → NotFound，一个字节都没删。
+
+    **这是整个修复的核心：默认拒绝。** store 层这闸门存在的全部意义就是拦
+    「将来某个新调用方忘传参数」那种疏漏——忘传就该炸掉，而不是恰好删掉别人的
+    工作流。注意不能只靠 get_workflow：它在 owner_id 为 None 时是**放行**的
+    （语义是「没声明是谁就当内部调用」），拿它当闸门的话这里恰好会删成。
+
+    两种「没传」都断：完全不传、以及显式传 None + is_admin=False。
+    """
+    uid = _user()
+    wf = _wf(uid)
+    row = store.create_task("r", "b", owner_id=uid, actor="system",
+                            workflow_id=wf["id"], workflow_row=0)
+    with pytest.raises(store.NotFound):
+        store.delete_workflow(wf["id"])          # 完全不传参数
+    with pytest.raises(store.NotFound):
+        store.delete_workflow(wf["id"], owner_id=None, is_admin=False)
+    assert store.get_workflow(wf["id"], owner_id=uid)["id"] == wf["id"], "工作流被删了"
+    assert store.get_task(row["id"], owner_id=uid)["status"] == "queued", "行任务被动了"
+    assert store.list_workflows(owner_id=uid), "列表里也不该少东西"
+
+
+def test_delete_workflow_admin_path_works():
+    """围栏④：管理员路径确实能用——默认拒绝不能把管理员一起拒掉。
+
+    管理员带别人的 owner_id 能删，且不声明 owner 也能删（is_admin=True 时
+    默认拒绝不适用）。两条都断，否则「一律拒绝、谁也删不掉」也能蒙混过关。
+    """
+    a, c = _user("a"), _user("c")
+    admin = _user("root", "admin")
+    wf = _wf(a)
+    row = store.create_task("r", "b", owner_id=a, actor="system",
+                            workflow_id=wf["id"], workflow_row=0)
+    store.delete_workflow(wf["id"], owner_id=admin, is_admin=True)
+    with pytest.raises(store.NotFound):
+        store.get_workflow(wf["id"], is_admin=True)
+    with pytest.raises(store.NotFound):
+        store.get_task(row["id"], is_admin=True)
+    # 不声明 owner 的管理员路径
+    wf2 = _wf(c, name="另一个")
+    store.delete_workflow(wf2["id"], is_admin=True)
+    with pytest.raises(store.NotFound):
+        store.get_workflow(wf2["id"], is_admin=True)
