@@ -30,7 +30,8 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
+                    UploadFile)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -52,7 +53,8 @@ log = logging.getLogger("protforge.web")
 
 # 用户面板前端。挂在仓库里而不是数据盘：它是程序的一部分，不该跟着数据一起被清。
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-USER_UI_FILES = frozenset({"index.html", "app.js", "style.css"})
+USER_UI_FILES = frozenset({"index.html", "app.js", "style.css",
+                           "workflow.html", "workflow.js"})
 
 PUBLIC_PORT = 8473
 INTERNAL_PORT = 8475
@@ -216,6 +218,115 @@ def _delete_task_row(task_id: int) -> None:
         c.close()
 
 
+# ---------------------------------------------------------------- 工作流
+
+# 控制动作白名单。**必须显式校验，不能靠类型标注**：action 是路径参数（用户可控
+# 的字符串），不校验的话拼错的 action、`../admin/xxx` 这类路径穿越尝试都会落到
+# 同一条控制流上——按 else 分支执行就是「用户点错了按钮，平台把整批中止了」。
+#
+# 刻意不写成 `Literal["start", ...]`：那个标注被改成 str 时，下面这一行还在，
+# 围栏照样红；反过来只靠标注的话，"删掉白名单"等价于"改成 str"，而失败方式是
+# **静默中止整批**——不报任何错。
+WORKFLOW_ACTIONS = frozenset({"start", "pause", "resume", "abort"})
+
+# 上传建记录时提示词模板还没配（要等 POST /api/workflows 写）。store.create_workflow
+# 拒空模板（它不是可空列），所以先落这个**哨兵值**，并在 start 时拒它——悄悄填个
+# 真模板的话，用户不配模板直接点「开始」，每一行都会拿同一句占位文本去白烧一次
+# 完整计算，而且时间线上看不出异常。
+PROMPT_PLACEHOLDER = "（还没配置提示词模板）"
+
+
+def _workflow_root() -> Path:
+    """工作流源文件目录。**刻意在 guards.regions() 四区之外**——
+    agent 不该有权限碰用户的表格，回写一律由平台做（规格 4.4）。"""
+    return db.data_root() / "workflows"
+
+
+def _wf_view(wf: dict) -> dict:
+    """对外的工作流视图：**去掉 writeback**。
+
+    v1 不暴露这个开关（上游裁定）：归档路径从来不读它，配了 output 列就一定回写。
+    一个用户可勾可不勾、后端却不读的开关，比没有这个开关更危险——用户以为自己
+    能控制，实际控制不了。是否回写由「有没有配 output 列」决定。
+    """
+    out = dict(wf)
+    out.pop("writeback", None)
+    return out
+
+
+def _has_output_columns(workflow_id: int) -> bool:
+    """配没配结果列。**判据只有这一个**——writeback 开关 v1 不暴露，归档路径也
+    从不读它（dispatcher._archive_one 里 `if not output_cols` 直接置归档完成）。"""
+    return any(c["role"] == "output" and (c.get("field") or "").strip()
+               for c in store.list_workflow_columns(workflow_id))
+
+
+def save_upload(filename: str, data: bytes, owner_id: int) -> dict:
+    """落盘 + 建库记录。**先 staging、解析成功再建记录**（规格 4.5 ③）。
+
+    反过来（先建记录再解析）的话，解析失败要回滚一行记录加一个目录，
+    两处都得清，漏一处就留下垃圾。
+    """
+    import workflow as wfmod
+    wfmod.check_upload(filename, data)          # 魔数 / 扩展名 / 大小 / 空文件
+    root = _workflow_root()
+    staging = wfmod.staging_path(root)
+    staging.write_bytes(data)
+    try:
+        view = wfmod.read_source(staging)
+    except Exception:
+        staging.unlink(missing_ok=True)         # 解析失败：库里不留痕，磁盘不留垃圾
+        raise
+    wf = store.create_workflow(
+        owner_id, wfmod.safe_display_name(filename), PROMPT_PLACEHOLDER,
+        sheet=view.sheet, source_path="", header_row=1, key_col=0,
+        total_rows=len(view.row_numbers))
+    source = wfmod.finalize_upload(root, staging, int(wf["id"]))
+    store.update_workflow(int(wf["id"]), source_path=str(source))
+    store.set_workflow_columns(int(wf["id"]), [
+        {"col_index": i, "header": h, "role": ("key" if i == 0 else "ignore")}
+        for i, h in enumerate(view.headers)])
+    return {"workflow": _wf_view(store.get_workflow(int(wf["id"]))),
+            "headers": view.headers,
+            "row_count": len(view.row_numbers), "preview": view.preview}
+
+
+def _abort_live_rows(workflow_id: int) -> list[int]:
+    """把在跑的行逐个写成 failed（actor=human）——**这是唯一的跨进程中止通道**。
+
+    不要试图去拿调度器实例调 abort：``scripts/start-services.ps1:41`` 对 public /
+    internal / admin **三个进程都设了 WORKERS_ENV=1**，所以三个进程各自建了
+    一个 Dispatcher 并 start()（``app.py:799-801``），靠 claim_queued 的 CAS
+    决定谁真的起进程。于是 public 里的 app.state.dispatcher 虽然是活的，它的
+    running 里**通常没有别人的 agent**——对着它调 abort 是对着空字典操作，静默无效。
+
+    真正管用的是数据库：现有 abort 路由（``app.py:487-491``）就只写库，持有该
+    agent 的那个 dispatcher 在下一次 _reap（<=1 秒）里经 _abort_signal 看到终态
+    且 actor 是人，于是真去杀进程。这里照抄那一套，不发明新机制。
+    """
+    out = []
+    for row in store.list_workflow_rows(workflow_id):
+        if row["status"] not in db.TERMINAL_STATUSES:
+            store.set_status(row["id"], "failed", actor="human",
+                             message="工作流中止")
+            store.update_task(row["id"], error="工作流中止")
+            out.append(int(row["id"]))
+    return out
+
+
+def _settle_abort_signal(seconds: float) -> None:
+    """给中止信号留出投递时间，然后**不假装确认过**。
+
+    public 进程看不到 agent 是否真死了（不在它的 running 里），能观测到的
+    只有数据库。所以这不是「等进程退出」，只是让持有它的那个 dispatcher 至少
+    完成一轮 _reap。**绝不能先删记录再等**——删完 _db_status 立刻返回 ""，
+    中止信号根本产生不出来，那正是「删工作流留下一个烧到自然结束的僵尸」的
+    成因（规格 6.7）。
+    """
+    import time
+    time.sleep(seconds)
+
+
 # ---------------------------------------------------------------- 请求体
 
 class LoginIn(BaseModel):
@@ -303,6 +414,43 @@ class FinishIn(BaseModel):
     artifacts: list[str] = Field(default_factory=list, max_length=50)
 
 
+class ColumnIn(BaseModel):
+    """一列的映射。col_index 必带：它是用户表格里的列号（0 基）。
+
+    header / slot / field 都不做格式强校验，真正的判定在
+    ``workflow.validate_binding``（未绑定的 {{变量}}、标识列唯一、
+    输出列字段名受限都在那里报错）——放在一处判，别在两个地方各判一半。
+    """
+
+    col_index: int
+    header: str = ""
+    role: str = "ignore"
+    slot: str = ""
+    field: str = ""
+
+
+class WorkflowIn(BaseModel):
+    """配一个已上传的工作流：写模板 + **整体替换**列映射。
+
+    **没有 writeback**：v1 不暴露这个开关（上游裁定）——归档路径从来不读它，
+    配了 output 列就一定回写。一个用户可勾可不勾、后端却不读的开关比没有更
+    危险，所以既不接受它也不返回它（见 :func:`_wf_view`）。
+
+    多传的键由 pydantic 静默丢掉（与 TaskPatch 同约定），但**丢掉的键绝不许
+    被转手写进别的行任务**——`update_task(id, workflow_id=别人的)` 能把一行
+    搬进别人的工作流，所以任何端点都不从请求体透传 workflow_id。
+    """
+
+    workflow_id: int
+    name: str = ""
+    prompt_template: str
+    columns: list[ColumnIn] = Field(default_factory=list)
+
+
+class SkipIn(BaseModel):
+    reason: str = Field(default="", max_length=400)
+
+
 # ---------------------------------------------------------------- 内部令牌
 
 # **令牌表只有一张，在 dispatcher 里。** 签发方是调度器（它起进程时把令牌交给
@@ -375,11 +523,20 @@ def create_public_app() -> FastAPI:
 
     @app.get("/api/tasks")
     def list_tasks(status: str | None = Query(default=None),
+                   scope: Literal["regular", "workflow", "all"] = "regular",
                    limit: int = Query(default=100, ge=1, le=500),
                    user=Depends(auth.current_user)):
         is_admin = user["role"] == "admin"
         rows = store.list_tasks(None if is_admin else user["id"], status,
                                 is_admin=is_admin, limit=limit)
+        # scope 只管「行任务算不算进来」，**不管归属**——归属由上面的
+        # owner_id 参数负责，两个维度是正交的。scope 本身是用户可控的查询维度，
+        # 白名单收窄成这三个值（Literal）：不校验的话一个随手编的值就会落进
+        # 「不过滤」的分支，把不该在这一屏里出现的行任务放出来。
+        if scope == "regular":
+            rows = [r for r in rows if r.get("workflow_id") is None]
+        elif scope == "workflow":
+            rows = [r for r in rows if r.get("workflow_id") is not None]
         return {"tasks": [_task_view(t) for t in rows]}
 
     @app.get("/api/tasks/{task_id}")
@@ -419,8 +576,15 @@ def create_public_app() -> FastAPI:
 
     @app.delete("/api/tasks/{task_id}")
     def delete_task(task_id: int, user=Depends(auth.current_user)):
-        store.get_task(task_id, owner_id=user["id"],
-                       is_admin=user["role"] == "admin")     # 越权 → 404
+        task = store.get_task(task_id, owner_id=user["id"],
+                              is_admin=user["role"] == "admin")     # 越权 → 404
+        if task.get("workflow_id") is not None:
+            # 删掉行任务后归档再也扫不到它 → 那一行的结果静默丢失，而闸门②
+            # 因为该行不见了反而满足，整批继续往下跑（规格 6.5 洞三）。
+            raise PreciseHTTPException(
+                409,
+                "这是工作流行任务，删掉它会让那一行的结果无法归档。"
+                "要跳过这一行请用「跳过这一行」，要清掉整批请删除整个工作流。")
         _delete_task_row(task_id)
         # 任务行已经没了，这条"删除"事件无处可写，也不假装记了日志
         return {"ok": True}
@@ -498,6 +662,167 @@ def create_public_app() -> FastAPI:
         if not real.is_file():
             raise PreciseHTTPException(409, "结果包文件不见了")
         return FileResponse(real, filename=real.name, media_type="application/zip")
+
+    # ---------------------------------------------------------------- 工作流
+    #
+    # 归属校验在这一段里**统一走 store.get_workflow(owner_id=...)**，越权一律 404
+    # 不 403（403 等于承认这个 id 存在，见 app.py:387 的同款理由）。
+    #
+    # 管理员对别人的工作流**只读**：列表 / 详情 / 结果表下载看得见（值班台需要），
+    # 但 start / pause / resume / abort / skip / delete 一律 404——一次误点就停了
+    # 别人几十分钟 GPU 的批次。控制类端点因此**一律不传 is_admin**，这是刻意的。
+
+    @app.post("/api/workflows/upload")
+    async def upload_workflow(file: UploadFile = File(...),
+                              user=Depends(auth.current_user)):
+        data = await file.read()
+        return save_upload(file.filename or "", data, user["id"])
+
+    @app.post("/api/workflows")
+    def save_workflow(body: WorkflowIn, user=Depends(auth.current_user)):
+        """上传端点已经建好了记录，这里只负责**配列映射与模板**。
+
+        越权先判（404），再强校验，再落库——顺序反了会把「别人的工作流」
+        这个信息通过 400/409 的差异泄露出去。
+
+        **列是整体替换**（store.set_workflow_columns 先 DELETE 再 INSERT）：
+        用户把一列解绑再保存，旧列行必须消失，否则它继续参与渲染。
+        """
+        import workflow as wfmod
+        wf = store.get_workflow(body.workflow_id, owner_id=user["id"])
+        cols = [c.model_dump() for c in body.columns]
+        wfmod.validate_binding(body.prompt_template, cols)     # 服务端强校验
+        fields = {"prompt_template": body.prompt_template}
+        if (body.name or "").strip():
+            fields["name"] = body.name.strip()
+        store.update_workflow(body.workflow_id, **fields)
+        store.set_workflow_columns(body.workflow_id, cols)
+        return {"workflow": _wf_view(
+            store.get_workflow(int(wf["id"]), owner_id=user["id"]))}
+
+    @app.get("/api/workflows")
+    def list_workflows(user=Depends(auth.current_user)):
+        is_admin = user["role"] == "admin"
+        return {"workflows": [_wf_view(w) for w in store.list_workflows(
+            None if is_admin else user["id"], is_admin=is_admin)]}
+
+    @app.get("/api/workflows/{workflow_id}")
+    def get_workflow(workflow_id: int, user=Depends(auth.current_user)):
+        is_admin = user["role"] == "admin"
+        wf = store.get_workflow(workflow_id, owner_id=user["id"],
+                                is_admin=is_admin)
+        return {"workflow": _wf_view(wf),
+                "columns": store.list_workflow_columns(workflow_id),
+                "skips": sorted(store.list_workflow_skips(workflow_id)),
+                "rows": store.list_workflow_rows(workflow_id)}
+
+    @app.get("/api/workflows/{workflow_id}/preview")
+    def preview_workflow(workflow_id: int,
+                         row: int = Query(default=0, ge=0),
+                         user=Depends(auth.current_user)):
+        """预览第 row 个数据行渲染出来的提示词。**只读，所以不给管理员开**——
+        它不在「列表/详情/结果表」这三个值班台可见项里。"""
+        import workflow as wfmod
+        wf = store.get_workflow(workflow_id, owner_id=user["id"])
+        source = Path(wf["source_path"])
+        view = wfmod.read_source(source, header_row=int(wf["header_row"]))
+        values = wfmod.row_values(source, view, int(row))
+        slots = {}
+        for col in store.list_workflow_columns(workflow_id):
+            if col["role"] in ("input", "context") and col.get("slot"):
+                slots[col["slot"]] = values.get(int(col["col_index"]), "")
+        return {"row": row,
+                "rendered": wfmod.render(wf["prompt_template"], slots),
+                "values": {wf["sheet"]: values}}
+
+    @app.post("/api/workflows/{workflow_id}/{action}")
+    def control_workflow(workflow_id: int, action: str,
+                         user=Depends(auth.current_user)):
+        """action ∈ WORKFLOW_ACTIONS。越权一律 404（规格 9.2）。
+
+        **白名单在归属校验之前**：非法 action 不是别人的资源，判它不会泄露任何
+        东西；而顺序反过来（先 get_workflow 再判 action）会让「不存在的工作流 +
+        非法 action」与「存在的工作流 + 非法 action」给出不同响应。
+        """
+        if action not in WORKFLOW_ACTIONS:
+            raise PreciseHTTPException(422, "没有这个操作")
+        wf = store.get_workflow(workflow_id, owner_id=user["id"])   # 管理员也按 owner
+        if action in ("start", "resume"):
+            if wf["prompt_template"] == PROMPT_PLACEHOLDER:
+                raise PreciseHTTPException(
+                    422, "还没配提示词模板，先把模板和列映射填好再开始。")
+            import workflow as wfmod
+            wfmod.validate_binding(wf["prompt_template"],
+                                   store.list_workflow_columns(workflow_id))
+            # abort_requested 必须一起清：中止之后 status 回到 paused，不清它的话
+            # 调度器那一行 `or int(wf.get("abort_requested") or 0)` 永远不放行，
+            # 用户看到的现象是「点了开始，状态是运行中，但一行都不动」。
+            wf = store.update_workflow(workflow_id, status="running",
+                                       abort_requested=0)
+        elif action == "pause":
+            wf = store.update_workflow(workflow_id, status="paused")
+        else:
+            wf = store.update_workflow(workflow_id, status="paused",
+                                       abort_requested=1)
+            _abort_live_rows(workflow_id)
+        sse.notify()
+        return {"workflow": _wf_view(wf)}
+
+    @app.post("/api/workflows/{workflow_id}/rows/{row_index}/skip")
+    def skip_row(workflow_id: int, row_index: int,
+                 body: SkipIn, user=Depends(auth.current_user)):
+        """跳过 = 写 workflow_skips + 把该行置终态 + 归档写「已跳过」。
+
+        置终态是必需的：不置的话闸门② 会一直等这一行，整批卡住。
+        """
+        wf = store.get_workflow(workflow_id, owner_id=user["id"])
+        store.skip_workflow_row(workflow_id, row_index, body.reason)
+        for row in store.list_workflow_rows(workflow_id, row_index):
+            if row["status"] not in db.TERMINAL_STATUSES:
+                # actor 只能是 human/agent/admin/system（events 的 CHECK）。
+                # 这里是人点的，用 human；行任务本身由调度器以 system 建（规格 8）。
+                store.set_status(row["id"], "failed", actor="human",
+                                 message=f"用户跳过：{body.reason or '未说明'}")
+        sse.notify()
+        return {"workflow": _wf_view(wf),
+                "skips": sorted(store.list_workflow_skips(workflow_id))}
+
+    @app.get("/api/workflows/{workflow_id}/result.xlsx")
+    def download_result(workflow_id: int, user=Depends(auth.current_user)):
+        wf = store.get_workflow(workflow_id, owner_id=user["id"],
+                                is_admin=user["role"] == "admin")
+        # 判据是「有没有配 output 列」，**不是 writeback**：v1 不暴露那个开关，
+        # 归档路径也从不读它（配了 output 列就一定回写）。没配 output 列时
+        # 调度器直接把该行置归档完成、根本不生成 result.xlsx。
+        if not _has_output_columns(workflow_id):
+            raise PreciseHTTPException(404, "这个工作流没有配结果列，不生成结果表")
+        # **必须先判空串再取 Path**：`Path("")` 是 "."，`.exists()` 对它为真，
+        # 于是「没配结果表」会走进 FileResponse 变成 500（dispatcher.py:1561
+        # 记着同一个坑）。用 is_file() 而不是 exists()：目录也得挡掉。
+        raw = (wf.get("result_path") or "").strip()
+        path = Path(raw) if raw else None
+        if path is None or not path.is_file():
+            raise PreciseHTTPException(404, "结果表还没生成")
+        return FileResponse(path, filename=path.name,
+                            media_type=("application/vnd.openxmlformats-"
+                                        "officedocument.spreadsheetml.sheet"))
+
+    @app.delete("/api/workflows/{workflow_id}")
+    def delete_workflow(workflow_id: int, user=Depends(auth.current_user)):
+        """先中止在跑的行任务，再删记录（规格 6.7）。
+
+        **归属校验必须在 _abort_live_rows 之前**：反过来，越权请求会先把别人
+        在跑的计算杀掉、再返回 404——凭空造出一条「B 的工作流刚被中止过」的
+        时间线，而 B 什么都没做。删掉记录后 tasks.workflow_id 级联带走行任务，
+        `_db_status` 返回 ""、`_abort_signal` 因 "" not in TERMINAL_STATUSES 直接
+        返回 None，调度器不会去杀它——所以顺序反了还会留下一个烧到自然结束的僵尸。
+        """
+        store.get_workflow(workflow_id, owner_id=user["id"])    # 越权 → 404
+        _abort_live_rows(workflow_id)
+        _settle_abort_signal(dispatcher.POLL_INTERVAL * 3)
+        store.delete_workflow(workflow_id)
+        sse.notify()
+        return {"ok": True}
 
     # 用户面板前端挂在**最后**，且只放行这三个文件。
     #
