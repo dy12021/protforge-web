@@ -44,6 +44,50 @@ TERMINAL_STATUSES = ("done", "failed")
 SCHEMA_VERSION = 1
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL, salt TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user', disabled INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, CHECK (role IN ('user','admin'))
+);
+CREATE TABLE IF NOT EXISTS workflows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  sheet TEXT NOT NULL DEFAULT '',
+  source_path TEXT NOT NULL DEFAULT '',
+  prompt_template TEXT NOT NULL,
+  header_row INTEGER NOT NULL DEFAULT 1,
+  key_col INTEGER NOT NULL DEFAULT 0,
+  total_rows INTEGER NOT NULL DEFAULT 0,
+  cursor INTEGER NOT NULL DEFAULT 0,
+  writeback INTEGER NOT NULL DEFAULT 0,
+  writeback_pending INTEGER NOT NULL DEFAULT 0,
+  abort_requested INTEGER NOT NULL DEFAULT 0,
+  result_path TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  CHECK (status IN ('draft','running','paused','finished'))
+);
+CREATE INDEX IF NOT EXISTS idx_workflows_owner ON workflows(owner_id, status);
+CREATE TABLE IF NOT EXISTS workflow_columns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  col_index INTEGER NOT NULL,
+  header TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'ignore',
+  slot TEXT NOT NULL DEFAULT '',
+  field TEXT NOT NULL DEFAULT '',
+  UNIQUE(workflow_id, col_index),
+  CHECK (role IN ('key','input','context','output','ignore'))
+);
+CREATE TABLE IF NOT EXISTS workflow_skips (
+  workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  row_index INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (workflow_id, row_index)
+);
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL, brief TEXT NOT NULL DEFAULT '',
@@ -54,6 +98,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   uploads_dir TEXT NOT NULL DEFAULT '', output_dir TEXT NOT NULL DEFAULT '',
   package_path TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+  workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE,
+  workflow_row INTEGER,
+  workflow_archived INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, done_at TEXT,
   CHECK (status IN ('queued','running','packaging','done','failed'))
 );
@@ -80,12 +127,6 @@ CREATE TABLE IF NOT EXISTS events (
   CHECK (actor IN ('human','agent','admin','system'))
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, id);
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL, salt TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'user', disabled INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL, CHECK (role IN ('user','admin'))
-);
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
@@ -132,11 +173,43 @@ def connect() -> sqlite3.Connection:
     return c
 
 
+_MISSING_TASK_COLUMNS = (
+    "workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE",
+    "workflow_row INTEGER",
+    "workflow_archived INTEGER NOT NULL DEFAULT 0",
+)
+
+
+def _add_column(c, spec: str) -> None:
+    """加一列，容忍「别的进程刚加过」这一种失败。
+
+    平台上有三个进程同时开着同一个库（public / admin / internal），它们都在
+    启动时调 init_db()，而下面是**读-判断-写**三步：两个进程可能都看到「这一列
+    还没有」，然后各自 ALTER，后到的拿到 duplicate column。
+
+    只吞这一种错：宽泛的 except 会把磁盘满、库被锁、语法错一起吞掉，
+    迁移失败却报告成功——那是这个项目最熟的一种静默失效形状。
+    """
+    try:
+        c.execute(f"ALTER TABLE tasks ADD COLUMN {spec}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
+def _add_missing_columns(c) -> None:
+    have = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+    for spec in _MISSING_TASK_COLUMNS:
+        if spec.split()[0] not in have:
+            _add_column(c, spec)
+
+
 def init_db() -> None:
     """建表。建库期允许手工改过 schema 的库存在，所以不做版本化迁移。"""
     c = connect()
     try:
         c.executescript(SCHEMA)
+        _add_missing_columns(c)          # 旧库补列；新库这里三个都在，什么也不做
         c.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         c.commit()
     finally:
