@@ -13,6 +13,7 @@
 """
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 # 状态机是固定、线性的，不能加列改名。tasks.status 的 CHECK 与这里必须一致，
@@ -160,6 +161,33 @@ def db_path() -> Path:
     return Path(env) if env else (data_root() / "web.db")
 
 
+def _enable_wal(c: sqlite3.Connection) -> None:
+    """把 journal_mode 切成 WAL，切不动就重试。
+
+    `PRAGMA journal_mode=WAL` 要短暂拿独占锁，而 busy_timeout 对它**不生效**
+    ——它不排队等锁，直接回 SQLITE_BUSY。三个进程同时对着一个还没切过 WAL 的
+    库起服务（public / admin / internal 都在启动时调 init_db），后到的那个就会
+    吃到 `database is locked`，服务起不来。这不是工作流迁移引入的，但迁移让启动
+    期的写窗口变长，撞上的概率更高，所以在这里补上。
+
+    已经是 WAL 就直接返回：journal_mode 是文件属性，转换过一次之后这条语句
+    只是读，不再需要锁，也就没有竞争。
+    """
+    if str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+        return
+    for attempt in range(50):                      # 50 × 0.1s = 最多等 5s
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise                              # 只等锁，别的一律上抛
+            if attempt == 49:
+                raise                              # 等不到就明着失败，别假装建好了
+            time.sleep(0.1)
+
+
 def connect() -> sqlite3.Connection:
     """每次调用返回新连接，四条 PRAGMA 已就位。"""
     p = db_path()
@@ -169,7 +197,7 @@ def connect() -> sqlite3.Connection:
     c.execute("PRAGMA busy_timeout=10000")         # 排第一：等锁要早于任何写
     c.execute("PRAGMA foreign_keys=ON")            # 每连接：不开则级联删除失效
     c.execute("PRAGMA recursive_triggers=OFF")     # 每连接：不开则 touch 触发器递归
-    c.execute("PRAGMA journal_mode=WAL")           # 文件属性：建库时设一次即可
+    _enable_wal(c)                                 # 文件属性：建库时设一次即可
     return c
 
 
