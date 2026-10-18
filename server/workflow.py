@@ -6,7 +6,10 @@
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import uuid
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
@@ -305,3 +308,70 @@ def validate_binding(template: str, cols: list[dict]) -> None:
             raise store.Invalid(
                 f"结果列「{c.get('header')}」的字段名不认识：{c.get('field')}。"
                 "可用：" + "、".join(OUTPUT_FIELDS))
+# --- 上传落盘（规格 4.5 ①③）------------------------------------------------
+
+def staging_path(root: Path) -> Path:
+    """staging 名字**自己生成**，不含任何用户输入。"""
+    d = Path(root) / "staging"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{uuid.uuid4().hex}.xlsx"
+
+
+def finalize_upload(root: Path, staging: Path, workflow_id: int) -> Path:
+    """解析成功后把 staging 搬成 workflows\\<id>\\source.xlsx —— 固定名。"""
+    dest_dir = Path(root) / str(int(workflow_id))
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "source.xlsx"
+    shutil.move(str(staging), str(dest))
+    return dest
+
+
+# --- 回写（规格 7.1 / 7.2）-------------------------------------------------
+
+@dataclass(frozen=True)
+class OutputCol:
+    col_index: int
+    field: str
+
+
+def _sheet_row_number(view: SheetView, row_index: int) -> int:
+    if row_index < 0 or row_index >= len(view.row_numbers):
+        raise store.Invalid(
+            f"第 {row_index + 1} 行不存在了——源表可能被改短了或损坏了")
+    return view.row_numbers[row_index]
+
+
+def write_back(source: Path, dest: Path, sheet: str, header_row: int,
+               jobs: list[tuple[int, OutputCol, str]]) -> None:
+    """把一批 (数据行序号, 输出列, 值) 写进 dest.xlsx。
+
+    - **原子**：先写同目录临时文件再 ``os.replace``，用户在浏览器下载的同时
+      平台在写，不原子就会下载到半个文件。
+    - **被占则抛**：Windows 上 Excel/WPS 开着会独占，``openpyxl.save()`` 与
+      ``os.replace()`` 都会 PermissionError。**这里不重试**——重试到调度
+      tick 里会让整个工作流被一个文件锁卡住，而用户看到的只是「停在第 N 行」。
+      调用方负责降级（记 writeback_pending=1）。
+    - **越界抛 store.Invalid**：源表被改短了。这不是文件锁，是数据损坏，
+      调用方要记失败原因并**仍然置 workflow_archived=1**，否则闸门②会一直
+      等着这一行。
+    """
+    if not jobs:
+        return
+    view = read_source(source, header_row=header_row)
+    wb = load_workbook(source)
+    try:
+        if sheet and sheet in wb.sheetnames:
+            ws = wb[sheet]
+        else:
+            ws = wb[wb.sheetnames[0]]
+        for row_index, col, value in jobs:
+            r = _sheet_row_number(view, row_index)
+            cell = ws.cell(row=r, column=int(col.col_index) + 1)
+            cell.value = str(value)[:CELL_MAX]
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.stem + ".tmp" + dest.suffix)
+        wb.save(tmp)
+        os.replace(tmp, dest)
+    finally:
+        wb.close()
