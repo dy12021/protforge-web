@@ -43,6 +43,19 @@ const CMD_LABEL = {
   set_model: "切换模型", set_thinking_level: "切换思考档位",
 };
 
+/* 任务范围（GET /api/admin/tasks?scope=）。
+ *
+ * 默认「常规」是**服务端的设计**：值班台是「现在有什么不对」的地方，
+ * 几百个正常跑的行任务会把排查视图糊满。但行任务恰恰是管理员来这儿
+ * 要查的东西，所以前端必须有开关——不然这个默认值等于把行任务彻底藏起来了，
+ * 而管理员排查卡住的行任务正是这个功能对他的全部价值。 */
+const SCOPES = [
+  { value: "regular", label: "常规", hint: "只看常规计算任务（不含工作流行任务）" },
+  { value: "workflow", label: "工作流", hint: "只看工作流里的行任务" },
+  { value: "all", label: "全部", hint: "常规与工作流行任务一起看" },
+];
+const SCOPE_LABEL = { regular: "常规", workflow: "工作流", all: "全部" };
+
 const state = {
   tasks: [],                 // GET /api/admin/tasks 的快照（最新在前）
   byId: new Map(),           // id -> task
@@ -53,6 +66,8 @@ const state = {
   cards: new Map(),          // taskId -> 卡片元素（复用，重建就没有滑轨动画）
   reached: new Map(),        // taskId -> 走到的站序；failed 时用它把红点放对位置
   pending: new Map(),        // artifactId -> 产物行（确认/排除后回填状态）
+  scope: "regular",         // GET /api/admin/tasks 的 scope：常规/工作流/全部
+  counts: {},               // 同上，按当前范围统计的各状态计数
   filter: { q: "", status: "", activeOnly: false },
   auditFilter: { task: "", kind: "", q: "", failOnly: false },
   tab: "live",
@@ -354,9 +369,14 @@ function renderLive() {
   });
 
   empty.hidden = live.length > 0;
-  document.getElementById("live-sub").textContent =
-    live.length ? (live.length + " 个在跑 · 队列 " +
-      (state.queue ? state.queue.queued : 0) + " 个待启动") : "";
+  if (!live.length) fillEmpty(empty, "live");
+  // 队列与失败数**跟着 scope 走**（服务端就这么算的），所以这里必须把
+  // 当前视图写出来——不然「常规视图 0 个在跑」会被读成「全平台 0 个在跑」。
+  const q = (state.queue || {}).queued || 0;
+  const failed = (state.counts || {}).failed || 0;
+  document.getElementById("live-sub").textContent = scopeName() + "视图 · "
+    + live.length + " 个在跑 · 队列 " + q + " 个待启动"
+    + (failed ? " · 失败 " + failed : "");
 }
 
 /* 就地重画一张卡。不重建节点：重建会把正在敲的干预内容和滑轨动画一起扔掉。 */
@@ -517,9 +537,14 @@ function renderTasks() {
   const rows = filteredTasks();
   body.textContent = "";
   rows.forEach(t => body.append(taskRow(t)));
-  document.getElementById("tasks-empty").hidden = rows.length > 0;
-  document.getElementById("tasks-sub").textContent =
-    rows.length + " / " + state.tasks.length + " 个计算任务";
+  const empty = document.getElementById("tasks-empty");
+  empty.hidden = rows.length > 0;
+  if (!rows.length) {
+    // 有任务却筛没了，与这个视图本来就没有，是两回事。
+    fillEmpty(empty, state.tasks.length ? "filter" : "scope");
+  }
+  document.getElementById("tasks-sub").textContent = scopeName() + "视图 · "
+    + rows.length + " / " + state.tasks.length + " 个计算任务";
 }
 
 function taskRow(t) {
@@ -994,13 +1019,95 @@ function scheduleRefresh(id) {
   }, 1200));
 }
 
+// ---------------------------------------------------------------- 任务范围
+
+/* 控件挂在工具条末尾。**不能挂进 #tabs**：那里的点击是委托到
+ * closest(".tab") 的，混进去点一下就会顺手把页签切成 showTab(undefined)，
+ * 五个面板一起消失。选中态用既有的 .primary 上色，因此不必改 style.css。 */
+function buildScopeSwitch() {
+  const bar = document.querySelector(".toolbar");
+  if (!bar) return;              // 工具条没了就不摆控件，页面其余部分照常
+  bar.append(el("span", "toolbar-gap"));
+  bar.append(el("span", "who", "任务范围"));
+  SCOPES.forEach(s => {
+    const b = el("button", "secondary", s.label);
+    b.type = "button";
+    b.dataset.scope = s.value;
+    b.title = s.hint;
+    b.setAttribute("aria-pressed", String(s.value === state.scope));
+    bar.append(b);
+  });
+  paintScopeSwitch();
+}
+
+function paintScopeSwitch() {
+  document.querySelectorAll(".toolbar [data-scope]").forEach(b => {
+    const on = b.dataset.scope === state.scope;
+    b.className = on ? "primary" : "secondary";
+    b.setAttribute("aria-pressed", String(on));
+  });
+}
+
+/* 默认视图**不发** scope：服务端的默认值就是 regular，多发一个与默认相同的
+ * 参数只是噪音（前端冒烟是按精确路径核对接口的，多一个 ? 就对不上）。 */
+function scopeQuery() {
+  return state.scope === "regular"
+    ? ""
+    : "?scope=" + encodeURIComponent(state.scope);
+}
+
+function setScope(v) {
+  if (!SCOPES.some(s => s.value === v) || state.scope === v) return;
+  state.scope = v;
+  paintScopeSwitch();
+  load().catch(e => setMsg(document.getElementById("board-msg"),
+    e.message || "切换任务范围失败", "bad"));
+}
+
+function scopeName() { return SCOPE_LABEL[state.scope] || state.scope; }
+
+/* 空视图不能只写一句「没有任务」。默认视图按设计**不含行任务**，
+ * 而管理员来值班台正是要查卡住的行任务——只留一句「没有任务」，
+ * 他面对空列表只能猜。所以范围空的时候要把话说全，并给一个一键切换。
+ *
+ * why='filter' 是另一回事：那是搜索/状态筛选没匹配上，与范围无关。 */
+function fillEmpty(node, why) {
+  let text, next = null;
+  if (why === "filter") {
+    text = "没有匹配的计算任务。";
+  } else if (state.scope === "all") {
+    text = why === "live"
+      ? "此刻没有在跑的计算任务。"
+      : "一个计算任务都没有。";
+  } else if (state.scope === "workflow") {
+    text = why === "live"
+      ? "此刻没有在跑的工作流行任务。"
+      : "本视图只看工作流里的行任务，现在一行都没有。";
+    next = "all";
+  } else {
+    text = why === "live"
+      ? "此刻没有在跑的常规任务。本视图不含工作流行任务。"
+      : "本视图只看常规计算任务，不含工作流行任务。";
+    next = "workflow";
+  }
+  node.textContent = "";          // 先清干净：复用节点，忘了清就会两句叠在一起
+  node.append(el("span", null, text));
+  if (next) {
+    const b = el("button", "secondary", "切到" + SCOPE_LABEL[next] + "视图");
+    b.type = "button";
+    b.dataset.scope = next;
+    node.append(b);
+  }
+}
+
 // ---------------------------------------------------------------- 数据
 
 async function load() {
-  const got = await api("GET", "/tasks");
+  const got = await api("GET", "/tasks" + (scopeQuery()));
   state.tasks = got.tasks || [];
   state.byId = new Map(state.tasks.map(t => [Number(t.id), t]));
   state.queue = got.queue;
+  state.counts = got.counts || {};   // 同样只覆盖当前视图
   // 待确认产物的合并：**已确认/已排除的本地结论不许被下一轮拉取冲掉**，
   // 否则操作完的那一条会立刻又冒回待确认区，看起来像"没生效"。
   const fresh = new Map();
@@ -1221,6 +1328,14 @@ document.getElementById("tabs").onclick = e => {
   if (b) showTab(b.dataset.tab);
 };
 
+buildScopeSwitch();
+/* 委托而不是逐个绑：范围控件和空视图里那个「切到…」按钮都是运行时挂上去的，
+ * 委托一次就把两处都盖住了，也不会漏掉以后新增的节点。 */
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-scope]");
+  if (b) setScope(b.dataset.scope);
+});
+
 document.getElementById("new-user-form").addEventListener("submit", async e => {
   e.preventDefault();
   const btn = document.getElementById("nu-save");
@@ -1282,7 +1397,7 @@ function startClock() {
  * 几个函数，render 这个名字早就不存在了。整个值班台于是从来没活过。 */
 Object.assign(window, {
   api, state, el, load, reload: load, loadUsers, loadAudit,
-  renderLive, renderPending, renderTasks, renderAudit, renderUsers,
+  renderLive, renderPending, renderTasks, renderAudit, renderUsers, setScope,
   fmtTime, fmtMs, fmtSize, STATUS_ORDER, STATUS_LABEL, ROLE_LABEL,
   SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL, apiBase, token,
   buildRail, paintRail, railIndex, confirmAction, confirmBody,
