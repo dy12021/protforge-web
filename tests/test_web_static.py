@@ -139,6 +139,8 @@ def test_hidden_attribute_is_forced_to_display_none():
         ".drawer-msg",     # 抽屉提示条
         ".board-msg",      # 看板顶部横幅
         ".login-error",    # 登录失败提示
+        ".wf-pane",        # 工作流三步向导的步骤面板
+        ".wf-colpick",     # 点表头弹出的角色选择层
     ]
     for sel in toggled:
         # 只要求出现 `选择器[hidden]` 即可，不要求紧跟 `{`：
@@ -449,7 +451,7 @@ def test_workflow_page_shows_the_real_slot_syntax():
 
 
 def test_workflow_page_has_all_four_controls():
-    """开始 / 暂停 / 继续 / 中止整批（规格 8.2 第 518 行）。
+    """开始 / 暂停 / 继续 / 中止整批（规格 8.2 详情「控制」那条）。
 
     少「继续」是一条死路：界面上点完暂停就再也回不去了，只能改库或者
     自己调接口——而服务端 WORKFLOW_ACTIONS 本来就认 resume。
@@ -462,23 +464,271 @@ def test_workflow_page_has_all_four_controls():
         assert f'control("{act}")' in js, f"JS 里没有接 {act}"
 
 
-def test_workflow_cards_have_a_progress_bar_and_the_detail_a_failure_count():
-    """卡片要有**条**（规格 8.2 第 513 行），失败数要真的按行数出来。
+def _func_body(src: str, name: str) -> str:
+    """按花括号配对取某个具名函数的函数体。
 
-    失败数只能落在详情页：列表端点是 `SELECT * FROM workflows`，而
-    workflows 表根本没有失败计数这个字段（`server/` 冻结，不能加），
-    所以卡片上不许编一个数出来。
+    **不能正则截到第一个 `}`**：这几个函数体里都有 if 块与模板字符串，
+    截出来的「函数体」不含后半段，于是「函数体里有 X」既可能恒真也可能恒假——
+    两种都学不到任何东西。
+    """
+    m = re.search(r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", src)
+    assert m, f"找不到函数 {name}"
+    i = src.index("{", m.end())
+    depth = 0
+    while i < len(src):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[m.end():i]
+        i += 1
+    raise AssertionError(f"{name} 的函数体没有闭合")
+
+
+def _py_func_body(src: str, name: str) -> str:
+    """按缩进取 Python 函数的函数体（到下一个同级或更浅的 def 为止）。
+
+    同样不能正则截：服务端那几个函数的判断都在返回之前，正则截出来的多半是
+    一句 def 行，断言就成了「它有没有把花括号写在同一行」。
+    注意 `def` 可能缩进在函数里（路由处理器就是），所以按**缩进宽度**收尾，
+    不能按「顶格」收尾。
+    """
+    m = re.search(r"^([ \t]*)def\s+" + re.escape(name) + r"\s*\(", src, re.M)
+    assert m, f"找不到函数 {name}"
+    base = len(m.group(1).expandtabs(4))
+    out = []
+    started = False
+    for line in src[m.start():].split("\n"):
+        if not line.strip():
+            out.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if not started:
+            out.append(line)
+            started = line.rstrip().endswith(":")
+            continue
+        if indent <= base:
+            break
+        out.append(line)
+    assert started, f"{name} 没取到函数体"
+    return "\n".join(out)
+
+
+def _handler_bodies(src: str, event: str) -> list[str]:
+    """取出所有 addEventListener("<event>", (…) => { … }) 的回调体。"""
+    out = []
+    pat = re.compile(r'addEventListener\(\s*"' + event + r'"\s*,\s*'
+                     r'(?:async\s*)?\([^)]*\)\s*=>\s*\{')
+    for m in pat.finditer(src):
+        depth, i = 0, m.end() - 1
+        while i < len(src):
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(src[m.end():i])
+                    break
+            i += 1
+    assert out, f"没有任何 addEventListener(\"{event}\", …)"
+    return out
+
+
+def _server(name: str) -> str:
+    return _read(REPO / "server" / name)
+
+
+def test_workflow_card_shows_the_failed_row_count_and_the_number_is_real():
+    """U1：卡片上要有失败数（规格 8.2 列表那条 + 7.4「失败行数放到最显眼处」）。
+
+    **这一条取代了旧版「卡片上不许编失败数」那条断言。** 旧版的前提是列表端点
+    只有 `SELECT * FROM workflows`，而 workflows 表里没有失败计数——那个前提
+    当时是对的，于是当时的结论是「照实说明、不做 UI」。现在改成真算：列表端点
+    从行任务聚合一并给出，前端于是不必编。
+
+    所以这里断的是三件互相咬住的事，缺一件都红：
+      ① 卡片上真的有失败数的位置，且排在进度条**上面**（显眼）；
+      ② 那个数取自服务端给的 failed_rows，不是前端自己数出来的；
+      ③ 服务端真的算得出它（一条 GROUP BY，而不是每张卡片打一次详情接口）。
+    ①②③ 断任何一条，剩下两条都可能各自是绿的——所以必须一起断。
+    """
+    js, html = _js("workflow.js"), _html("workflow.html")
+    card = _func_body(js, "loadList")
+
+    # ① 位置与显眼度：卡片模板里失败数在进度条之前
+    at_failed = card.find('class="wf-card-failed"')
+    at_bar = card.find('class="wf-bar"')
+    assert at_failed > 0, "卡片上没有失败数的位置"
+    assert 0 < at_failed < at_bar, \
+        "失败数没有排在进度条上面——规格 7.4 要的是第一眼能看见"
+    assert re.search(r'failedBox\.className\s*=[^;]*is-bad', card), \
+        "有失败行时不标红，等于没放到显眼处"
+
+    # ② 数据来源：取的是列表端点给的 failed_rows，且**显示出去的那个数**就是它。
+    # 只断「loadList 里出现过 wf.failed_rows」是恒真的：同一函数里那句
+    # 「没算出来」的判据也要读同一个键，把它换成常量而显示仍然读旧值也照样绿。
+    assert re.search(r"const\s+failed\s*=\s*Number\(\s*wf\.failed_rows\s*\)\s*\|\|\s*0",
+                     card), \
+        "显示出去的失败数不是从 wf.failed_rows 算出来的（前端编了一个数）"
+    assert re.search(r"failedBox\.textContent\s*=[^;]*\bfailed\b", card, re.S), \
+        "失败数那个格子建了却没人往里写字"
+    assert re.search(r'failed_rows\s*!==\s*undefined', card), \
+        "缺 failed_rows 时要照实说「没算出来」，不能当成 0 显示成「没有失败行」"
+
+    # ③ 服务端：一次 GROUP BY，且列表端点真的把统计挂上去
+    srv = _server("app.py")
+    stats = _py_func_body(srv, "_row_stats")
+    assert "COUNT(*)" in stats, "失败数没有真的数出来"
+    assert re.search(r'==\s*"failed"', stats), \
+        "聚合没有按 failed 过滤（数的是行数而不是失败行数）"
+    listed = _py_func_body(srv, "list_workflows")
+    assert "_row_stats" in listed, "列表端点没有带上行级统计"
+    assert "list_workflow_rows" not in listed, \
+        "列表端点逐个工作流取行数据 = 每张卡片一次详情查询，不要这么写"
+    # 前后端用同一个键名：任何一边改名，这条都红（而不是界面默默显示 0）
+    assert re.search(r'out\["failed_rows"\]\s*=', srv), \
+        "服务端没有把 failed_rows 放进工作流视图"
+
+
+def test_workflow_current_row_is_on_the_card_too():
+    """规格 8.2 列表那条里的「当前在跑第几行」，与失败数同属卡片。
+
+    只报行号不报状态是不够的：规格 7.5 要求「界面必须显示『第 N 行停在打包中』」，
+    只写「第 4 行」的话，packaging 卡住与计算中在卡片上长得一模一样——
+    而这两种情况用户要做的完全不同（一个是等，一个是去点重新打包）。
+    """
+    card = _func_body(_js("workflow.js"), "loadList")
+    assert re.search(r"wf\.current_row", card), "卡片上没有「当前在跑第几行」"
+    assert re.search(r"wf\.current_row[\s\S]{0,400}wf\.current_status", card), \
+        "只报了行号没报状态（打包中与计算中会长得一样）"
+    assert _server("app.py").count("current_status") >= 1, \
+        "服务端没给 current_status，卡片那个状态无从显示"
+
+
+def test_column_role_is_picked_on_the_table_header_not_a_separate_form():
+    """U2：列角色做在表头上——点表头弹出选角色，不另开映射表单（规格 8.2）。
+
+    这一条同时断三件：
+      ① 表头那格真的绑着「点它就配列」；
+      ② 角色选择器就长在那个弹层里（不是点开另一个表单）；
+      ③ 旧的映射列表 **不在了**。只断 ①② 的话，把弹层挪回独立列表照样全绿。
+    """
+    js, html = _js("workflow.js"), _html("workflow.html")
+    head = _func_body(js, "renderHead")
+    assert 'className = "wf-th"' in head, \
+        "表头那一格没有自己的类（既没法挂样式也没法说它可点）"
+    assert re.search(r'addEventListener\("click",\s*\(\)\s*=>\s*openColPick\(', head), \
+        "表头没绑「点它选角色」"
+    pick = _func_body(js, "openColPick")
+    assert re.search(r'\$\("#wf-colpick"\)\.hidden\s*=\s*false', pick), \
+        "点开之后没有出现选角色的东西"
+    assert re.search(r'\$\("#wf-roles"\)\.children', pick), \
+        "弹层里没有那一排角色按钮"
+    # 误触：点开弹层本身不许改任何一列——只有点角色才改
+    assert not re.search(r"colsModel\[\s*picked\s*\]\s*\.\w+\s*=", pick), \
+        "点开弹层就改动了列配置——手滑点一下表头会把某一列的角色弄丢"
+    # 旧的那个独立映射列表必须已经拆掉
+    assert 'id="wf-cols"' not in html and "#wf-cols" not in js, \
+        "独立的列映射表单还在：规格要的是在表头上选，不另开表单"
+    # 读回列组只有一个来源：列模型。界面上不存在第二份能与之不一致的副本。
+    assert "colsModel" in _func_body(js, "readCols"), \
+        "保存读的不是列模型，而是另一处 DOM——两份配置迟早对不上"
+
+
+def test_preview_updates_right_away_without_pressing_anything():
+    """U3：改完**立刻**在下方显示「第 N 行渲染出来的提示词」（规格 8.2）。
+
+    「立刻」的判据是不点任何按钮下面那一行就变了，所以这里断的是
+    **哪个输入框的哪个事件会重画预览**——绑 change 等于要用户先失焦，
+    而规格要的是改完就看见。
+
+    同时断住「拿服务端的 rendered 直接贴上去」这条退路：那个字段渲染的是
+    **已保存**的配置，用户还在改的时候它给的一直是旧句子。
     """
     js = _js("workflow.js")
-    assert "wf-bar" in js, "卡片上没有进度条，只有一行「第 N / M 行」"
-    assert re.search(r"\.style\.width\s*=", js), "进度条宽度没有被算出来"
-    assert 'id="wf-failed"' in _html("workflow.html"), "详情页没有失败数的位置"
-    assert re.search(r'status\s*===\s*"failed"', js), \
-        "失败数没有真的按 failed 的行数数出来"
+    typed = [b for b in _handler_bodies(js, "input") if "renderHere" in b]
+    assert len(typed) >= 2, \
+        "模板框与变量名框都要在 input 上重画预览（只绑 change 要先失焦）"
+    assert "renderHere" in _func_body(js, "setRole"), \
+        "换列角色之后预览没有立刻重画"
+
+    here = _func_body(js, "renderHere")
+    assert "api(" not in here and "fetch(" not in here, \
+        "预览去打了接口：没保存的改动服务端看不见，而且每敲一个字打一次会打爆"
+    assert "replace(" in here and "previewValues" in here, \
+        "预览没有就地按当前行的值渲染"
+
+    lp = _func_body(js, "loadPreview")
+    assert "renderHere()" in lp, "取回当前行的值之后没有重画预览"
+    assert not re.search(r'\$\("#wf-preview"\)\.textContent\s*=\s*d\.rendered', lp), \
+        "把服务端那份 rendered 直接贴上去：它是已保存的配置，改到一半看着像没生效"
+
+    # 槽位语法与服务端同一套。两份实现（本地预览 / 服务端渲染）最容易悄悄分家，
+    # 分家之后预览给的那句话与真正跑下去的那句话不是同一句。
+    assert re.search(r"const\s+SLOT_RE\s*=\s*/\\\{\\\{", js), \
+        "本地预览没有声明与服务端同构的槽位语法"
+    srv = _server("workflow.py")
+    assert r"\{\{\s*([^{}\s]+)\s*\}\}" in srv, \
+        "服务端槽位语法变了：本地预览的 SLOT_RE 要跟着改"
+
+
+def test_new_workflow_is_a_real_three_step_wizard():
+    """U4：新建是 3 步向导——上传 → 选列配模板 → 确认开跑（规格 8.2）。
+
+    这一条钉的是**真的分步**，不是步骤指示条：每一步有自己的面板、
+    面板跟着当前步显隐、进下一步有条件、并且回得去。
+    上一轮只有一条指示条时它照样是绿的——那正是漏掉的地方。
+    """
+    js, html = _js("workflow.js"), _html("workflow.html")
+
+    # ① 三块面板，且与步骤条那三个名字一一对应（换序/漏一个都红）
+    panes = re.findall(r'data-step="([^"]+)"', html)
+    assert len(panes) == 3, f"详情页没有三块步骤面板：{panes}"
+    assert re.search(r"const\s+WF_STEPS\s*=\s*\[([^\]]*)\]", js), "找不到 WF_STEPS"
+    labels = re.findall(r'"([^"]*)"', re.search(
+        r"const\s+WF_STEPS\s*=\s*\[([^\]]*)\]", js).group(1))
+    assert panes == labels, \
+        f"面板顺序与步骤名对不上：{panes} vs {labels}"
+    assert re.search(r'STEP_PANES\s*=\s*\[\s*\$\("#wf-pane-1"\),'
+                     r'\s*\$\("#wf-pane-2"\),\s*\$\("#wf-pane-3"\)\s*\]', js), \
+        "三块面板没有在 JS 里按顺序列出来（显隐就无从对应到步骤）"
+
+    # ② 一次只露当前这一步
+    show = _func_body(js, "showStep")
+    assert re.search(r"STEP_PANES\.forEach\([^;]*hidden\s*=\s*i\s*!==\s*stepNow", show), \
+        "面板没有跟着当前步显隐，三步是并排摊着的"
+
+    # ③ 进下一步有条件：没配好不许进第 3 步，且要写出缺什么
+    assert re.search(r"const\s+gap\s*=\s*missingConfig\(\)", show), \
+        "「下一步」不看配置状态——没配模板也能一路点到开跑"
+    assert re.search(r"next\.disabled\s*=[^;]*\bgap\b", show), \
+        "缺配置时那一步仍然点得进去"
+    gap = _func_body(js, "missingConfig")
+    assert "PROMPT_PLACEHOLDER" in gap, \
+        "上传时那句占位模板被当成了用户写好的提示词"
+    assert re.search(r"\$\(\"#wf-next-hint\"\)\.textContent\s*=\s*gap", show), \
+        "缺什么没有告诉用户"
+
+    # ④ 回得去：步骤条能点回去，「上一步」也在
+    assert re.search(r'\$\("#wf-prev"\)\.disabled\s*=\s*stepNow\s*===\s*0', show), \
+        "「上一步」没有边界，第 1 步也能往回退"
+    steps_fn = _func_body(js, "renderSteps")
+    assert re.search(r'addEventListener\("click",\s*\(\)\s*=>\s*gotoStep\(', steps_fn), \
+        "步骤条不可点，就只能一路往前走"
+    assert re.search(r'\$\("#wf-prev"\)\.addEventListener\("click",[^;]*gotoStep\(', js), \
+        "「上一步」没有绑事件"
+    assert re.search(r"Math\.max\(0,\s*Math\.min\(", _func_body(js, "gotoStep")), \
+        "切步骤没有夹在 0 与最后一步之间，点过头会露出不存在的面板"
+
+    # ⑤ 第 3 步才是「确认开跑」：开始按钮在第 3 块面板里，不是常驻在顶上
+    pane3 = re.search(r'id="wf-pane-3".*?</div>\s*</div>', html, re.S)
+    assert pane3 and 'id="wf-start"' in pane3.group(0), \
+        "「开始」不在确认开跑这一步里"
 
 
 def test_workflow_table_is_styled_as_the_spec_demands():
-    """表格预览的四件：行号列、表头粘顶、当前行高亮、状态色点（规格 8.2 第 515 行）。
+    """表格预览的四件：行号列、表头粘顶、当前行高亮、状态色点（规格 8.2 详情第一条）。
 
     **断言一律带作用域**（.wf-table / .wf-rownum / .wf-dot[data-status=...]）。
     写成 `assert "sticky" in css` 是恒真的：.toolbar 早就有 position: sticky
@@ -504,7 +754,7 @@ def test_workflow_table_is_styled_as_the_spec_demands():
 
 
 def test_homepage_links_to_the_workflow_page():
-    """两边都要有入口：首页进得去（规格 8.2 第 523 行），工作流页回得来。
+    """两边都要有入口：首页进得去（规格 8.2「独立页面怎么挂上去」），工作流页回得来。
 
     上一版是零入口——页面能打开，但没人找得到。
     """
@@ -515,7 +765,7 @@ def test_homepage_links_to_the_workflow_page():
 
 
 def test_workflow_detail_can_filter_to_failed_rows_only():
-    """规格 8.3 第 534 行：行任务的故障排查走工作流详情页，那里有「只看失败行」的筛选。"""
+    """规格 8.3 第二条：行任务的故障排查走工作流详情页，那里有「只看失败行」的筛选。"""
     html = _html("workflow.html")
     assert 'id="wf-only-failed"' in html, "详情页没有「只看失败行」的开关"
     js = _js("workflow.js")
@@ -544,10 +794,11 @@ def test_workflow_download_carries_the_bearer_token():
 
 
 def test_workflow_detail_shows_the_three_step_indicator():
-    """规格 8.2 第 519 行的三步：上传 → 选列配模板 → 确认开跑。
+    """规格 8.2「新建是 3 步向导」的步骤条本身。
 
-    这里钉的是**指示**（步骤条会随真实状态重画），不是拦路的分屏向导——
-    后者需要一整套步骤状态机，本轮没有做，见 task-9b-report.md。
+    真的分步（面板、进入条件、返回）由
+    test_new_workflow_is_a_real_three_step_wizard 断；这条只断名字与位置，
+    免得有人把「上传 → 选列配模板 → 确认开跑」改写成别的三个词而没人发现。
     """
     assert 'id="wf-steps"' in _html("workflow.html"), "详情页没有步骤指示"
     js = _js("workflow.js")

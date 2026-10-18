@@ -544,6 +544,59 @@ button { cursor: pointer; }
 .wf-dot[data-status="done"]      { background: var(--st-done); }
 .wf-dot[data-status="failed"]    { background: var(--st-failed); }
 
+/* 卡片上的两行数：失败多少行 + 当前在跑第几行（规格 8.2 列表那条 /
+   7.4「失败行数放到最显眼处」）。这一整行排在进度条**上面**，失败数在这一行
+   的最前面并且红色加粗——一眼扫过去先看见的就是它。 */
+.wf-card-line { display: flex; align-items: baseline; gap: .55rem; margin: .1rem 0 .05rem; }
+.wf-card-now { color: var(--fg-dim); font-size: .72rem; }
+.wf-card-failed { color: var(--fg-dim); font-size: .72rem; }
+.wf-card-failed.is-bad { color: var(--st-failed); font-weight: 700; }
+
+/* 三步向导：一次只露一块面板。display 是作者规则，所以 [hidden] 必须有伴生
+   规则——否则与开头的 [hidden] 同特异性、写在后面，hidden 时面板还露着。 */
+.wf-pane { border-left: 2px solid var(--border); padding-left: .7rem; margin: .5rem 0; }
+.wf-pane[hidden] { display: none; }
+.wf-summary {
+  margin: .5rem 0; padding: .55rem .7rem; border: 1px solid var(--border);
+  border-radius: var(--r-sm); background: var(--panel); color: var(--fg);
+  font-family: var(--mono); font-size: .74rem; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+/* 步骤条：能跳的那几步看上去能点，锁着的那几步看上去点不动 */
+.wf-step.is-jump { cursor: pointer; text-decoration: underline dotted var(--border); }
+.wf-step.is-jump:hover { color: var(--accent); }
+.wf-step.is-locked { opacity: .45; }
+
+/* 角色弹层：点表头才出现。**不是模态**——它就贴在表上方，
+   用户能一边看表一边选，选错再点一次就改回来了。 */
+.wf-colpick {
+  display: flex; flex-direction: column; gap: .35rem;
+  border: 1px solid var(--border); border-left: 2px solid var(--accent);
+  border-radius: var(--r-sm); background: var(--panel);
+  padding: .45rem .6rem; margin: .5rem 0;
+}
+.wf-colpick[hidden] { display: none; }
+.wf-roles { display: flex; flex-wrap: wrap; gap: .35rem; }
+.wf-role {
+  border: 1px solid var(--border); background: var(--card); color: var(--fg-dim);
+  border-radius: 999px; padding: .18rem .65rem; font-size: .75rem; cursor: pointer;
+}
+.wf-role:hover { color: var(--fg); border-color: #C6CFDA; }
+.wf-role.is-on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.wf-field-line { display: flex; align-items: center; gap: .4rem; color: var(--fg-dim); font-size: .75rem; }
+.wf-field-line input[type=text] { min-width: 16rem; }
+.wf-field-line select { padding: .2rem .35rem; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--card); }
+
+/* 表头就是角色选择器：可点、有指针、表头格里挂一个角色标签 */
+.wf-table th.wf-th { cursor: pointer; }
+.wf-table th.wf-th:hover { background: var(--lift); color: var(--fg); }
+.wf-role-tag {
+  margin-left: .4rem; padding: 0 .4rem; border: 1px solid var(--border);
+  border-radius: 999px; color: var(--fg-dim); font-size: .68rem; font-weight: 400;
+}
+.wf-role-tag[data-role="input"], .wf-role-tag[data-role="context"] { color: var(--accent); border-color: var(--accent); }
+.wf-role-tag[data-role="output"] { color: var(--st-done); border-color: var(--st-done); }
+
 /* 动效只做一处（流转轨滑动），其余不加；并全部服从 prefers-reduced-motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }

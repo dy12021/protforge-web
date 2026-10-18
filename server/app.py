@@ -242,7 +242,7 @@ def _workflow_root() -> Path:
     return db.data_root() / "workflows"
 
 
-def _wf_view(wf: dict) -> dict:
+def _wf_view(wf: dict, stats: dict | None = None) -> dict:
     """对外的工作流视图。
 
     **writeback 原样返回**（规格 2 决策表「回写是可开关」/ 7.1 / 9.1）：用户
@@ -259,6 +259,66 @@ def _wf_view(wf: dict) -> dict:
     out = dict(wf)
     raw = (out.get("result_path") or "").strip()
     out["result_ready"] = bool(raw) and Path(raw).is_file()
+    # 行级统计**只在列表端点挂上来**（_row_stats 那条 SQL 已经是一次 GROUP BY，
+    # 别的端点拿不到聚合值就不给这个键）。不给键比给一个默认 0 强：前端区分
+    # 「真的 0 行失败」和「这里没有这个数」，后者不能显示成「没有失败行」。
+    if stats is not None:
+        out["failed_rows"] = int(stats["failed_rows"])
+        out["current_row"] = stats["current_row"]
+        out["current_status"] = stats["current_status"]
+    return out
+
+
+# 行任务里「还没收工」的那些状态。**从 db 里推，不另抄一份词表**：抄一份的话，
+# 将来加了状态这里不会跟着变，卡片就会把一行永远算成「不在跑」。
+_LIVE_STATUSES = tuple(s for s in db.VALID_STATUSES if s not in db.TERMINAL_STATUSES)
+
+
+def _row_stats(workflow_ids) -> dict:
+    """每个工作流的行级统计：已经失败的行数 + 当前在跑第几行（规格 8.2 列表那条）。
+
+    **一条 GROUP BY 拿全，不按工作流逐个查。** 列表页有 N 张卡片，逐个查就是
+    N 次往返，而每张卡片背后的行任务可能有几百行（500 行的工作流一次卡片刷新
+    就是 500 行 SELECT）。
+
+    为什么算而不是存：workflows 表里加一列失败计数，就得在每次行状态迁移时维护
+    它，而漏维护的那一次**永远查不出来**——卡片上会一直挂着一个与真实行任务对不
+    上的数。对不上的失败数比没有失败数更坏：用户照着它去排查，排查的是一件
+    根本没发生过的事。行任务是唯一事实，这里每读一次都现算。
+
+    ``current_row`` 取非终态行里最小的 workflow_row：工作流是**串行**的
+    （规格 6.3 闸门②），同一时刻至多有一行没进终态，所以最小的那行就是当前行。
+    连它的 status 一起返回，规格 7.5 要的「第 N 行停在打包中」才写得出来——
+    只报行号的话，packaging 卡住与计算中在卡片上长得一模一样。
+    """
+    ids = [int(i) for i in workflow_ids]
+    out = {i: {"failed_rows": 0, "current_row": None, "current_status": None}
+           for i in ids}
+    if not ids:
+        return out
+    marks = ",".join("?" * len(ids))
+    c = db.connect()
+    try:
+        rows = c.execute(
+            "SELECT workflow_id, status, COUNT(*), MIN(workflow_row)"
+            f" FROM tasks WHERE workflow_id IN ({marks})"
+            " GROUP BY workflow_id, status", ids).fetchall()
+    finally:
+        c.close()
+    for r in rows:
+        wid = int(r["workflow_id"])
+        if wid not in out:
+            continue
+        if r["status"] == "failed":
+            out[wid]["failed_rows"] = int(r[2])
+        elif r["status"] in _LIVE_STATUSES:
+            row = int(r[3])
+            # 同一工作流有多条非终态行时取最小的——串行批次里第一条就是当前行。
+            # 「管理员重跑」会造出额外行，但那些行的 workflow_row 更大，
+            # 不该盖掉正跑的那一行。
+            if out[wid]["current_row"] is None or row < out[wid]["current_row"]:
+                out[wid]["current_row"] = row
+                out[wid]["current_status"] = r["status"]
     return out
 
 
@@ -720,8 +780,15 @@ def create_public_app() -> FastAPI:
     @app.get("/api/workflows")
     def list_workflows(user=Depends(auth.current_user)):
         is_admin = user["role"] == "admin"
-        return {"workflows": [_wf_view(w) for w in store.list_workflows(
-            None if is_admin else user["id"], is_admin=is_admin)]}
+        wfs = store.list_workflows(
+            None if is_admin else user["id"], is_admin=is_admin)
+        # 卡片要显示失败数与「当前在跑第几行」（规格 8.2 列表那条 / 7.4
+        # 「失败行数放到最显眼处」）。前端不编这个数：列表端点原来只有
+        # SELECT * FROM workflows，而失败数不在 workflows 表里——所以它只能
+        # 由行任务算出来。算的地方在这一处，**一次 GROUP BY 覆盖全部卡片**。
+        stats = _row_stats([w["id"] for w in wfs])
+        return {"workflows": [_wf_view(w, stats.get(int(w["id"])))
+                              for w in wfs]}
 
     @app.get("/api/workflows/{workflow_id}")
     def get_workflow(workflow_id: int, user=Depends(auth.current_user)):

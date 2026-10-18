@@ -34,10 +34,6 @@
 
   <!-- 详情 -->
   <section id="wf-detail" hidden>
-    <!-- 步骤指示（规格 8.2 第 519 行的三步）。当前站在哪一步由真实状态算出来，
-         不是画上去的装饰：模板没配好就停在第 2 步，开跑过才是第 3 步。 -->
-    <div class="toolbar"><ol class="wf-steps" id="wf-steps"></ol></div>
-
     <div class="toolbar">
       <button id="wf-back" class="secondary" type="button">← 全部工作流</button>
       <span class="who" id="wf-name"></span>
@@ -47,8 +43,72 @@
       <span class="who" id="wf-progress-text"></span>
     </div>
 
+    <!-- 三步向导（规格 8.2「新建是 3 步向导」）：上传 → 选列配模板 → 确认开跑。
+         步骤条能点：当前这一步之前的、以及状态允许到达的步骤都能点回去；
+         第 3 步要第 2 步配好才进得去。缺什么写在 hint 上，不让用户猜。 -->
     <div class="toolbar">
-      <button id="wf-start" class="primary" type="button">开始</button>
+      <ol class="wf-steps" id="wf-steps"></ol>
+      <span class="toolbar-gap"></span>
+      <span class="who" id="wf-next-hint"></span>
+      <button id="wf-prev" class="secondary" type="button">上一步</button>
+      <button id="wf-next" class="primary" type="button">下一步</button>
+    </div>
+
+    <!-- 第 1 步：上传回执。进到详情页说明表已经传上来了，
+         这步要回答的只有一个问题「我传的是不是这张表」。 -->
+    <div class="wf-pane" id="wf-pane-1" data-step="上传表格">
+      <div class="toolbar"><span class="who" id="wf-upload-receipt"></span></div>
+    </div>
+
+    <!-- 第 2 步：配列与模板。角色在**表头**上点着选（规格 8.2），
+         不另开映射表单；改完下面立刻出预览，不必先保存。 -->
+    <div class="wf-pane" id="wf-pane-2" data-step="配列与模板">
+      <div class="wf-colpick" id="wf-colpick" hidden>
+        <div class="toolbar">
+          <span class="who" id="wf-colpick-title"></span>
+          <span class="toolbar-gap"></span>
+          <span class="who">点一个角色就改完，取消不动任何配置</span>
+          <button id="wf-colpick-close" class="secondary" type="button">取消</button>
+        </div>
+        <div class="toolbar"><span class="wf-roles" id="wf-roles"></span></div>
+        <div class="toolbar">
+          <label class="wf-field-line">变量名
+            <input id="wf-slot" type="text" placeholder="变量名，模板里写成 {{变量名}}"></label>
+          <label class="wf-field-line">结果字段
+            <select id="wf-field"></select></label>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <span class="who">提示词模板（列绑定的变量写成两个大括号包起来，例如 {{seq}}）</span>
+      </div>
+      <div class="toolbar">
+        <textarea id="wf-template" rows="4" style="flex:1 1 40rem"
+                  placeholder="例：请按下面的条件计算，序列号是 {{seq}}。"></textarea>
+      </div>
+      <!-- 回写开关（规格 2 决策表 / 7.1 / 9.1）。关掉之后结果只存在平台里
+           （任务详情与工作流详情都能看），不会生成 result.xlsx，磁盘上不留
+           整表副本。批量场景下表里有敏感序列时这是需要的。 -->
+      <div class="toolbar">
+        <label class="toggle"><input id="wf-writeback" type="checkbox" checked>
+          把结果写回 Excel（关掉后结果只存在平台里，不生成结果表）</label>
+        <span class="toolbar-gap"></span>
+        <!-- 改完点「保存映射」，服务端校验通过才落库，校验不过原样退回并在这里说原因。 -->
+        <button id="wf-save" class="primary" type="button">保存映射</button>
+      </div>
+    </div>
+
+    <!-- 第 3 步：确认开跑。先把要跑的东西摊开写出来，再决定点不点开始。 -->
+    <div class="wf-pane" id="wf-pane-3" data-step="确认开跑">
+      <pre class="wf-summary" id="wf-summary"></pre>
+      <div class="toolbar">
+        <button id="wf-start" class="primary" type="button">开始（逐行跑）</button>
+      </div>
+    </div>
+
+    <!-- 控制：这几个不属于「新建三步」，批次跑起来之后一直要在手边。
+         刻意放在向导外面——藏进某一步就是把「中止整批」做成了死路。 -->
+    <div class="toolbar">
       <button id="wf-pause" class="secondary" type="button">暂停（当前行跑完再停）</button>
       <!-- 少这一颗按钮是一条死路：界面上点完暂停就再也回不去了，
            只能改库或者自己调接口（服务端 WORKFLOW_ACTIONS 本来就认 resume）。 -->
@@ -59,32 +119,11 @@
       <a id="wf-download" class="secondary" hidden>下载结果表</a>
     </div>
 
-    <!-- 列映射：角色、绑定的变量、结果字段都在这一块里改。
-         改完点「保存映射」，服务端校验通过才落库，校验不过原样退回并在这里说原因。 -->
-    <div class="toolbar"><span class="who">列映射</span></div>
-    <div id="wf-cols"></div>
-
-    <div class="toolbar">
-      <span class="who">提示词模板（列绑定的变量写成两个大括号包起来，例如 {{seq}}）</span>
-    </div>
-    <div class="toolbar">
-      <textarea id="wf-template" rows="4" style="flex:1 1 40rem"
-                placeholder="例：请按下面的条件计算，序列号是 {{seq}}。"></textarea>
-      <button id="wf-save" class="primary" type="button">保存映射</button>
-    </div>
-
-    <!-- 回写开关（规格 2 决策表 / 7.1 / 9.1）。关掉之后结果只存在平台里
-         （任务详情与工作流详情都能看），不会生成 result.xlsx，磁盘上不留
-         整表副本。批量场景下表里有敏感序列时这是需要的。 -->
-    <div class="toolbar">
-      <label class="toggle"><input id="wf-writeback" type="checkbox" checked>
-        把结果写回 Excel（关掉后结果只存在平台里，不生成结果表）</label>
-    </div>
-
     <!-- 表格预览：点任意一行，下面显示那一行渲染出来的提示词。
-         表头粘顶、行号列、当前行高亮、状态色点的样式都挂在 .wf-table 上。 -->
+         表头粘顶、行号列、当前行高亮、状态色点的样式都挂在 .wf-table 上。
+         点表头选列角色也发生在这张表上。 -->
     <div class="toolbar">
-      <span class="who">每一行</span>
+      <span class="who">每一行（点表头改这一列的角色，点行看这一行的提示词）</span>
       <label class="toggle"><input id="wf-only-failed" type="checkbox"> 只看失败行</label>
       <span class="toolbar-gap"></span>
       <span class="who" id="wf-filter-note"></span>
