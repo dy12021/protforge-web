@@ -7,6 +7,9 @@
 - **全空数据行要剔除**：真实 Excel 尾部常有一两行格式残留，``ws.max_row``
   会把它们算成数据行——不剔的话工作流会跑出一堆「输入全空」的行任务。
 - **context 列必须整列恒定**：不恒定就报错，不能悄悄取第一行。
+- **整表只许读一遍**：read_only 工作簿上按行号定位要从 XML 流头重扫，
+  逐行定位是 O(n^2)——Task 5 每放行一行就调一次 read_source，800 行的表
+  单次就要 19 秒。这条用 `iter_rows` 调用次数围，不测时间（CI 上必抖）。
 """
 from __future__ import annotations
 
@@ -38,13 +41,17 @@ def test_check_upload_accepts_real_xlsx(tmp_path):
 
 
 def test_check_upload_rejects_empty():
-    with pytest.raises(store.Invalid):
+    """空文件这条分支只能用**错误文案**围栏：`b""` 是唯一能进这个分支的载荷，
+    而它必然被后面的魔数检查再拦一次——所以删掉空文件检查后，
+    报错会从「文件是空的」变成「不是 xlsx」，断言依然要红。"""
+    with pytest.raises(store.Invalid, match="空的"):
         workflow.check_upload("空.xlsx", b"")
 
 
 def test_check_upload_rejects_shell_by_extension():
-    with pytest.raises(store.Invalid):
-        workflow.check_upload("evil.sh", b"echo hi")
+    """载荷自带 zip 头：删掉扩展名检查就**根本不抛**，而不是换个报错。"""
+    with pytest.raises(store.Invalid, match="只支持"):
+        workflow.check_upload("evil.sh", b"PK\x03\x04" + b"junk")
 
 
 def test_check_upload_rejects_wrong_magic():
@@ -65,6 +72,13 @@ def test_safe_display_name_strips_path():
     assert len(workflow.safe_display_name("x" * 500 + ".xlsx")) <= 120
 
 
+def test_safe_display_name_strips_control_chars():
+    """控制字符必须剥掉：它会进日志、进 HTTP 头、也可能糊掉终端。"""
+    got = workflow.safe_display_name("a\x00b\x07c\x1bd.xlsx")
+    assert got == "abcd.xlsx", "控制字符没剥干净：%r" % got
+    assert "<" not in workflow.safe_display_name('a<b>c.xlsx')
+
+
 # --- 读表 -------------------------------------------------------------------
 
 def test_read_source_basics(tmp_path):
@@ -83,9 +97,13 @@ def test_read_source_drops_trailing_blank_rows(tmp_path):
     ws.append(["编号", "序列"])
     ws.append(["1", "AAA"])
     ws.append([None, None])      # 真实表格尾部常有这种格式残留
+    ws.append([None, "只有序列"])  # 首列空但整行不空：这是数据行，不能剔
     wb.save(p)
     v = workflow.read_source(p)
-    assert len(v.row_numbers) == 1
+    assert v.row_numbers == [2, 4]
+    # 内容用 row_values 验，不碰 preview——preview 有条数上限，
+    # 拿它断言等于让别的用例也绑死在 PREVIEW_ROWS 上
+    assert workflow.row_values(p, v, 1) == {0: "", 1: "只有序列"}
 
 
 def test_read_source_header_row_is_configurable(tmp_path):
@@ -93,6 +111,10 @@ def test_read_source_header_row_is_configurable(tmp_path):
     v = workflow.read_source(p, header_row=2)
     assert v.headers == ["编号", "序列"]
     assert len(v.row_numbers) == 1
+    # 行号从 1 起：header_row=0 时表头读成空 → 列名全塌成「列N」，
+    # 真表头行还会被当成第一条数据行，不报错但整张表认错列
+    with pytest.raises(store.Invalid, match="表头行号"):
+        workflow.read_source(p, header_row=0)
 
 
 def test_read_source_truncates_long_cells(tmp_path):
@@ -100,6 +122,7 @@ def test_read_source_truncates_long_cells(tmp_path):
     p = _wb(tmp_path, [["编号", "备注"], ["1", long]])
     v = workflow.read_source(p)
     assert len(v.preview[0][1]) == workflow.CELL_MAX
+    assert workflow.CELL_MAX == 8000      # 规格值，跟着常量走的断言验不到常量本身
 
 
 def test_read_source_rejects_empty_sheet(tmp_path):
@@ -107,6 +130,153 @@ def test_read_source_rejects_empty_sheet(tmp_path):
     Workbook().save(p)
     with pytest.raises(store.Invalid):
         workflow.read_source(p)
+
+
+def test_read_source_caps_preview_rows(tmp_path):
+    """预览只留前 50 行，但 row_numbers 必须是**全部**数据行——
+    少收会漏任务，多收会把几百行预览塞进前端。"""
+    n = workflow.PREVIEW_ROWS + 10
+    p = _wb(tmp_path, [["编号"]] + [[str(i)] for i in range(n)])
+    v = workflow.read_source(p)
+    assert len(v.row_numbers) == n
+    # 写死 50 而不是只比 workflow.PREVIEW_ROWS：常量本身被改小的话，
+    # 跟着常量走的断言会跟着一起变小，等于什么都没验。
+    assert workflow.PREVIEW_ROWS == 50
+    assert len(v.preview) == 50
+    assert v.preview[0][0] == "0"
+    assert v.preview[-1][0] == "49"
+    assert v.row_numbers[-1] == n + 1
+
+
+def test_read_source_names_unnamed_headers(tmp_path):
+    """无名表头占位成「列N」，不能塌成空串——前端列表要拿它当列名。"""
+    p = _wb(tmp_path, [["编号", None, None], ["1", "AAA", "CCC"]])
+    v = workflow.read_source(p)
+    assert v.headers == ["编号", "列2", "列3"]
+    # 只占位 None：纯空白表头是 strip 成空串（规格原样行为，见报告待裁决项）
+    p2 = _wb(tmp_path, [["编号", "  "], ["1", "AAA"]], "ws.xlsx")
+    assert workflow.read_source(p2).headers == ["编号", ""]
+
+
+# --- 读表不许退化成逐行定位（性能围栏，规格 5.1）---------------------------
+
+class _CountingWS:
+    """数 workflow 自己发起多少次 iter_rows。包一层，不改行为。"""
+
+    def __init__(self, ws, calls):
+        self._ws = ws
+        self._calls = calls
+
+    def iter_rows(self, *a, **k):
+        self._calls.append(1)
+        return self._ws.iter_rows(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._ws, name)
+
+
+class _CountingWB:
+    def __init__(self, wb, calls):
+        self._wb = wb
+        self._calls = calls
+
+    def __getitem__(self, key):
+        return _CountingWS(self._wb[key], self._calls)
+
+    def close(self):
+        self._wb.close()
+
+    @property
+    def sheetnames(self):
+        return self._wb.sheetnames
+
+
+def _count_iter_rows(monkeypatch):
+    """把 workflow.load_workbook 换成会数 iter_rows 的替身。
+
+    **不测时间**——CI 上必然抖动。数调用次数才是确定的，且精确指向根因：
+    read_only 工作簿上 iter_rows(min_row=r, max_row=r) 每次都要从 XML 流头
+    重扫到第 r 行，所以逐行定位必然是「行数 × 行数」次调用。
+    """
+    calls: list[int] = []
+    real = workflow.load_workbook
+
+    def fake(*a, **k):
+        return _CountingWB(real(*a, **k), calls)
+
+    monkeypatch.setattr(workflow, "load_workbook", fake)
+    return calls
+
+
+def _big_xlsx(tmp_path, n, name="big.xlsx"):
+    """n 行数据：项目/批次/版本三列恒定（可当 context），序列列逐行变。"""
+    rows = [["编号", "项目", "批次", "版本", "序列"]]
+    rows += [[str(i + 1), "XBR", "B1", "v2", "SEQ%d" % (i + 1)]
+             for i in range(n)]
+    return _wb(tmp_path, rows, name)
+
+
+def test_read_source_scans_the_sheet_once(tmp_path, monkeypatch):
+    calls = _count_iter_rows(monkeypatch)
+    v = workflow.read_source(_big_xlsx(tmp_path, 100))
+    assert len(v.row_numbers) == 100
+    assert len(calls) <= 2, "iter_rows 调了 %d 次：逐行重新定位了" % len(calls)
+
+
+def test_read_source_scan_count_does_not_grow_with_rows(tmp_path, monkeypatch):
+    calls = _count_iter_rows(monkeypatch)
+    workflow.read_source(_big_xlsx(tmp_path, 100, "small.xlsx"))
+    small = len(calls)
+    calls.clear()
+    workflow.read_source(_big_xlsx(tmp_path, 800, "big.xlsx"))
+    big = len(calls)
+    assert small <= 2
+    assert big == small, "iter_rows 次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
+
+
+def test_check_context_columns_scans_the_sheet_once(tmp_path, monkeypatch):
+    """一列 context 就扫一次全表，三列也不能变成三遍全表。"""
+    calls = _count_iter_rows(monkeypatch)
+    p = _big_xlsx(tmp_path, 200)
+    v = workflow.read_source(p)
+    calls.clear()
+    workflow.check_context_columns(p, v, [1, 2, 3])
+    assert len(calls) <= 2, "iter_rows 调了 %d 次：逐列逐行重新定位了" % len(calls)
+
+
+def test_check_context_columns_scan_count_does_not_grow(tmp_path, monkeypatch):
+    calls = _count_iter_rows(monkeypatch)
+    p1 = _big_xlsx(tmp_path, 100, "small.xlsx")
+    v1 = workflow.read_source(p1)
+    calls.clear()
+    workflow.check_context_columns(p1, v1, [1, 2, 3])
+    small = len(calls)
+    calls.clear()
+    p2 = _big_xlsx(tmp_path, 800, "big.xlsx")
+    v2 = workflow.read_source(p2)
+    calls.clear()
+    workflow.check_context_columns(p2, v2, [1, 2, 3])
+    big = len(calls)
+    assert small <= 2
+    assert big == small, "iter_rows 次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
+
+
+# --- 取值 -------------------------------------------------------------------
+
+def test_row_values_rejects_row_out_of_range(tmp_path):
+    """两侧都要拦。上界漏了会 IndexError，下界漏了 -1 会**静默返回最后一行**。"""
+    p = _wb(tmp_path, [["编号", "序列"], ["1", "AAA"], ["2", "BBB"]])
+    v = workflow.read_source(p)
+    with pytest.raises(store.Invalid, match="行号越界"):
+        workflow.row_values(p, v, -1)
+    with pytest.raises(store.Invalid, match="行号越界"):
+        workflow.row_values(p, v, len(v.row_numbers))
+
+
+def test_row_values_returns_one_row(tmp_path):
+    p = _wb(tmp_path, [["编号", "序列"], ["1", "AAA"], ["2", "BBB"]])
+    v = workflow.read_source(p)
+    assert workflow.row_values(p, v, 1) == {0: "2", 1: "BBB"}
 
 
 # --- 公式回退（规格 5.3）----------------------------------------------------
@@ -130,6 +300,25 @@ def test_value_prefers_cached_result(tmp_path):
     assert workflow.row_values(p, v, 0)[1] == "42"
 
 
+def test_read_source_preview_falls_back_to_formula_text(tmp_path):
+    """read_source 里的公式回退是**另一处独立代码**，preview 会直接显示它。
+
+    不回退的表现：预览里整列公式显示成空白，用户以为列是空的。
+    """
+    p = Path(tmp_path) / "f2.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws.append(["编号", "长度", "序列"])
+    ws.append(["1", "=LEN(C1)", "AAA"])     # openpyxl 自己写的公式，没有缓存值
+    wb.save(p)
+    v = workflow.read_source(p)
+    assert v.preview[0][1] == "=LEN(C1)", "回退失效：预览里是空白"
+    assert v.preview[0][1].startswith("=")
+    assert v.preview[0][2] == "AAA"
+    assert v.row_numbers == [2]
+
+
 # --- context 列恒定性（规格 5.1）--------------------------------------------
 
 def test_context_column_must_be_constant(tmp_path):
@@ -139,6 +328,16 @@ def test_context_column_must_be_constant(tmp_path):
     workflow.check_context_columns(p, v, [1])         # 恒定，不抛
     with pytest.raises(store.Invalid):
         workflow.check_context_columns(p, v, [2])     # 序列在变，当 context 要报错
+
+
+def test_context_check_catches_change_after_second_row(tmp_path):
+    """只比前两行的实现会让「第 3 行起才变」的表蒙混过关——5000 行的表里
+    漏掉最后一行出错，用户拿到的就是一次静默的串味。"""
+    p = _wb(tmp_path, [["编号", "项目"], ["1", "XBR"], ["2", "XBR"],
+                       ["3", "XBR"], ["4", "XBR"], ["5", "ZZZ"]])
+    v = workflow.read_source(p)
+    with pytest.raises(store.Invalid, match="第 5 行"):
+        workflow.check_context_columns(p, v, [1])
 
 
 def test_context_check_ignores_blank_cells(tmp_path):
@@ -172,15 +371,19 @@ def test_extract_slots_dedupes_and_strips():
 
 
 def test_validate_binding_rejects_unbound_slot():
-    cols = [{"col_index": 0, "role": "input", "slot": "seq"}]
-    with pytest.raises(store.Invalid):
+    # 夹具里必须有一列 key：否则「必须有且只有一列标识列」会先抛，
+    # 这条用例就变成被错误的分支满足了（撤掉下面的校验照样全绿）。
+    cols = [{"col_index": 0, "role": "key"},
+            {"col_index": 1, "role": "input", "slot": "seq"}]
+    with pytest.raises(store.Invalid, match="没有列绑定"):
         workflow.validate_binding("查 {{seq}} 与 {{proj}}", cols)
 
 
 def test_validate_binding_rejects_unused_column():
-    cols = [{"col_index": 0, "role": "input", "slot": "seq"},
-            {"col_index": 1, "role": "context", "slot": "没人用"}]
-    with pytest.raises(store.Invalid):
+    cols = [{"col_index": 0, "role": "key"},
+            {"col_index": 1, "role": "input", "slot": "seq"},
+            {"col_index": 2, "role": "context", "slot": "没人用"}]
+    with pytest.raises(store.Invalid, match="没用到"):
         workflow.validate_binding("查 {{seq}}", cols)
 
 
@@ -193,6 +396,13 @@ def test_validate_binding_accepts_healthy_binding():
 
 
 def test_output_column_needs_a_known_field():
-    cols = [{"col_index": 0, "role": "output", "field": "随便写的"}]
-    with pytest.raises(store.Invalid):
+    cols = [{"col_index": 0, "role": "key"},
+            {"col_index": 1, "role": "output", "field": "随便写的"}]
+    with pytest.raises(store.Invalid, match="不认识"):
         workflow.validate_binding("x", cols)
+
+
+def test_validate_binding_needs_exactly_one_key_column():
+    cols = [{"col_index": 0, "role": "input", "slot": "seq"}]
+    with pytest.raises(store.Invalid, match="标识列"):
+        workflow.validate_binding("查 {{seq}}", cols)

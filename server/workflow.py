@@ -10,6 +10,7 @@ import re
 import shutil
 import uuid
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -63,10 +64,13 @@ def check_upload(filename: str, data: bytes) -> None:
 # --- 读表 -------------------------------------------------------------------
 
 def _row_at(ws, r: int, max_col: int) -> list:
-    """读 sheet 第 r 行的前 max_col 个值。
+    """读 sheet 第 r 行的前 max_col 个值。**只给 row_values 用**（逐行取值）。
 
     走 iter_rows 而不是逐格 cell()：read_only 工作簿上逐格调用极慢，
     而一次一行的迭代只解析一遍共享字符串表。
+
+    **不要写 ws.cell(..., values_only=True)**——cell() 返回 Cell 对象，
+    values_only 是 iter_rows 的参数，传给它直接 TypeError。
     """
     for tup in ws.iter_rows(min_row=r, max_row=r, max_col=max_col,
                             values_only=True):
@@ -105,11 +109,21 @@ def read_source(path: Path, header_row: int = 1) -> SheetView:
         max_col = wsv.max_column or 1
         row_numbers: list[int] = []
         preview: list[list[str]] = []
-        for r in range(header_row + 1, wsv.max_row + 1):
-            # 一次读整行。**不要写 ws.cell(..., values_only=True)**——cell()
-            # 返回 Cell 对象，values_only 是 iter_rows 的参数，传给它直接 TypeError。
-            row_vals = _row_at(wsv, r, max_col)
-            raw_vals = _row_at(wsr, r, max_col)
+        # **单遍顺序读完，绝不按行号反复定位。** read_only 工作簿上
+        # iter_rows(min_row=r, max_row=r) 每次都要从 XML 流头重新扫到第 r 行
+        # （openpyxl 的 ReadOnlyWorksheet._cells_by_row 每次调用都新建 parser），
+        # 于是逐行定位是 O(n^2)：实测 800 行 19.8 秒，而 Task 5 每放行一行就调
+        # 一次 read_source，用户看到的是「保存转圈很久没有任何提示」。
+        it_vals = wsv.iter_rows(min_row=header_row + 1, max_row=wsv.max_row,
+                                max_col=max_col, values_only=True)
+        it_raw = wsr.iter_rows(min_row=header_row + 1, max_row=wsv.max_row,
+                               max_col=max_col, values_only=True)
+        for r, pair in enumerate(zip_longest(it_vals, it_raw),
+                                 start=header_row + 1):
+            # zip_longest 补 None：两个工作簿行数不一致时短的那个按空行算。
+            row_vals, raw_vals = pair
+            row_vals = row_vals or ()
+            raw_vals = raw_vals or ()
             line = []
             for i in range(max_col):
                 val = row_vals[i] if i < len(row_vals) else None
@@ -165,23 +179,48 @@ def check_context_columns(path: Path, view: SheetView,
     """
     if not context_cols:
         return
-    # **两个工作簿只开一次，整表读进内存再比。** 逐行调 row_values 等于
+    # **两个工作簿只开一次，整表单遍读完再比。** 逐行调 row_values 等于
     # 每行重新 load 一遍——1000 行的表就是 2000 次整表加载，20MB 的表
     # 根本跑不完，而且用户看到的是「保存转圈很久没有任何提示」。
+    # 逐行调 _row_at 也一样糟：read_only 下定位第 r 行要从流头重扫，是 O(n^2)。
+    # 所以先单遍把要比较的值收齐，再逐列比——和原来的「先列后行」嵌套顺序
+    # 一致，报错时挑中的列与行号才不变。
+    if not view.row_numbers:
+        return
+    order: dict[int, int] = {}
+    for idx, r in enumerate(view.row_numbers):
+        order.setdefault(r, idx)      # 重复行号取第一次，与逐行比较的下标一致
+    first = min(order)
+    last = max(order)
+    # 按数据行下标存，row_numbers 里的下标原样保留（跳过的全空行不参与）。
+    col_values: dict[int, list[str]] = {
+        c: [""] * len(view.row_numbers) for c in context_cols}
     wb = load_workbook(path, data_only=True, read_only=True)
     wbr = load_workbook(path, data_only=False, read_only=True)
     try:
-        for col in context_cols:
-            seen = None
-            seen_row = 0
-            for idx, r in enumerate(view.row_numbers):
-                vals = _row_at(wb[view.sheet], r, view.col_count)
-                raws = _row_at(wbr[view.sheet], r, view.col_count)
+        it_vals = wb[view.sheet].iter_rows(min_row=first, max_row=last,
+                                           max_col=view.col_count,
+                                           values_only=True)
+        it_raw = wbr[view.sheet].iter_rows(min_row=first, max_row=last,
+                                          max_col=view.col_count,
+                                          values_only=True)
+        for r, pair in enumerate(zip_longest(it_vals, it_raw), start=first):
+            idx = order.get(r)
+            if idx is None:
+                continue
+            vals, raws = pair
+            vals = vals or ()
+            raws = raws or ()
+            for col in context_cols:
                 val = vals[col] if col < len(vals) else None
                 raw = raws[col] if col < len(raws) else None
                 if val is None and isinstance(raw, str) and raw.startswith("="):
                     val = raw
-                val = str(val)[:CELL_MAX] if val is not None else ""
+                col_values[col][idx] = str(val)[:CELL_MAX] if val is not None else ""
+        for col in context_cols:
+            seen = None
+            seen_row = 0
+            for idx, val in enumerate(col_values[col]):
                 if val == "":
                     continue
                 if seen is None:
