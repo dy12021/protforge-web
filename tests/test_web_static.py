@@ -656,7 +656,7 @@ def test_preview_updates_right_away_without_pressing_anything():
     here = _func_body(js, "renderHere")
     assert "api(" not in here and "fetch(" not in here, \
         "预览去打了接口：没保存的改动服务端看不见，而且每敲一个字打一次会打爆"
-    assert "replace(" in here and "previewValues" in here, \
+    assert "renderSlots(" in here and "previewValues" in here, \
         "预览没有就地按当前行的值渲染"
 
     lp = _func_body(js, "loadPreview")
@@ -666,8 +666,15 @@ def test_preview_updates_right_away_without_pressing_anything():
 
     # 槽位语法与服务端同一套。两份实现（本地预览 / 服务端渲染）最容易悄悄分家，
     # 分家之后预览给的那句话与真正跑下去的那句话不是同一句。
+    #
+    # **这里只钉形状**：改 SLOT_RE 的内容这条抓不到（上一轮复审把正则改窄，
+    # 38 条全绿）。真正的围栏是把两边都跑一遍逐句对比：
+    # tests/test_workflow_preview_parity.py（经 node 调 web/workflow.js 的
+    # renderSlots，与服务端 workflow.render() 对同一批用例的结果）。
     assert re.search(r"const\s+SLOT_RE\s*=\s*/\\\{\\\{", js), \
         "本地预览没有声明与服务端同构的槽位语法"
+    assert "function renderSlots(" in js, \
+        "槽位替换没有拆成可单独调用的纯函数：跨语言一致性围栏够不着它"
     srv = _server("workflow.py")
     assert r"\{\{\s*([^{}\s]+)\s*\}\}" in srv, \
         "服务端槽位语法变了：本地预览的 SLOT_RE 要跟着改"
@@ -765,11 +772,18 @@ def test_homepage_links_to_the_workflow_page():
 
 
 def test_workflow_detail_can_filter_to_failed_rows_only():
-    """规格 8.3 第二条：行任务的故障排查走工作流详情页，那里有「只看失败行」的筛选。"""
+    """规格 8.3 第二条：行任务的故障排查走工作流详情页，那里有「只看失败行」的筛选。
+
+    筛的判据是 :func:`isFailedRow`（它把「跳过」排除在外，见 Major-1），不是
+    ``row.status !== "failed"``：按 status 筛的话，用户自己刚跳过的行会混在故障
+    行里一起列出来，而那件事的处理方式正好相反（不用管 vs 要查）。
+    真正跑起来的那条围栏在 tests/frontend_smoke.mjs——这里只钉「开关真的接在
+    重绘上」，断的是形状不是行为。
+    """
     html = _html("workflow.html")
     assert 'id="wf-only-failed"' in html, "详情页没有「只看失败行」的开关"
     js = _js("workflow.js")
-    assert re.search(r'onlyFailed\s*&&\s*row\.status\s*!==\s*"failed"', js), \
+    assert re.search(r'onlyFailed\s*&&\s*!isFailedRow\(', js), \
         "开关没有真的在筛行（不是只染个色或者只在文案里写「只看失败行」）"
     assert re.search(r'\$?\(\s*["\']#wf-only-failed["\']\s*\)', js) \
         and "change" in js, "开关没有绑 change 事件，点了不重绘"

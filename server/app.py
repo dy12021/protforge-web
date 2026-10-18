@@ -290,6 +290,17 @@ def _row_stats(workflow_ids) -> dict:
     （规格 6.3 闸门②），同一时刻至多有一行没进终态，所以最小的那行就是当前行。
     连它的 status 一起返回，规格 7.5 要的「第 N 行停在打包中」才写得出来——
     只报行号的话，packaging 卡住与计算中在卡片上长得一模一样。
+
+    **跳过的行不算失败（Major-1）**：用户在库里看到的跳过行，status 是
+    ``failed``（补偿任务建出来就是终态，db.VALID_STATUSES 里没有 ``skipped``——
+    加它是 CHECK 迁移，表重建级别，见 fix2-report 的取舍），而同一行在结果表里
+    写的是「已跳过」。这里不排除的话就是**表说一套、卡片说另一套**：跳 2 行 →
+    表里两行「已跳过」，卡片标红「失败 2 行」，「只看失败行」也把它们列出来。
+    用户分不清「这行是我跳过的」（不用管）和「这行跑失败了」（要查）——
+    而这两件事的处理方式正好相反。
+
+    判据用 ``workflow_skips``（唯一事实）而不是 status：``failed`` 这一个值
+    同时装着两种完全相反的语义，按 status 分不开。
     """
     ids = [int(i) for i in workflow_ids]
     out = {i: {"failed_rows": 0, "current_row": None, "current_status": None}
@@ -302,6 +313,12 @@ def _row_stats(workflow_ids) -> dict:
         rows = c.execute(
             "SELECT workflow_id, status, COUNT(*), MIN(workflow_row)"
             f" FROM tasks WHERE workflow_id IN ({marks})"
+            # **排除被跳过的行**（见上面的 docstring）。workflow_row 为 NULL 的
+            # 行（普通任务）不在 workflow_skips 里，NOT EXISTS 判不出来就被留下，
+            # 所以这条不影响非工作流任务。仍然是**一条** GROUP BY，没有 N+1。
+            " AND NOT EXISTS (SELECT 1 FROM workflow_skips s"
+            " WHERE s.workflow_id = tasks.workflow_id"
+            " AND s.row_index = tasks.workflow_row)"
             " GROUP BY workflow_id, status", ids).fetchall()
     finally:
         c.close()

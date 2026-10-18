@@ -118,6 +118,10 @@ _AGENT_SCRIPT_ENV = "PROTFORGE_WEB_AGENT_SCRIPT"
 #:
 #: **不要做「超时后重排」**：重排会让同一行被写两次，重复写竞态引入的
 #: 数据损坏比它解决的问题更糟。宁可让这一行慢慢等，也不写第二次。
+#:
+#: **并发是按工作流分段的，不是按行的**（Major-2）：同一工作流任意时刻只有一行
+#: 在途（见 `_archive_wf_busy` 与 `_archive_wf_lock`），不同工作流之间仍然各跑各的。
+#: 分段而不是全局一把锁，是这个下限 2 还有意义的前提。
 ARCHIVE_WORKERS = 2
 #: 入队多久还没写完，就给该行记一条用户可见的「卡住了」。正常 write_back
 #: 几秒内返回，超过 30 秒基本可以断定结果表在网络盘上或被占用。
@@ -807,6 +811,17 @@ class Dispatcher:
         self._archive_lock = threading.Lock()
         self._archive_q: queue.Queue = queue.Queue()
         self._archive_inflight: set[int] = set()
+        #: **已经在队列里或正在写的工作流**。同一工作流任意时刻至多一行在途：
+        #: 结果表是**同一个文件**，两条 write_back 同时进去就是 read-modify-write
+        #: 互相覆盖——后写的拿它自己那份更早读到的旧内容盖上去，前一行的值永久
+        #: 丢失，而两行都会 workflow_archived=1，归档 pass 再也不会回头（Major-2）。
+        #: 按 task_id 去重挡不住这个：同一工作流的两行各有各的 task_id。
+        #: 与 `_archive_wf_locks` 是两道：**入队时**这条保证一个卡住的工作流只占
+        #: 一条线程（平台不会整体停摆），**执行时**那把锁兜住一切别的入口。
+        self._archive_wf_busy: set[int] = set()
+        #: workflow_id -> 它自己的归档锁。**分段加锁**：不同工作流各拿各的锁，
+        #: 跨工作流仍然并发（全局一把锁会把归档串成单线程）。
+        self._archive_wf_locks: dict[int, threading.Lock] = {}
         #: 代表线程（池里第 0 条）。既有断言和外部代码只看一条，留个引用。
         self._archive_thread: threading.Thread | None = None
         self._archive_threads: list[threading.Thread] = []
@@ -1412,12 +1427,21 @@ class Dispatcher:
             for row in rows:
                 task_id = int(row["id"])
                 with self._archive_lock:
+                    # **同工作流至多一行在途**（Major-2）：入队那一刻就掐住，
+                    # 而不是在执行时才发现要排队。原因不是"少一点并发"，
+                    # 是结果表只有一个文件——两条 write_back 同时进去，后写的
+                    # 拿它更早读到的旧内容盖上去，前一行的值永久丢失，两行却
+                    # 都 workflow_archived=1，**不报错也不再重试**。
+                    # 顺带的好处：一个卡住的工作流只占一条线程，别的批次照跑。
+                    if wid in self._archive_wf_busy:
+                        break                      # 同一个工作流，后面的行等下一轮
                     # **在途去重**：这一行已经在队列里/正在写，就不再排一次。
                     # 只靠 store 的 workflow_archived = 0 是不够的——那一列要等
                     # 写完才置位，而整表重写中间有两秒。
                     if task_id in self._archive_inflight:
                         continue
                     self._archive_inflight.add(task_id)
+                    self._archive_wf_busy.add(wid)
                     # **入队时刻**：看门狗靠它算「这一行卡了多久」。用
                     # monotonic 而不是 time.time()——系统时间被对时调回，
                     # time() 会算出负的耗时，告警就永远不触发。
@@ -1535,6 +1559,8 @@ class Dispatcher:
             finally:
                 with self._archive_lock:
                     self._archive_inflight.discard(task_id)
+                    # 这一行收工了，它的工作流才允许再排下一行（入队时那道闸门）。
+                    self._archive_wf_busy.discard(wid)
                     self._archive_queued_at.pop(task_id, None)
                     self._archive_warned.discard(task_id)
                 try:
@@ -1542,25 +1568,51 @@ class Dispatcher:
                 except Exception:                  # noqa: BLE001
                     log.exception("归档完成广播失败")
 
+    def _archive_wf_lock(self, wid: int) -> threading.Lock:
+        """这个工作流自己的归档锁。**按 workflow_id 分段**，不是一把全局锁。
+
+        全局锁会把归档整体串成单线程——500 行的批次每行一次整表重写，全排成一条
+        队就是十几分钟，而 ARCHIVE_WORKERS 的下限 2 正是为了不让一条卡住的
+        write_back 把**所有工作流**一起停住。按工作流分段之后：同一工作流串行
+        （结果表只有一个文件，必须），跨工作流照旧并发。
+
+        取锁时**不持有** `_archive_lock`：否则一条正在写盘的归档线程会把
+        `_archive_lock` 攥在手里去等写盘，而 tick 线程同时在 `_archive_lock`
+        上排队（它每轮都要加锁入队），写盘那条收尾时又要这把锁——那是真的死锁。
+        """
+        with self._archive_lock:
+            lock = self._archive_wf_locks.get(int(wid))
+            if lock is None:
+                lock = threading.Lock()
+                self._archive_wf_locks[int(wid)] = lock
+            return lock
+
     def _archive_job(self, wid: int, task_id: int) -> None:
         """执行一次归档。**先重读这一行**：入队到真正执行之间可能已被归档过
-        （比如上一轮已经写完、这一轮才轮询到），重读是唯一的真相来源。"""
-        try:
-            wf = store.get_workflow(wid)
-            row = store.get_task(task_id)
-        except Exception:                          # noqa: BLE001
-            log.exception("重读待归档行 %s 失败", task_id)
-            return
-        if int(row.get("workflow_archived") or 0):
-            return
-        self._archive_one(wf, row)
-        try:
-            # writeback_pending 的语义就是「还有没有终态没归档的行」。写成功一
-            # 行不代表整批都补上了，所以这里重新查一次再清，而不是顺手清零。
-            if not store.workflow_unarchived_terminal_rows(wid):
-                store.update_workflow(wid, writeback_pending=0)
-        except Exception:                          # noqa: BLE001
-            log.exception("校准工作流 %s 的 writeback_pending 失败", wid)
+        （比如上一轮已经写完、这一轮才轮询到），重读是唯一的真相来源。
+
+        整个执行体在**该工作流自己的锁**里（Major-2）：`_archive_one` 里是一次
+        read-modify-write（load 结果表 → 改一格 → 整表 save），同一个 dest 上
+        两条同时做就是互相覆盖，且**两行都会被置 workflow_archived=1**，于是丢
+        掉的那一格永远补不回来。跨工作流各拿各的锁，吞吐不受影响。
+        """
+        with self._archive_wf_lock(wid):
+            try:
+                wf = store.get_workflow(wid)
+                row = store.get_task(task_id)
+            except Exception:                      # noqa: BLE001
+                log.exception("重读待归档行 %s 失败", task_id)
+                return
+            if int(row.get("workflow_archived") or 0):
+                return
+            self._archive_one(wf, row)
+            try:
+                # writeback_pending 的语义就是「还有没有终态没归档的行」。写成功一
+                # 行不代表整批都补上了，所以这里重新查一次再清，而不是顺手清零。
+                if not store.workflow_unarchived_terminal_rows(wid):
+                    store.update_workflow(wid, writeback_pending=0)
+            except Exception:                      # noqa: BLE001
+                log.exception("校准工作流 %s 的 writeback_pending 失败", wid)
 
     def _archive_one(self, wf: dict, row: dict) -> None:
         """归档**一行**：写回结果表 + 置 workflow_archived。逐行，不是整批。"""

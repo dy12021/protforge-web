@@ -95,7 +95,36 @@ const WF_STATUS_LABEL = {
 const ROW_STATUS_LABEL = {
   queued: "已排队", running: "计算中", packaging: "打包中",
   done: "已完成", failed: "失败",
+  /* skipped **不是** tasks.status 里的值（那套词没有它，见下面的 rowStatus）：
+     它是界面按 workflow_skips 推出来的第五种显示态。 */
+  skipped: "已跳过",
 };
+
+/* ---------------------------------------------------------------- 跳过 */
+
+/* 用户跳过的行，在库里 status 是 failed（补偿任务建出来就是终态，
+   db.VALID_STATUSES 里没有 skipped —— 加它是 CHECK 迁移、表重建级别），
+   而同一行在结果表里写的是「已跳过」。两处说的不是一回事就是 Major-1：
+   界面跟着 status 走的话，跳过 2 行会标红「失败 2 行」，用户分不清
+   「这行是我跳过的」（不用管）和「这行跑失败了」（要查）。
+
+   **判据只有 workflow_skips 一处**，与服务端 _row_stats 的 NOT EXISTS 是
+   同一条排除条件。卡片数、详情数、只看失败行的筛选、状态色与文案全从
+   rowStatus 走 —— 别在别处再写一次 status === "failed"。 */
+function skipSet(d) {
+  return new Set((d && d.skips) || []);
+}
+
+/** 面向用户的那一行是什么状态。**跳过优先于 status**：跳过的行按语义就没跑过，
+    跑没跑过与失败不失败都轮不到它。 */
+function rowStatus(row, skips) {
+  return skips.has(Number(row.workflow_row)) ? "skipped" : (row.status || "queued");
+}
+
+/** 「只看失败行」与两个失败计数共用这一条判据。 */
+function isFailedRow(row, skips) {
+  return rowStatus(row, skips) === "failed";
+}
 
 let wfId = null;
 let wfSheet = "";
@@ -219,7 +248,8 @@ function renderSummary() {
   const total = Number(lastDetail && lastDetail.workflow
     ? lastDetail.workflow.total_rows : 0) || 0;
   const rows = (lastDetail && lastDetail.rows) || [];
-  const failed = rows.filter((r) => r.status === "failed").length;
+  const skips = skipSet(lastDetail);
+  const failed = rows.filter((r) => isFailedRow(r, skips)).length;
   lines.push(`表格：${wfSheet ? "工作表 " + wfSheet : "—"}，共 ${total} 行，逐行串行跑。`);
   lines.push("列：" + (colsModel.map(
     (c) => `${c.header || "列" + (c.col_index + 1)}→${ROLE_LABEL[c.role] || c.role}`
@@ -319,9 +349,11 @@ async function openDetail(id) {
     `${done} / ${total} 行` + (wf.abort_requested ? " · 已请求中止" : "");
 
   // 详情页的失败数从**这份行数据**里数出来（列表端的聚合值在这里不够细：
-  // 筛选、逐行排查都要对着真实的行）。
+  // 筛选、逐行排查都要对着真实的行）。跳过的行不进这个数——它没跑过，
+  // 不是跑失败了（跳过的判据见 skipSet）。
   const rows = d.rows || [];
-  const failed = rows.filter((r) => r.status === "failed").length;
+  const skips = skipSet(d);
+  const failed = rows.filter((r) => isFailedRow(r, skips)).length;
   const failedBox = $("#wf-failed");
   failedBox.textContent = failed > 0 ? `失败 ${failed} 行` : "没有失败行";
   failedBox.className = failed > 0 ? "who wf-failed is-bad" : "who";
@@ -443,12 +475,16 @@ function renderRows(d) {
   // 表头是「行号列 + 每一列角色」共 1+N 格，所以数据行也必须 1+N 格。
   // 少写一个 td，浏览器会把后面的行整体左移，读起来像是列错位了。
   const cols = colsModel;
+  // 跳过的行**一律按 skipped 显示**（不按 status）：筛不筛、什么颜色、什么
+  // 文案，全走 rowStatus 一处。
+  const skips = skipSet(d);
   // 「只看失败行」是**真筛**：非失败的行根本不进 DOM，不是给它们调透明度
-  // ——筛完还让人以为「整批只有这几行跑过」比筛不出来更坏。
+  // ——筛完还让人以为「整批只有这几行跑过」比筛不出来更坏。跳过的行同样
+  // 不进筛选结果：用户点它是为了找要排查的行，不是找自己刚跳掉的行。
   const onlyFailed = !!$("#wf-only-failed").checked;
   let shown = 0;
   for (const row of d.rows) {
-    if (onlyFailed && row.status !== "failed") continue;
+    if (onlyFailed && !isFailedRow(row, skips)) continue;
     shown++;
     const tr = document.createElement("tr");
     tr.dataset.row = String(row.workflow_row);
@@ -464,12 +500,13 @@ function renderRows(d) {
       if (col.role === "output") {
         // 结果列放行任务的状态，前面缀一颗状态色点：格子里的值在表格里，
         // 归档回 Excel 才有；这里显示状态，不是假装已经读到结果。
+        const st = rowStatus(row, skips);
         const dot = document.createElement("span");
         dot.className = "wf-dot";
-        dot.dataset.status = row.status || "queued";
+        dot.dataset.status = st;
         td.appendChild(dot);
         td.appendChild(document.createTextNode(
-          ROW_STATUS_LABEL[row.status] || row.status || ""));
+          ROW_STATUS_LABEL[st] || st || ""));
       }
       tr.appendChild(td);
     }
@@ -507,6 +544,25 @@ async function loadPreview(rowIndex) {
   renderHere();
 }
 
+/** 槽位替换本身：把 {{名称}} 换成取值，没绑定的槽位渲染成空串。
+ *
+ *  **与服务端 workflow.render() 是两份实现**（这个项目吃过十几次「同一件事
+ *  写了两份，改了一份另一份还在跑」的亏），所以把它单独拆成一个纯函数，
+ *  并且有一条围栏**真的把两边都跑一遍**逐句对比：
+ *  同一段模板 + 同一组取值，两边必须给出同一句话
+ *  （tests/test_workflow_preview_parity.py，经 node 调 web/workflow.js）。
+ *
+ *  单独拆出来不是为了好看：拆之前这段 replace 埋在 renderHere 里，
+ *  只能靠整页跑起来才够得着，围栏也就只能去断「文件里出现过某个词」。
+ */
+function renderSlots(tpl, slots) {
+  const re = new RegExp(SLOT_RE.source, "g");
+  return (tpl || "").replace(re, (_m, name) => {
+    const v = slots ? slots[name] : undefined;
+    return v === undefined || v === null ? "" : String(v);
+  });
+}
+
 /** 就地渲染当前行的提示词。**不发请求**。
  *
  *  「立刻」的判据：改了列角色、变量名或模板之后，不点任何按钮，
@@ -515,9 +571,13 @@ async function loadPreview(rowIndex) {
  *  为什么本地算而不是拉接口：① 每敲一个字打一次预览端点会把接口打爆，
  *  节流也仍然是「打完还在等」；② 那个端点渲染的是**已保存**的配置，
  *  保存前它给的一直是旧句子——节流多少毫秒都做不到「立刻」。
- *  代价是这份槽位替换与服务端 workflow.render() 是两份实现，
- *  所以语法（SLOT_RE）与「没绑定的槽位渲染成空串」都写死成同一套，
- *  保存之后服务端那条路会再渲染一次盖回来，对不上时以服务端为准。
+ *  代价是与服务端那份分家，所以语法（SLOT_RE）与「没绑定的槽位渲染成空串」
+ *  都写死成同一套，并由 renderSlots 那条一致性围栏盯着两边不许漂。
+ *
+ *  **保存之后仍然以本地这份为准**：/preview 也返回服务端那份 rendered，
+ *  但它渲染的是**已保存**的配置，用户还在改的时候贴上去看着像没生效
+ *  （test_web_static 专门断着不许贴）。保存完 openDetail 会重拉一次，
+ *  那时本地这份已经是保存后的配置，两边自然一致。
  */
 function renderHere() {
   const slots = {};
@@ -526,12 +586,8 @@ function renderHere() {
       slots[(c.slot || "").trim()] = previewValues[c.col_index];
     }
   }
-  const tpl = $("#wf-template").value || "";
-  const re = new RegExp(SLOT_RE.source, "g");
-  $("#wf-preview").textContent = tpl.replace(re, (_m, name) => {
-    const v = slots[name];
-    return v === undefined || v === null ? "" : String(v);
-  });
+  $("#wf-preview").textContent =
+    renderSlots($("#wf-template").value || "", slots);
 }
 
 /* ---------------------------------------------------------------- 动作 */

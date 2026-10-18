@@ -500,6 +500,89 @@ def test_admin_can_read_but_not_control(client, auth_headers, admin_headers,
 
 # ---------------------------------------------------------------- 跳过
 
+def _card(client, headers, wid):
+    """列表端点给这张卡片的那一份视图（failed_rows 只在这里挂）。"""
+    r = client.get("/api/workflows", headers=headers)
+    assert r.status_code == 200, r.text
+    for w in r.json()["workflows"]:
+        if int(w["id"]) == int(wid):
+            return w
+    raise AssertionError(f"列表里没有 {wid}")
+
+
+def test_failed_rows_counts_the_rows_that_really_failed(client, auth_headers,
+                                                         one_workflow):
+    """Minor-1：``failed_rows`` 是**算出来的数**，不是恒 0，也不是「源码里出现过 failed」。
+
+    上一轮这条只有源码文本围栏：把 ``out[wid]["failed_rows"] = int(r[2])`` 改成
+    ``= 0``（保留 ``if r["status"] == "failed"`` 字面量），143 条全绿——卡片于是对
+    任何工作流恒显「没有失败行」，对着没发生过的故障报平安，而规格 7.4 把它列为
+    最显眼处。所以这里断**返回值**：一行真失败 + 一行已完成，数出来必须是 1。
+    """
+    wid, row = one_workflow["id"], one_workflow["row_id"]
+    store.update_task(row, status="failed", error="崩了")
+    ok = store.create_task("第 2 行", "b", owner_id=int(
+        store.get_workflow(wid, is_admin=True)["owner_id"]),
+        actor="system", workflow_id=wid, workflow_row=1)
+    store.update_task(ok["id"], status="done", summary="算完了")
+
+    assert _card(client, auth_headers, wid)["failed_rows"] == 1, \
+        "真失败的那一行没被数进 failed_rows——卡片恒显「没有失败行」"
+
+    store.update_task(row, status="done")          # 故障处理完了，计数要跟着回落
+    assert _card(client, auth_headers, wid)["failed_rows"] == 0
+
+
+def test_skipped_rows_are_not_reported_as_failed(client, auth_headers, one_workflow):
+    """Major-1：用户跳过的行，**卡片上不得表现为失败**。
+
+    跳过的行在 tasks 里 status 是 failed（补偿任务建出来就是终态），
+    而同一行在结果表里写的是「已跳过」。不排除的话：跳 1 行 → 表里「已跳过」，
+    卡片标红「失败 1 行」，「只看失败行」也把它列出来——两件事的处理方式正好相反
+    （前者不用管，后者要查），用户分不清。
+
+    混合断言是必要的：只测「全跳过时是 0」，把整个统计改成恒 0 也能过。
+    """
+    wid, row = one_workflow["id"], one_workflow["row_id"]
+    store.update_task(row, status="failed", error="用户跳过，未运行")
+    store.skip_workflow_row(wid, 0, "序列坏了")
+    # 夹具自证：这一行确实长得跟真失败一模一样（这正是必须靠 workflow_skips 区分的原因）
+    assert store.get_task(row)["status"] == "failed"
+    assert _card(client, auth_headers, wid)["failed_rows"] == 0, \
+        "跳过的行被算成失败行了：卡片说「失败」，结果表说「已跳过」"
+
+    # 同一个工作流里再来一行**真**失败：它必须照常被数进去。
+    real = store.create_task("第 2 行", "b", owner_id=int(
+        store.get_workflow(wid, is_admin=True)["owner_id"]),
+        actor="system", workflow_id=wid, workflow_row=1)
+    store.update_task(real["id"], status="failed", error="真的崩了")
+    assert _card(client, auth_headers, wid)["failed_rows"] == 1, \
+        "真失败的行也被一起排除了——那是对着故障报平安"
+
+    # 跳过一整行之后，行状态仍然是那条补偿任务的 failed（数据模型没改，
+    # 改 CHECK 是表重建级别的迁移，见 fix2-report）；界面那一侧由
+    # workflow_skips 判，两边说的是同一件事。
+    detail = client.get(f"/api/workflows/{wid}", headers=auth_headers).json()
+    assert detail["skips"] == [0]
+    assert [r["status"] for r in detail["rows"]] == ["failed", "failed"]
+
+
+def test_skipped_rows_do_not_hide_the_current_row(client, auth_headers,
+                                                  one_workflow):
+    """排除跳过行不许顺手把 current_row 也算没**：跳过是终态，不影响当前行。"""
+    wid, row = one_workflow["id"], one_workflow["row_id"]
+    store.update_task(row, status="failed", error="用户跳过，未运行")
+    store.skip_workflow_row(wid, 0, "序列坏了")
+    live = store.create_task("第 2 行", "b", owner_id=int(
+        store.get_workflow(wid, is_admin=True)["owner_id"]),
+        actor="system", workflow_id=wid, workflow_row=1)
+    store.update_task(live["id"], status="running")
+
+    card = _card(client, auth_headers, wid)
+    assert card["current_row"] == 1, "在跑的那一行不见了：卡片会以为整批没在动"
+    assert card["current_status"] == "running"
+
+
 def test_skip_terminates_row_and_records_reason(client, auth_headers, one_workflow):
     wid, row = one_workflow["id"], one_workflow["row_id"]
     r = client.post(f"/api/workflows/{wid}/rows/1/skip", headers=auth_headers,

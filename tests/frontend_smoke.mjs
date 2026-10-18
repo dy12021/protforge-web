@@ -112,7 +112,19 @@ function makeDom(byId) {
       if (!byId.has(id)) byId.set(id, makeEl('div', id));
       return byId.get(id);
     },
-    querySelector: () => makeEl('div'),    querySelectorAll: () => [],
+    // **#id 选择器与 getElementById 返回同一个节点**（真 DOM 就是同一个）。
+    // 原来这里每次返回一个全新的桩，于是页面写进去的内容在桩外面根本读不到，
+    // 「渲染结果对不对」这类断言一条也写不出来——只能去断源码里有没有某个词。
+    // 非 id 的选择器（.class 之类）按选择器缓存一个桩，但不进 byId：
+    // stringifyLeaks 只扫 byId，保持它原来只看得到 getElementById 建出来的那些。
+    querySelector(sel) {
+      const s = String(sel);
+      if (s.startsWith('#')) return doc.getElementById(s.slice(1));
+      if (!doc._q) doc._q = new Map();
+      if (!doc._q.has(s)) doc._q.set(s, makeEl('div', s));
+      return doc._q.get(s);
+    },
+    querySelectorAll: () => [],
     addEventListener() {},
   };
   return doc;
@@ -150,12 +162,17 @@ function loadFixtures() {
   // 未知路径的兜底是 {}，于是 d.workflows 会是 undefined，
   // for...of 直接抛 TypeError——所以这一段缺了会让冒烟红。
   //
-  // 三条从代码里核出来、照抄直觉会写错的点：
-  //   1. **没有 writeback 字段**：_wf_view() 明确把它 pop 掉了（v1 不暴露）。
-  //      夹具里加一个 writeback: false 会让前端以为它存在，掩盖真 bug。
-  //   2. workflow.status 的 CHECK 是 ('draft','running','paused','finished')，
+  // 四条从代码里核出来、照抄直觉会写错的点：
+  //   1. **writeback 是返回的**（M-4 把 _wf_view 里的 pop 去掉了，规格 2 决策表
+  //      「回写是可开关」）。前端 workflow.js 真的在读 wf.writeback 去勾那颗
+  //      复选框，夹具里缺这个键的话勾选框恒为未勾选，看着像"开关坏了"。
+  //   2. **行级统计只在列表端点挂**（app.py 的 _wf_view(stats) 注释写明）：列表
+  //      的每张卡片带 failed_rows / current_row / current_status，**详情端点的
+  //      workflow 没有这三个键**。夹具必须照抄这个差别，否则卡片会走缺键分支
+  //      显示「失败行数没算出来」——真实接口不会那么说。
+  //   3. workflow.status 的 CHECK 是 ('draft','running','paused','finished')，
   //      **终态是 finished，不是 done**（行任务才是 done/failed）。
-  //   3. 详情路由还返回 skips；列表只返回 workflows 一个键。
+  //   4. 详情路由还返回 skips；列表只返回 workflows 一个键。
   //
   // 键的顺序有讲究：stubFetch 用 startsWith(k + '/') 找夹具，**先插入的赢**。
   // 具体的（/preview）必须排在笼统的（/api/workflows）前面，否则预览会拿到
@@ -165,9 +182,11 @@ function loadFixtures() {
     sheet: 'Sheet1', source_path: 'C:/data/workflows/wf1/source.xlsx',
     prompt_template: '请计算 {{seq}}',
     header_row: 1, key_col: 0,
-    total_rows: 3, cursor: 1,
+    total_rows: 4, cursor: 3,
+    writeback: 1,
     writeback_pending: 0, abort_requested: 0,
-    result_path: '', created_at: '2026-10-18 10:00:00',
+    result_path: 'C:/data/workflows/wf1/result.xlsx',
+    created_at: '2026-10-18 10:00:00',
     updated_at: '2026-10-18 10:05:00',
   };
   FIXTURES['/api/workflows/1/preview'] = {
@@ -186,16 +205,30 @@ function loadFixtures() {
       { id: 3, workflow_id: 1, col_index: 2, header: '结果',
         role: 'output', slot: '', field: 'summary' },
     ],
-    skips: [],
+    // 第 3 行被用户跳过，第 4 行是真跑失败的。**跳过的行在 tasks 里 status 就是
+    // failed**（补偿任务建出来就是终态，tasks.status 的 CHECK 里没有 skipped），
+    // 界面必须靠 workflow_skips 把它显示成「已跳过」——否则表里写「已跳过」、
+    // 卡片标红「失败 2 行」，用户分不清「我跳过的」和「跑失败的」。
+    skips: [2],
     // 行就是普通计算任务（tasks 表），status 走主链那套词
     rows: [
       { id: 11, title: '行 1', status: 'done', summary: '算完了', error: '',
         workflow_id: 1, workflow_row: 0, workflow_archived: 1 },
       { id: 12, title: '行 2', status: 'running', summary: '', error: '',
         workflow_id: 1, workflow_row: 1, workflow_archived: 0 },
+      { id: 13, title: '行 3 · 已跳过', status: 'failed',
+        summary: '用户跳过：序列坏了', error: '用户跳过，未运行',
+        workflow_id: 1, workflow_row: 2, workflow_archived: 0 },
+      { id: 14, title: '行 4', status: 'failed',
+        summary: '', error: '计算进程崩了',
+        workflow_id: 1, workflow_row: 3, workflow_archived: 0 },
     ],
   };
-  FIXTURES['/api/workflows'] = { workflows: [WF] };
+  FIXTURES['/api/workflows'] = {
+    // 列表比详情多三个统计键（见上面第 2 条）
+    workflows: [Object.assign({}, WF,
+      { failed_rows: 1, current_row: 1, current_status: 'running' })],
+  };
   FIXTURES['/api/workflows/upload'] = {
     workflow: WF, headers: ['标识', '序列', '结果'], row_count: 3,
     preview: [['A1', 'SEQ-001', '']],
@@ -296,6 +329,128 @@ function boardColumns(byId) {
   const b = byId.get('board');
   if (!b) return 0;
   return (b.children || []).filter((c) => c && c.className === 'col').length;
+}
+
+/**
+ * 一个节点在页面上显示出来的那句话：**要递归拼子节点**。
+ *
+ * 桩的 textContent 只存「直接赋值」的那一句，而 appendChild 挂上去的文本节点
+ * 不在里面——真 DOM 里 td.textContent 会把子节点全算上。表格里那一格是
+ * 「色点 span + 文本节点」拼出来的，只读 textContent 一律是空串，于是任何
+ * 「这一格写着什么」的断言都会变成恒假的反面（读出来永远是空，比对什么都失败）。
+ */
+function textOf(node) {
+  if (!node) return '';
+  const kids = node.children || [];
+  if (!kids.length) return node.textContent || '';
+  return kids.map(textOf).join('');
+}
+
+/**
+ * Major-1 的行为围栏：用户跳过的行，在**每一处面向用户的地方**都不是失败。
+ *
+ * 这里真的调页面的函数（openDetail / renderRows），断的是**渲染结果**，
+ * 不是「文件里出现过某个词」。上一轮复审把 failed_rows 改成恒 0 时 143 条
+ * 全绿——那就是文本围栏的代价；而这一条把数改回去它就红。
+ *
+ * 夹具里同时放了一行**真**失败（第 4 行）：只有「跳过不算失败」这一半的话，
+ * 把整个统计改成恒 0 也能过。四处一起看：卡片式的详情失败数、筛选结果、
+ * 状态文案、状态色点。
+ */
+async function checkSkippedRows(r) {
+  const detail = FIXTURES['/api/workflows/1'];
+  const box = (id) => r.sandbox.document.getElementById(id);
+  await r.sandbox.openDetail(1);
+
+  // ① 详情页顶部的失败数：跳过的行不进，真失败的那行照进
+  const failed = box('wf-failed');
+  if (textOf(failed) !== '失败 1 行') {
+    return [`详情页的失败数是「${textOf(failed)}」，应该是「失败 1 行」` +
+            '（跳过的行被算成失败了）'];
+  }
+  if (!/is-bad/.test(failed.className)) {
+    return ['真失败的那一行没标红'];
+  }
+
+  // ② 表格里那一行显示的是「已跳过」，色点也是 skipped 而不是 failed
+  const body = box('wf-body');
+  const rowOf = (n) => (body.children || []).find((tr) => tr.dataset.row === String(n));
+  // 一行的结构是 [行号 th, ...每一列的 td]；只有结果列那一格带状态（色点 + 文案）
+  const statusCell = (n) => {
+    const tr = rowOf(n);
+    return tr ? (tr.children || []).slice(1).find((td) => (td.children || []).length) : null;
+  };
+  const skippedCell = statusCell(2);
+  const realCell = statusCell(3);
+  const bad = [];
+  if (!skippedCell) {
+    bad.push('跳过的行根本没渲染出来');
+  } else {
+    if (textOf(skippedCell) !== '已跳过') {
+      bad.push(`跳过的那一行显示「${textOf(skippedCell)}」，应该是「已跳过」`);
+    }
+    const dot = skippedCell.children[0];
+    if (!dot || dot.dataset.status !== 'skipped') {
+      bad.push(`跳过那一行的状态色点还是 ` +
+               `${dot ? dot.dataset.status : '没有'}，是红的（=失败）`);
+    }
+  }
+  if (!realCell || !realCell.children[0]
+      || realCell.children[0].dataset.status !== 'failed') {
+    bad.push('真失败的那一行没有被标成 failed——修过头了');
+  }
+
+  // ③「只看失败行」：只剩真失败的那一行，跳过的不许混进来
+  box('wf-only-failed').checked = true;
+  // 桩的 innerHTML = '' 不清 children（真 DOM 会），这里手动清一下再重绘
+  body.children.length = 0;
+  r.sandbox.renderRows(detail);
+  const shown = (body.children || []).map((tr) => tr.dataset.row);
+  if (shown.join(',') !== '3') {
+    bad.push(`「只看失败行」筛出来的是 [${shown}]，应该只有 ['3']（真失败的那行）`);
+  }
+  if (!/显示 1 \/ 4 行/.test(box('wf-filter-note').textContent)) {
+    bad.push(`筛选后的对账文案是「${box('wf-filter-note').textContent}」，` +
+             '应该写明显示 1 / 4 行');
+  }
+
+  // ④ 第 3 步向导里的汇总也走同一套判据
+  r.sandbox.showStep();
+  if (!/失败 1 行/.test(box('wf-summary').textContent)) {
+    bad.push(`汇总里写的是「${box('wf-summary').textContent}」，` +
+             '应该只说真失败的 1 行');
+  }
+
+  // 还原：后面还有别的检查，别把筛选留在勾上
+  box('wf-only-failed').checked = false;
+  body.children.length = 0;
+  r.sandbox.renderRows(detail);
+  return bad;
+}
+
+/**
+ * Minor-2 的跨语言一致性围栏：本地预览与服务端 workflow.render() 是**两份实现**，
+ * 同一段模板 + 同一组取值，两边必须给出同一句话。
+ *
+ * 用例由 tests/test_workflow_preview_parity.py 用**服务端**渲染出 expected 之后
+ * 写到临时 JSON，再用环境变量 PROTFORGE_WEB_PARITY 指过来。不这么做就只能去断
+ * 「源码里出现过同一个正则」——把 SLOT_RE 改窄一点两边就分家了，而上一轮实测
+ * 那种断言 38 条全绿。
+ */
+function checkParity(sandbox) {
+  const path = process.env.PROTFORGE_WEB_PARITY;
+  if (!path) return [];
+  const cases = JSON.parse(readFileSync(path, 'utf8'));
+  const bad = [];
+  for (const c of cases) {
+    const got = sandbox.renderSlots(c.tpl, c.slots);
+    if (got !== c.expected) {
+      bad.push(`${c.name}：服务端渲染成 ${JSON.stringify(c.expected)}，` +
+               `本地渲染成 ${JSON.stringify(got)}——预览给用户看的和真正跑下去的` +
+               '不是同一句话');
+    }
+  }
+  return bad;
 }
 
 async function smoke(file) {
@@ -427,6 +582,13 @@ for (const f of files) {
       errs.push(new Error(
         `看板列建了 ${r.cols} 套，应该 ${r.expectCols} 套：`
         + 'buildCols() 被跑了两遍（页面加载一次、登录成功再一次）'));
+    }
+    // 工作流页专属的两组行为围栏：
+    //   ① 跳过的行不得表现为失败（Major-1）——断的是渲染结果；
+    //   ② 本地预览与服务端 render() 必须给出同一句话（Minor-2）。
+    if (/web[\\/]workflow\.js$/.test(f)) {
+      for (const m of await checkSkippedRows(r)) errs.push(new Error(m));
+      for (const m of checkParity(r.sandbox)) errs.push(new Error(m));
     }
   } catch (e) {
     errs.push(e);

@@ -494,7 +494,17 @@ def test_archive_pass_exception_does_not_escape(disp, tmp_path):
 
 
 def test_one_broken_row_does_not_stop_the_batch(disp, tmp_path, monkeypatch):
-    """第 1 行的 write_back 抛异常，第 2 行照样归档，线程照样活着。"""
+    """第 1 行的 write_back 抛异常：**下一轮它自己会再试，整批不会被永久停住**。
+
+    Major-2 之后同一工作流的归档是串行的，所以后面那些行要等前面这行收工。
+    这里因此写成三段：抛异常那一轮收不到任何一行 → 异常不再抛之后第 1 行归档 →
+    再下一轮第 2 行归档。**延迟不是丢失**：不归档的行取数带
+    ``AND workflow_archived = 0``，闸门② 也会把整批停住，所以它们一定还会被重试。
+
+    （代价写在明面上：同一工作流里某一行**永久**失败时，它后面那些行也会一直
+    排队。这可以接受，因为闸门② 早就把整批停住了；而让它们并发写同一张结果表
+    就是 Major-2 那种静默丢更新。）
+    """
     import workflow as wfmod
     uid = _user()
     wf = _workflow(uid, tmp_path)
@@ -506,20 +516,27 @@ def test_one_broken_row_does_not_stop_the_batch(disp, tmp_path, monkeypatch):
     store.update_task(r1["id"], status="done", summary="ok2")
 
     real = wfmod.write_back
+    state = {"broken": True}
 
     def boom_first(*a, **k):
-        if a[4][0][0] == 0:                 # jobs = [(row_index, col, value)]
+        if state["broken"] and a[4][0][0] == 0:      # jobs = [(row_index, col, value)]
             raise RuntimeError("openpyxl 崩了")
         return real(*a, **k)
 
     monkeypatch.setattr(wfmod, "write_back", boom_first)
     disp._workflow_archive_pass()
     assert disp._archive_wait(30)
-
-    assert _archived(r0["id"]) == 0
-    assert _archived(r1["id"]) == 1, "一行失败把整批带走了"
+    assert _archived(r0["id"]) == 0, "抛异常的行被误判成归档完成了"
     assert disp._archive_thread is not None and disp._archive_thread.is_alive(), \
         "归档线程被一个异常带走了"
+
+    state["broken"] = False
+    disp._workflow_archive_pass()                    # 异常不再抛：第 1 行收工
+    assert disp._archive_wait(30)
+    assert _archived(r0["id"]) == 1, "下一轮没重试，整批被永久停住了"
+    disp._workflow_archive_pass()                    # 第 2 行在它后面收工
+    assert disp._archive_wait(30)
+    assert _archived(r1["id"]) == 1, "一行失败把整批带走了"
 
 
 # --- 归档不阻塞调度主路径 ----------------------------------------------------
@@ -713,30 +730,37 @@ def test_archive_pool_has_at_least_two_workers(disp, tmp_path):
 
 
 def test_one_hung_write_back_does_not_block_other_rows(disp, tmp_path, monkeypatch):
-    """I-2 的核心围栏：一条 write_back 挂起，**别的行照样被归档**。
+    """I-2 的核心围栏：一条 write_back 挂起，**别的批次照样被归档**。
 
-    单线程池下这里必然失败：三条行任务排在一条线程上，第一条挂着，后面两条
-    永远轮不到，闸门② 于是卡死整个工作流而界面上看不出任何异常。
+    单线程池下这里必然失败：那一行排在一条线程上并挂着，别的批次的行
+    永远轮不到，闸门② 于是卡住那个工作流而界面上看不出任何异常。
+
+    **「别的批次」必须是另一个工作流**（Major-2 之后）：同一个工作流的行共享
+    一张结果表，并发写就是静默丢更新（见下面那条串行围栏），所以它们本来就该
+    排队。ARCHIVE_WORKERS=2 的意义从一开始就是「别让一个工作流把平台停住」。
     """
     import workflow as wfmod
     uid = _user()
-    wf = _workflow(uid, tmp_path)
+    wf = _workflow(uid, tmp_path, name="A", wid=9001)
+    other = _workflow(uid, tmp_path, name="B", wid=9002)
     disp._workflow_run_pass()
     r0 = _first_row(wf)
     store.update_task(r0["id"], status="done", summary="ok")
-    others = []
-    for i in (1, 2):
-        t = store.create_task("补的行", "b", owner_id=uid,
-                              workflow_id=wf["id"], workflow_row=i)
-        store.update_task(t["id"], status="done", summary=f"ok{i}")
-        others.append(int(t["id"]))
+    # A 的第 2 行：与 r0 同一张结果表，**必须**排在 r0 后面（Major-2）
+    same_wf_next = store.create_task("A 的第 2 行", "b", owner_id=uid,
+                                     workflow_id=wf["id"], workflow_row=1)
+    store.update_task(same_wf_next["id"], status="done", summary="ok1")
+    r_other = _first_row(other)
+    store.update_task(r_other["id"], status="done", summary="别的批次")
 
     entered = threading.Event()
     release = threading.Event()
     real = wfmod.write_back
 
     def hang_first(*a, **k):
-        if a[4][0][0] == 0:                 # jobs = [(row_index, col, value)]
+        # 按**结果表**判是哪一个工作流：两个工作流的第一行 row_index 都是 0，
+        # 只看 row_index 会把两个批次一起挂住，那这条就测不到跨批次并发了。
+        if Path(a[1]).parent.name == "9001" and a[4][0][0] == 0:
             entered.set()
             release.wait(30)
             raise PermissionError(13, "一直挂着")
@@ -747,18 +771,125 @@ def test_one_hung_write_back_does_not_block_other_rows(disp, tmp_path, monkeypat
         disp._workflow_archive_pass()
         assert entered.wait(5), "归档线程根本没开工"
         deadline = time.time() + 15
-        while time.time() < deadline and not all(
-                _archived(t) == 1 for t in others):
+        while time.time() < deadline and not _archived(r_other["id"]):
             time.sleep(0.05)
-        # 夹具自证：上面那圈是「别的行被归档了」，不是「挂起提前结束了」
+        # 夹具自证：上面那圈是「别的批次被归档了」，不是「挂起提前结束了」
         assert entered.is_set() and not release.is_set(), \
             "夹具失效：挂起提前结束，这条断言测不到想测的东西"
-        assert _archived(others[0]) == 1, "别的行被一条挂起的 write_back 拖住了"
-        assert _archived(others[1]) == 1, "别的行被一条挂起的 write_back 拖住了"
+        assert _archived(r_other["id"]) == 1, \
+            "一个工作流挂住的 write_back 把另一个工作流也拖住了"
         assert _archived(r0["id"]) == 0, "挂着的那行被误判成归档完成了"
+        assert _archived(same_wf_next["id"]) == 0, \
+            "同一工作流的第二行趁第一行挂着就写了进去——那正是 Major-2 的丢更新"
     finally:
         release.set()
     assert disp._archive_wait(30)
+
+
+def test_same_workflow_archives_never_overlap(disp, tmp_path, monkeypatch):
+    """Major-2 的围栏：同一工作流任意时刻**只有一条 write_back 在途**。
+
+    丢更新的形状：两条 write_back 各自 load 同一张结果表、各改一格、各自整表
+    save。后 save 的那份内容是它**在自己 load 之后**才有的，中间隔着另一条写——
+    于是先写进去的那一格被整片盖掉，而**两行都会 workflow_archived=1**，归档
+    pass 再也不会回头：不报错、不重试，用户下载到的结果表少一行值。复审实测
+    8 次里漏 1 次。
+
+    **怎么造出「两条同时在途」而不用多进程碰运气**：探针在 write_back 内部按
+    dest（即工作流的结果表）计在场人数，第一个进来的人**开着门等**——
+    并发版本下第二个线程必然挤得进来（两个 job 都已入队、两条线程都已起来），
+    人数记到 2；串行版本下第二个线程压根到不了这里，门白开后放行。判据是
+    **在场人数**，不是耗时，所以不需要靠「跑得够快才撞上」。
+    """
+    from openpyxl import load_workbook
+
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok0")
+    r1 = store.create_task("补的行", "b", owner_id=uid,
+                           workflow_id=wf["id"], workflow_row=1)
+    store.update_task(r1["id"], status="done", summary="ok1")
+
+    inside: dict[str, int] = {}
+    overlap: list[str] = []
+    written: list[int] = []
+    guard = threading.Lock()
+    real = wfmod.write_back
+
+    def probe(source, dest, sheet, header_row, jobs):
+        key = str(dest)
+        with guard:
+            inside[key] = inside.get(key, 0) + 1
+            n = inside[key]
+            if n > 1:
+                overlap.append(f"{key}:{jobs[0][0]}")
+            written.append(int(jobs[0][0]))
+        try:
+            if n == 1:
+                time.sleep(1.2)            # 给同工作流的第二行一个进门的机会
+        finally:
+            with guard:
+                inside[key] -= 1
+        return real(source, dest, sheet, header_row, jobs)
+
+    monkeypatch.setattr(wfmod, "write_back", probe)
+    # 串行版本下第二行要等下一轮 pass 才排得上，所以像生产那样反复驱动。
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        disp._workflow_archive_pass()
+        assert disp._archive_wait(30)
+        if _archived(r0["id"]) == 1 and _archived(r1["id"]) == 1:
+            break
+        time.sleep(0.05)
+
+    assert overlap == [], (
+        "同一个工作流有两条 write_back 同时在途：后写的拿它更早读到的旧内容盖上去，"
+        f"先写的那一格永久丢失且永不重试。撞在一起的是：{overlap}")
+    # 夹具自证：探针真的跑过两次、真的各写一行、真的开过门等人。
+    assert sorted(written) == [0, 1], f"夹具没走到两次写：{written}"
+    # 串行不等于不写：两行的值都必须在结果表里。
+    ws = load_workbook(store.get_workflow(wf["id"])["result_path"])["S1"]
+    assert ws.cell(row=2, column=5).value == "ok0"
+    assert ws.cell(row=3, column=5).value == "ok1"
+
+
+def test_different_workflows_still_archive_concurrently(disp, tmp_path,
+                                                        monkeypatch):
+    """分段加锁不许退化成一把全局锁：两个工作流必须能**同时**归档。
+
+    Major-2 是按 workflow_id 分段加锁，不是全局串行——全局锁会把 500 行的批次
+    排成一条十几分钟的队，ARCHIVE_WORKERS 的下限 2 也就白设了。
+    围法用 barrier：两条 write_back 各自走到 barrier 一起放行。全局锁下第二条
+    永远到不了 barrier，超时抛 BrokenBarrierError，围栏就红。
+    """
+    import workflow as wfmod
+    uid = _user()
+    a = _workflow(uid, tmp_path, name="A", wid=9001)
+    b = _workflow(uid, tmp_path, name="B", wid=9002)
+    disp._workflow_run_pass()
+    ra, rb = _first_row(a), _first_row(b)
+    store.update_task(ra["id"], status="done", summary="ok-a")
+    store.update_task(rb["id"], status="done", summary="ok-b")
+
+    gate = threading.Barrier(2, timeout=20)
+    real = wfmod.write_back
+
+    def rendezvous(*a_, **k):
+        try:
+            gate.wait()
+        except threading.BrokenBarrierError:
+            raise RuntimeError("两个工作流没有同时归档：归档被串成单线程了")
+        return real(*a_, **k)
+
+    monkeypatch.setattr(wfmod, "write_back", rendezvous)
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30), "归档队列没排空"
+
+    assert _archived(ra["id"]) == 1, "A 的行没归档"
+    assert _archived(rb["id"]) == 1, "B 的行没归档——被另一个工作流串住了"
 
 
 def test_archive_stuck_threshold_default_is_thirty_seconds(disp):
