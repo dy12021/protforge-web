@@ -60,6 +60,24 @@ def _task_columns(db_path: Path) -> set[str]:
         c.close()
 
 
+def _task_column_order(db_path: Path) -> list[str]:
+    """按表里真实的物理顺序返回列名。迁移库和新库的顺序对不上，只能靠这个看。"""
+    c = sqlite3.connect(db_path)
+    try:
+        return [r[1] for r in c.execute("PRAGMA table_info(tasks)")]
+    finally:
+        c.close()
+
+
+def _task_index_names(db_path: Path) -> set[str]:
+    c = sqlite3.connect(db_path)
+    try:
+        return {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tasks'")}
+    finally:
+        c.close()
+
+
 def _table_names(db_path: Path) -> set[str]:
     c = sqlite3.connect(db_path)
     try:
@@ -95,7 +113,12 @@ def test_legacy_db_gains_the_three_tables(tmp_path, monkeypatch):
 
 
 def test_fresh_db_has_them_too(tmp_path, monkeypatch):
-    """新库走 SCHEMA 里的完整定义——两条路必须得到同一个结果。"""
+    """新库走 SCHEMA 里的完整定义。
+
+    只断「三列三表都在」；新库与迁移库的**列名集合**是否一致，由下面
+    test_fresh_and_migrated_tasks_agree_on_names_not_order 单独钉住
+    （两者的物理顺序一定不同，合并断言会掩盖真正的契约）。
+    """
     fresh = tmp_path / "fresh.db"
     monkeypatch.setenv("PROTFORGE_WEB_DB", str(fresh))
     import db
@@ -111,6 +134,58 @@ def test_init_db_is_idempotent(tmp_path, monkeypatch):
     db.init_db()
     db.init_db()
     assert NEW_TASK_COLUMNS <= _task_columns(tmp_path / "twice.db")
+
+
+# --- 新库 vs 迁移库：契约是「列名集合相同」，不是「顺序相同」 --------------
+
+def test_fresh_and_migrated_tasks_agree_on_names_not_order(tmp_path, monkeypatch):
+    """两条路的列名集合必须**完全相同**；但顺序一定不同，代码不得依赖顺序。
+
+    ALTER TABLE ADD COLUMN 只能追加，所以迁移库的 workflow_* 三列永远排在
+    created_at/updated_at/done_at 之后，而 SCHEMA 里它们写在 session_id 之后。
+    这个顺序分叉是结构性的、消不掉（要消只能重建表 + 搬数据），所以真正的契约
+    是列名集合相同——这里断集合，顺带把分叉显式钉出来，免得将来有人照着 docstring
+    「两条路得到同一个结果」写出按位置解包的代码。
+    """
+    fresh = tmp_path / "fresh.db"
+    monkeypatch.setenv("PROTFORGE_WEB_DB", str(fresh))
+    import db
+    db.init_db()
+
+    legacy = tmp_path / "legacy.db"
+    _make_legacy(legacy)
+    monkeypatch.setenv("PROTFORGE_WEB_DB", str(legacy))
+    db.init_db()
+
+    fresh_order = _task_column_order(fresh)
+    migrated_order = _task_column_order(legacy)
+
+    assert set(fresh_order) == set(migrated_order), "两条路的列名集合必须一样"
+    # 顺序确实不同，且分叉点正是被 ALTER 追加到末尾的那三列
+    assert fresh_order != migrated_order
+    assert migrated_order[-3:] == ["workflow_id", "workflow_row", "workflow_archived"]
+    assert fresh_order.index("workflow_id") < fresh_order.index("created_at")
+
+
+def test_workflow_index_needs_no_migration(tmp_path, monkeypatch):
+    """索引不用进 _MISSING_TASK_COLUMNS：CREATE INDEX IF NOT EXISTS 自己会补建。
+
+    这条同时钉住两件事：新库有 idx_tasks_workflow，旧库迁移后也有；
+    以及 SCHEMA 里那句 CREATE INDEX 对已存在的表**不是**空操作。
+    """
+    fresh = tmp_path / "fresh.db"
+    monkeypatch.setenv("PROTFORGE_WEB_DB", str(fresh))
+    import db
+    db.init_db()
+
+    legacy = tmp_path / "legacy.db"
+    _make_legacy(legacy)
+    assert "idx_tasks_workflow" not in _task_index_names(legacy), "夹具本身不该有这索引"
+    monkeypatch.setenv("PROTFORGE_WEB_DB", str(legacy))
+    db.init_db()
+
+    assert "idx_tasks_workflow" in _task_index_names(fresh)
+    assert "idx_tasks_workflow" in _task_index_names(legacy)
 
 
 # --- 竞态容忍：确定性测这两个分支 -------------------------------------------
@@ -168,6 +243,80 @@ def test_three_processes_migrate_same_legacy_db(tmp_path):
     for rc, out, err in outs:
         assert rc == 0, f"某个进程迁移失败 rc={rc}\n{out}\n{err}"
     assert NEW_TASK_COLUMNS <= _task_columns(legacy)
+
+
+# --- _enable_wal 的两个 raise 分支 ------------------------------------------
+
+class _WALSpy:
+    """包一层连接，数 `PRAGMA journal_mode=WAL` 真的执行了几次。
+
+    围栏必须**数次数**：只断「抛了」不够——把重试循环整个删掉也照样抛，
+    看起来是绿的，但那正是这里要防的静默失效。所以每次 WAL 语句要么抛预置的
+    错、要么透传给真连接。
+    """
+
+    def __init__(self, inner: sqlite3.Connection, errors: list[Exception]) -> None:
+        self._inner = inner
+        self._errors = list(errors)
+        self.wal_calls = 0
+
+    def execute(self, sql, *args):
+        if "journal_mode=WAL" in sql:
+            self.wal_calls += 1
+            if self._errors:
+                raise self._errors.pop(0)
+        return self._inner.execute(sql, *args)
+
+
+def test_enable_wal_reraises_non_lock_error_without_retrying():
+    """非锁错必须**立刻**上抛，一次都不许重试——这是 _enable_wal 里第一个 raise 的围栏。
+
+    把它换成 pass，重试会一路空转到循环结束，connect() 照样交出一条 journal mode
+    根本没切成 WAL 的连接：这正是本项目最熟的那种静默失效形状（迁移失败却报告成功）。
+    只读库（`attempt to write a readonly database`）是这条分支的真实触发场景，
+    但它依赖平台的文件属性语义，所以这里用 spy 稳定地把它逼出来。
+    """
+    import db
+    inner = sqlite3.connect(":memory:")          # :memory: 的 journal_mode 是 memory
+    try:
+        spy = _WALSpy(inner, [sqlite3.OperationalError("disk I/O error")])
+        with pytest.raises(sqlite3.OperationalError):
+            db._enable_wal(spy, attempts=50, delay=0)
+        assert spy.wal_calls == 1, "非锁错不该重试"
+    finally:
+        inner.close()
+
+
+def test_enable_wal_reraises_when_retries_exhausted():
+    """锁一直占着就必须明着失败，不能静默返回——这是第二个 raise 的围栏。
+
+    attempts=1 让它确定性地走到耗尽分支，不必真去撞 50 次锁。
+    """
+    import db
+    inner = sqlite3.connect(":memory:")
+    try:
+        spy = _WALSpy(inner, [sqlite3.OperationalError("database is locked")])
+        with pytest.raises(sqlite3.OperationalError):
+            db._enable_wal(spy, attempts=1, delay=0)
+        assert spy.wal_calls == 1
+    finally:
+        inner.close()
+
+
+def test_enable_wal_retries_until_it_succeeds():
+    """反过来也钉住：真的锁冲突必须重试，不能第一次失败就上抛。
+
+    前两条围栏会把「重试循环整个删掉」也判红，这条防的是反方向——
+    有人图省事把 except 整个改成 raise。
+    """
+    import db
+    inner = sqlite3.connect(":memory:")
+    try:
+        spy = _WALSpy(inner, [sqlite3.OperationalError("database is locked")] * 2)
+        db._enable_wal(spy, attempts=5, delay=0)     # 第 3 次成功，不该抛
+        assert spy.wal_calls == 3
+    finally:
+        inner.close()
 
 
 # --- 表约束 -----------------------------------------------------------------

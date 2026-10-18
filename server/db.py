@@ -161,7 +161,7 @@ def db_path() -> Path:
     return Path(env) if env else (data_root() / "web.db")
 
 
-def _enable_wal(c: sqlite3.Connection) -> None:
+def _enable_wal(c: sqlite3.Connection, attempts: int = 50, delay: float = 0.1) -> None:
     """把 journal_mode 切成 WAL，切不动就重试。
 
     `PRAGMA journal_mode=WAL` 要短暂拿独占锁，而 busy_timeout 对它**不生效**
@@ -172,20 +172,23 @@ def _enable_wal(c: sqlite3.Connection) -> None:
 
     已经是 WAL 就直接返回：journal_mode 是文件属性，转换过一次之后这条语句
     只是读，不再需要锁，也就没有竞争。
+
+    attempts/delay 做成参数**只为让围栏能确定性地走到「重试耗尽」那条分支**，
+    不必真去撞 50 次锁；生产路径就吃默认值。
     """
     if str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
         return
-    for attempt in range(50):                      # 50 × 0.1s = 最多等 5s
+    for attempt in range(attempts):             # 默认 50 × 0.1s = 最多等 5s
         try:
             c.execute("PRAGMA journal_mode=WAL")
             return
         except sqlite3.OperationalError as exc:
             msg = str(exc).lower()
             if "locked" not in msg and "busy" not in msg:
-                raise                              # 只等锁，别的一律上抛
-            if attempt == 49:
-                raise                              # 等不到就明着失败，别假装建好了
-            time.sleep(0.1)
+                raise                          # 只等锁，别的一律上抛
+            if attempt == attempts - 1:
+                raise                          # 等不到就明着失败，别假装建好了
+            time.sleep(delay)
 
 
 def connect() -> sqlite3.Connection:
@@ -201,14 +204,27 @@ def connect() -> sqlite3.Connection:
     return c
 
 
+# 只有**列**需要特殊处理。SCHEMA 里的 CREATE INDEX IF NOT EXISTS 对已存在的
+# 库本来就会补建（indexes 在 sqlite_master 上，与表是不是新建无关），所以索引
+# 不用进这个元组——给索引也套一套「读-判断-写」迁移是白费劲。
 _MISSING_TASK_COLUMNS = (
     "workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE",
     "workflow_row INTEGER",
     "workflow_archived INTEGER NOT NULL DEFAULT 0",
 )
 
+# 但**建在被补齐的新列上的索引不能写进 SCHEMA**：executescript(SCHEMA) 跑在
+# _add_missing_columns 之前，旧库那时还没有 workflow_id，一句
+# `CREATE INDEX ... ON tasks(workflow_id)` 就会以 `no such column` 让整段
+# executescript 中途中断（后面 uploads/artifacts/events 的建表也跟着落空，
+# init_db 直接抛错、服务起不来）。实测过，别挪回 SCHEMA。
+# 索引不需要条件判断：无条件跑一次即可，已存在就是空操作。
+_POST_COLUMN_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_tasks_workflow ON tasks(workflow_id);
+"""
 
-def _add_column(c, spec: str) -> None:
+
+def _add_column(c: sqlite3.Connection, spec: str) -> None:
     """加一列，容忍「别的进程刚加过」这一种失败。
 
     平台上有三个进程同时开着同一个库（public / admin / internal），它们都在
@@ -225,7 +241,7 @@ def _add_column(c, spec: str) -> None:
             raise
 
 
-def _add_missing_columns(c) -> None:
+def _add_missing_columns(c: sqlite3.Connection) -> None:
     have = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
     for spec in _MISSING_TASK_COLUMNS:
         if spec.split()[0] not in have:
@@ -238,6 +254,7 @@ def init_db() -> None:
     try:
         c.executescript(SCHEMA)
         _add_missing_columns(c)          # 旧库补列；新库这里三个都在，什么也不做
+        c.executescript(_POST_COLUMN_INDEXES)   # 索引建在补齐后的新列上，理由见常量上方
         c.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         c.commit()
     finally:
