@@ -15,6 +15,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 
 import { createGuardedBashOperations } from './guards.mjs';
 
@@ -166,4 +167,34 @@ test('the guard still works when no audit hook is configured', async () => {
   const out = await bash.exec('ls -la', WORK_DIR, {});
   assert.equal(out.exitCode, 0);
   await assert.rejects(() => bash.exec('rm -rf /', WORK_DIR, {}), /安全守卫拒绝/);
+});
+// ---------------------------------------------------------------- 工作流行任务 · 产物落点
+
+/* 这条规则钉的是提示词，不是代码。
+ *
+ * 背景很具体：`artifacts.discover()` 有三条发现路径——前缀命中、时间窗兜底、
+ * 任务工作目录。其中**时间窗兜底命中的是 verified=0**，而打包器诚实地失败：
+ * 产物没确认就不进结果包。落在 outputs 根又没有 t{任务号}_ 前缀的文件，
+ * 正好落在这条最窄的路上，于是那一行以「没有可下载的产物」失败。
+ *
+ * 而工作流是**按行**跑的，一行失败不阻断整批：所以这不是一行的问题，
+ * 批量场景下会一行接一行地全失败，**表里只显示 failed、不报任何错**。
+ * 批量才有的放大效应——不写进提示词，模型没有任何理由知道要避开它。
+ */
+test("PLATFORM_RULES 明写工作流行任务的产物落点", async () => {
+  const src = await readFile(new URL("./run.mjs", import.meta.url), "utf8");
+  const start = src.indexOf("const PLATFORM_RULES = `");
+  assert.ok(start > 0, "run.mjs 里找不到 PLATFORM_RULES");
+  const rules = src.slice(start);
+  const at = rules.indexOf("工作流任务");
+  assert.ok(at >= 0, "提示词里没提工作流行任务");
+  // 只取这一段的正文（到模板串结尾），不拿整份文件做匹配：
+  // "工作目录" 这四个字本来就出现在沙箱那一条里，全篇包含等于没断言。
+  const end = rules.indexOf("\\`;", at);
+  const para = rules.slice(at, end > 0 ? end : rules.length);
+  // 自证探针：取到的段落得真的是一段话。匹配错位置（比如切在"工作流任务"四个字
+  // 的中间）时上面那些 includes 仍可能为真，这条会把那种情况挡住。
+  assert.ok(para.length > 40, "取到的段落只有 " + para.length + " 字，多半匹配错位置了");
+  assert.ok(para.includes("工作目录"), "没要求工作流行任务的产物落在工作目录");
+  assert.ok(para.includes("t{你的任务号}_"), "没写清共享目录产物的 t{任务号}_ 前缀规则");
 });
