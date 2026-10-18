@@ -132,7 +132,18 @@ def _add_missing_columns(c):
             c.execute(f"ALTER TABLE tasks ADD COLUMN {spec}")
 ```
 
-新库走 `SCHEMA` 里加好的完整定义，旧库走这段补齐，两条路都得到同一个结果。**围栏必须拿一个「已存在的旧库」跑一遍**，只测新库等于没测。
+新库走 `SCHEMA` 里加好的完整定义，旧库走这段补齐。**围栏必须拿一个「已存在的旧库」跑一遍**，只测新库等于没测。
+
+**两条路得到的不是「同一个结果」，只是「同一组列名」。** 这一点是实现期实测出来的，我原来那句话写错了：`ALTER TABLE ADD COLUMN` **只能追加**，所以迁移库的 `tasks` 列顺序必然是新库那种顺序的另一种排列：
+
+```
+新库    [..., session_id, workflow_id, workflow_row, workflow_archived, created_at, updated_at, done_at]
+迁移库  [..., session_id, created_at, updated_at, done_at, workflow_id, workflow_row, workflow_archived]
+```
+
+当前没有功能影响（`store` 里全部走 `dict(row)` 按名取键，没有任何位置解包），但**写代码必须按名取**。所以围栏钉的是**列名集合相等**而不是顺序相等，并且顺带把顺序确实不同这件事显式断言出来——不然将来有人写位置解包，任何测试都拦不住。
+
+**同一类陷阱还有一个更狠的版本**：建在新补齐列上的索引**不能写进 `SCHEMA`**。`init_db()` 里 `executescript(SCHEMA)` 跑在补列**之前**，旧库那时还没有 `workflow_id`，一句 `CREATE INDEX ... ON tasks(workflow_id)` 会让 `init_db()` 直接抛 `no such column: workflow_id`——**三列永远补不上**，而且 `executescript` 中途中断会让排在后面的 `uploads`/`artifacts`/`events` 建表一起落空。索引不需要列补齐那套读-判断-写（`CREATE INDEX IF NOT EXISTS` 对已存在的库本来就会补建），但**不能早于补列执行**：落法是补列之后再单独跑一次这段 DDL。
 
 **但「幂等」在本机不是自动成立的——平台有三个进程同时开着这一个库**（public 8473 / admin 8474 / internal 8475），它们都在启动时调 `init_db()`。上例那段代码是**读-判断-写**三步，两个进程同时进来时都可能看到「这一列还没有」，然后各自执行一次 `ALTER TABLE`，后到的那个拿到 `sqlite3.OperationalError: duplicate column name`。
 
