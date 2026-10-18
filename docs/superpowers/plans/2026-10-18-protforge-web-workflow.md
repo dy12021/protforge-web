@@ -22,7 +22,7 @@
 - `tests/conftest.py` **冻结，不得改**。它 autouse 把库指向 `tmp_path` 并调 `db.init_db()`，测试**绝不碰真实数据盘**
 - **界面禁用词**：`AI`、`助手`、`大模型`。统一称「自动化计算平台」「计算任务」「计算进程」。`AI` 必须大小写敏感（小写词满地都是）
 - **中文写入禁走 PowerShell 内联**（cp936 静默乱码）→ 用编辑工具，或 `pathlib.write_text(encoding="utf-8")`
-- **commit message 含引号会被 PowerShell 拆参** → 先写进 `.git\MSG_*.txt` 再 `git -F`；仓库无 identity → `git -c user.name=mavis -c user.email=mavis@local commit -F`
+- **commit message 含引号会被 PowerShell 拆参** → 先写进一个文件再 `git -F`；仓库无 identity → `git -c user.name=mavis -c user.email=mavis@local commit -F`。**注意：在 git worktree 里 `.git` 是一个文件而不是目录**，所以 `.git\MSG*.txt` 写不进去（Task 2 实测）。用 `git rev-parse --git-dir` 拿到真实路径再拼，或者干脆写到会话 workspace 里
 - **删除用 `rm -- "<绝对路径>"`**（走 mavis-trash），不要用 `Remove-Item`
 - **闸门顺序是规格的一部分**（规格 6.4）：`①④⑤②③⑥`。把 ④ 挪到 ② 之后会让「重跑」当场失效
 - **围栏必须双向**：坏写法红 + 正确重构不误红。**每个任务的最后一个 Step 就是做这件事**（见该任务的「双向验证」步），不另起一轮
@@ -546,14 +546,6 @@ def test_update_workflow_archived():
 
 # --- 闸门要问的那几个问题 ---------------------------------------------------
 
-def _row(wf_id, idx, status, archived=0, owner=1):
-    return store.create_task(f"r{idx}", "b", owner_id=owner, actor="system",
-                             workflow_id=wf_id, workflow_row=idx,
-                             ) and store.update_task(
-        store.list_workflow_rows(wf_id, idx)[0]["id"], status=status,
-        workflow_archived=archived) and None
-
-
 def test_has_unarchived_reflects_the_flag():
     uid = _user()
     wf = _wf(uid)
@@ -959,7 +951,7 @@ def user_has_live_regular_tasks(owner_id: int) -> bool:
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `pytest tests/test_workflow_store.py -q --no-header -p no:cacheprovider`
-Expected: PASS（14 passed）
+Expected: PASS（15 passed）
 
 - [ ] **Step 6: 跑全量**
 
