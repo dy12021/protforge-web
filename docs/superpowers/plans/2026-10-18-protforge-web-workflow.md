@@ -405,7 +405,7 @@ message：工作流数据模型：三张新表 + tasks 三列，含幂等迁移�
   - `list_workflows(owner_id=None, *, is_admin: bool = False) -> list[dict]`
   - `get_workflow(workflow_id: int, owner_id=None, is_admin: bool = False) -> dict`（越权抛 `NotFound`）
   - `update_workflow(workflow_id: int, **fields) -> dict`（白名单，见下）
-  - `delete_workflow(workflow_id: int) -> None`
+  - `delete_workflow(workflow_id: int, owner_id=None, is_admin: bool = False) -> None`（**带归属校验**——见下）
   - `skip_workflow_row(workflow_id: int, row_index: int, reason: str = "") -> None`
   - `list_workflow_skips(workflow_id: int) -> set[int]`
   - `create_task(..., workflow_id=None, workflow_row=None) -> dict`（签名向后兼容地加两个**关键字**参数）
@@ -625,10 +625,26 @@ def test_delete_workflow_cascades_rows():
     wf = _wf(uid)
     row = store.create_task("r", "b", owner_id=uid, actor="system",
                             workflow_id=wf["id"], workflow_row=0)
-    store.delete_workflow(wf["id"])
+    store.delete_workflow(wf["id"], owner_id=uid)
     assert store.list_workflows(owner_id=uid) == []
     with pytest.raises(store.NotFound):
         store.get_task(row["id"])
+
+
+def test_delete_workflow_is_owner_scoped():
+    """非归属方删不动——漏了就是「杀掉别人正在跑的 GPU 计算」。
+
+    只断 404 是不够的：还要断言**库里的东西一个没少**。否则实现写成
+    「先中止在跑行任务、再抛 NotFound」也能过，而那时 A 的计算已经被杀了。
+    """
+    a, b = _user("a"), _user("b")
+    wf = _wf(a)
+    row = store.create_task("r", "b", owner_id=a, actor="system",
+                            workflow_id=wf["id"], workflow_row=0)
+    with pytest.raises(store.NotFound):
+        store.delete_workflow(wf["id"], owner_id=b)
+    assert store.get_workflow(wf["id"], owner_id=a)["id"] == wf["id"], "工作流被删了"
+    assert store.get_task(row["id"], owner_id=a)["status"] == "queued", "行任务被动了"
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -806,13 +822,22 @@ def set_workflow_columns(workflow_id: int, cols: list[dict]) -> list[dict]:
     return list_workflow_columns(workflow_id)
 
 
-def delete_workflow(workflow_id: int) -> None:
-    """只删数据库。tasks.workflow_id 的 ON DELETE CASCADE 会带走行任务记录；
-    磁盘由 janitor 负责（规格 6.7 要求先中止在跑的行任务，那是 app 层的事）。"""
+def delete_workflow(workflow_id: int, owner_id=None, is_admin: bool = False) -> None:
+    """删工作流。tasks.workflow_id 的 ON DELETE CASCADE 会带走行任务记录；
+    磁盘由 janitor 负责（规格 6.7 要求先中止在跑的行任务，那是 app 层的事）。
+
+    **归属校验放在 store 层，不只放 HTTP 层**：这是唯一破坏性的函数，
+    而删除端点漏过它一次。漏了的后果不是「删掉别人的东西」，是
+    **杀掉别人正在跑的 GPU 计算并伪造其时间线**——所以闸门必须贴着函数本身，
+    让「HTTP 层忘了先 get_workflow」这种疏漏无法再犯。越权抛 NotFound。
+    """
+    get_workflow(workflow_id, owner_id=owner_id, is_admin=is_admin)
     c = db.connect()
     try:
         with c:
-            c.execute("DELETE FROM workflows WHERE id = ?", (int(workflow_id),))
+            cur = c.execute("DELETE FROM workflows WHERE id = ?", (int(workflow_id),))
+            if cur.rowcount == 0:
+                raise NotFound("工作流不存在")
     finally:
         c.close()
 
@@ -2440,6 +2465,10 @@ tick 里两个 pass 各自 try/except：_loop 是 try: tick() except，
 - Consumes: Task 2 的 store 函数、Task 3/4 的 `workflow.*`
 - Produces: 规格 9.1 的九个端点 + `GET /api/tasks?scope=` + `DELETE /api/tasks/{id}` 的 409 守卫
 
+**一条容易被忽略的透传禁令**：任何更新任务/工作流的端点**都不得从请求体透传 `workflow_id`**。`store._update()` 的白名单放行了它（更新别的字段时要用），所以 `update_task(id, workflow_id=别人的)` 是**能跑通的** —— 而那等于把一行任务搬到另一个工作流下，闸门② 依赖的 `workflow_archived` 归属会跟着错位。要改归属只能删了重建。
+
+围栏要钉住：拿一个行任务，`POST`/`PATCH` 一个带 `workflow_id` 的请求体，断言该行任务的 `workflow_id` **没变**。只断言返回 4xx 是不够的——实现写成「忽略未知字段」也过，而那正是我们要的行为；真正要防的是「照单透传」。
+
 - [ ] **Step 1: 写失败测试**
 
 新建 `tests/test_workflow_api.py`：
@@ -2858,9 +2887,15 @@ def save_upload(filename: str, data: bytes, owner_id: int) -> dict:
         ``_db_status`` 返回 ""，``_abort_signal`` 因 "" not in TERMINAL_STATUSES
         直接返回 None，调度器不会去杀它。
         """
+        # 归属校验放在 store.delete_workflow 里（它自己会 get_workflow）。
+        # 这里**必须**在 _abort_live_rows 之前就把归属断掉——顺序反了的话，
+        # 越权请求会先把 A 的在跑行任务打成 failed、写下「工作流中止」的
+        # 事件与 error，然后才抛 404。A 的计算已经被杀了、伪造的时间线
+        # 已经落库，而请求返回 404。store 那道闸在中止之后才生效，救不了。
+        store.get_workflow(workflow_id, owner_id=user["id"])   # 越权 404
         _abort_live_rows(workflow_id)
         _settle_abort_signal(dispatcher.POLL_INTERVAL * 3)
-        store.delete_workflow(workflow_id)
+        store.delete_workflow(workflow_id, owner_id=user["id"])
         sse.notify()
         return {"ok": True}
 ```
@@ -2907,9 +2942,14 @@ def _settle_abort_signal(seconds: float) -> None:
 把删除端点里的那行也改掉：
 
 ```python
+        # 归属校验放在 store.delete_workflow 里（它自己会 get_workflow）。
+        # 这里**必须**在 _abort_live_rows 之前就把归属断掉——顺序反了的话，
+        # 越权请求会先把 A 的在跑行任务打成 failed、写下「工作流中止」的
+        # 事件与 error，然后才抛 404。A 的计算已经被杀了、伪造的时间线
+        # 已经落库，而请求返回 404。
         _abort_live_rows(workflow_id)
         _settle_abort_signal(dispatcher.POLL_INTERVAL * 3)
-        store.delete_workflow(workflow_id)
+        store.delete_workflow(workflow_id, owner_id=user["id"])
 ```
 
 两个请求体模型（加在既有的请求体模型旁边）：
