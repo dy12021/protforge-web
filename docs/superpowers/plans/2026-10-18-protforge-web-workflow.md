@@ -829,8 +829,18 @@ def delete_workflow(workflow_id: int, owner_id=None, is_admin: bool = False) -> 
     **归属校验放在 store 层，不只放 HTTP 层**：这是唯一破坏性的函数，
     而删除端点漏过它一次。漏了的后果不是「删掉别人的东西」，是
     **杀掉别人正在跑的 GPU 计算并伪造其时间线**——所以闸门必须贴着函数本身，
-    让「HTTP 层忘了先 get_workflow」这种疏漏无法再犯。越权抛 NotFound。
+    让「HTTP 层忘了先 get_workflow」这种疏漏无法再犯。越权抛 NotFound
+    （不抛 403，与 `get_workflow`/`get_task` 同约定：承认「这东西存在」本身就是泄露）。
+
+    **缺 `owner_id` 默认拒绝**（`owner_id=None` 且非管理员 → NotFound）：这一层
+    存在的全部意义就是拦住「新调用方忘传参数」那种疏漏，所以默认必须是拒绝。
+    ⚠️ **这里不能只靠 `get_workflow`**：它的判据是
+    `if not is_admin and owner_id is not None and ...`——`owner_id` 为 `None`
+    时**直接放行**（语义是「没声明是谁就当内部调用」）。拿它当唯一闸门的话，
+    `delete_workflow(id)` 恰好会删掉别人的工作流，正是这一层要防的那件事。
     """
+    if owner_id is None and not is_admin:
+        raise NotFound("工作流不存在")
     get_workflow(workflow_id, owner_id=owner_id, is_admin=is_admin)
     c = db.connect()
     try:
