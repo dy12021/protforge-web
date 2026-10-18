@@ -23,3 +23,7 @@ __pycache__/
 # 服务的 stdout/stderr：scripts\start-services.ps1 起服务时落到仓库里的 logs\。
 # 跟 data\ 分开——data\ 是要备份的产物，这里是本机运行痕迹，拷走没有意义。
 logs/
+
+# 隔离工作区：git worktree 建在仓库内，每棵工作树是一整份代码副本。
+# **必须忽略**——不忽略的话 `git add .` 会把整棵工作树当成普通目录提交进去。
+.worktrees/
