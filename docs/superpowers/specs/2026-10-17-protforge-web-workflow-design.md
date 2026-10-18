@@ -610,9 +610,19 @@ DELETE /api/workflows/{id}                先中止在跑的行任务，再删
 
 **② `scope` 参数不能顺手带上越权。** §8.1 给 `GET /api/tasks` 加 `scope=regular|workflow|all`，而现有代码是 `store.list_tasks(None if is_admin else user["id"], ...)`。**`all` 只是「行任务也算进来」，不是「所有人的都算进来」** —— 两个正交维度别混。非管理员传 `scope=all` 只能拿到自己的全部；只有 `is_admin=True` 才跨用户。
 
-**③ 行任务的 `actor` 不是「用户」。** `_workflow_run_pass()` 建行任务时调的是 `store.create_task(title, brief, owner_id, actor="human")` —— 默认值 `human`。但**没有任何用户提交过这一行**，是工作流自己推进的。`actor` 会进事件流和详情页时间线，写成 `human` 就意味着详情页上写着「用户提交了任务」，而时间线上根本找不到那次提交——和 §8.5 说的「行任务看起来像凭空出现」是同一类毛病。
+**③ 行任务的归属与 actor。** 两个字段，一处写错是显示问题，另一处写错会让闸门判错人：
 
-所以：行任务的 `actor` 用 `'workflow'`，`owner_id` 用 **`workflows.owner_id`**（不是谁点了开始、也不是调度器自己）。这两处分错都会出事——`actor` 分错是显示问题，`owner_id` 分错则是**闸门⑥ 判错了人**：A 的工作流会去看 B 有没有常规任务。
+- **`owner_id` 必须是 `workflows.owner_id`** —— 不是「谁点了开始」，更不是调度器自己。分错了，闸门⑥「该用户还有非终态的常规任务？」就会去查**别人的**队列，A 的工作流被 B 的任务挡住或不等 B（6.4 ⑥）
+- **`actor` 不能写 `'workflow'`**。`create_task` 的默认值是 `'human'`（`store.py:77`），但没有任何用户提交过这一行，写成 `human` 详情页就会显示「用户提交了任务」而时间线上找不到那次提交——所以要显式传。**但也不能自己造一个值**：`events` 表的 CHECK 约束是 `actor IN ('human','agent','admin','system')`（`db.py:80`），写 `'workflow'` 会在插入事件时**直接违反约束抛错**，而 `create_task` 本身不写事件，所以这个错会推迟到行任务被认领那一刻才炸——离原因很远。
+
+**取 `actor='system'`，靠事件文案承载来源**，不碰 CHECK 约束：
+
+```
+add_event(task_id, kind="created", actor="system",
+          message=f"工作流「{workflow.name}」第 {row_index + 1} 行")
+```
+
+加一个 CHECK 枚举值本身不是不行，但代价不小：SQLite 不支持 `ALTER TABLE ... DROP CONSTRAINT`，给 `events` 加值意味着**重建表 + 搬数据 + 重建索引和触发器**，而 `events` 正是 `tasks` 的级联子表。为一句文案付这个迁移代价不划算——**来源信息本来就该在 message 里，不该挤进一个枚举**。
 
 ### 9.3 管理员对别人的工作流
 
@@ -663,7 +673,8 @@ DELETE /api/workflows/{id}                先中止在跑的行任务，再删
 - **跨用户下载要 404**：A 建工作流 → B 调 `GET /api/workflows/{A的id}/result.xlsx` → 404，**且响应体不含任何 xlsx 字节**（钉死 9.2 ①——文件端点最容易走另一套取数路径而漏掉归属校验）
 - **跨用户控制要 404**：B 对 A 的工作流调 `start`/`pause`/`abort`/`skip`/`DELETE` 全部 404，且**库里没有产生任何副作用**（不只看状态码）
 - **`scope=all` 不是越权**：非管理员传 `scope=all` 只能拿到自己的行任务；admin 才能跨用户（钉死 9.2 ②）
-- **行任务 owner/actor 正确**：工作流创建的行任务，`owner_id == workflows.owner_id`（不是点开始的人）、`actor == 'workflow'`（不是 `'human'`）。断言要读库核对这两个值，并额外断言「闸门⑥ 判的是 owner 的常规任务，不是别人的」
+- **行任务 owner/actor 正确**：工作流创建的行任务，`owner_id == workflows.owner_id`（不是点开始的人）；`created` 事件的 `actor == 'system'` 且 message 含工作流名与行号（钉死 9.2 ③——`actor` 写 `'workflow'` 会撞上 `events` 表的 CHECK 约束（`db.py:80`），且 `create_task` 不写事件，所以这个错要推迟到行任务被认领时才炸）
+- **闸门⑥ 判的是 owner 的常规任务**：owner 有一个排队中的常规任务时工作流不放行；**另一个**用户有排队任务时**照样放行**（钉死 9.2 ③——`owner_id` 分错会拿别人的队列当自己的）
 - **管理员对别人的工作流只读**：admin 看得到别人的工作流，但 `pause` 它的行返回 404（钉死 9.3）
 
 ## 11. 明确不做（YAGNI）
