@@ -25,7 +25,9 @@
 - **commit message 含引号会被 PowerShell 拆参** → 先写进 `.git\MSG_*.txt` 再 `git -F`；仓库无 identity → `git -c user.name=mavis -c user.email=mavis@local commit -F`
 - **删除用 `rm -- "<绝对路径>"`**（走 mavis-trash），不要用 `Remove-Item`
 - **闸门顺序是规格的一部分**（规格 6.4）：`①④⑤②③⑥`。把 ④ 挪到 ② 之后会让「重跑」当场失效
-- **围栏必须双向**：坏写法红 + 正确重构不误红。撤补丁后**逐条核对预期红绿**，看到红不等于修复生效
+- **围栏必须双向**：坏写法红 + 正确重构不误红。**每个任务的最后一个 Step 就是做这件事**（见该任务的「双向验证」步），不另起一轮
+- **双向验证怎么做**：把修复撤掉（按行定位 + 唯一锚点，**不要用正则扫通用关键字**，像 `except Exception:` 这种会匹配到文件里更早的同名块），重跑该任务的测试文件，必须出现**预期的**红；再把修复装回去，重跑，必须全绿。
+  **逐条核对**：撤补丁后别的测试跟着红，说明补丁打歪了，不是修复生效。看到红 ≠ 修复生效。
 - **断言要读回数据库核对值**，不要断言函数返回成功——`create_task()` 不抛异常的用例在「白名单缺列」和「白名单对了但忘传参」两种坏写法下都会绿
 - **`store.Invalid` / `store.NotFound` / `guards.Violation` / `app.PreciseHTTPException` 是四个不同的异常类**，别混用
 - **越权一律 404 不 403**（沿用 `store.get_task()` 的既有约定，`app.py:387` 的注释就是理由：不承认 id 存在）
@@ -1286,6 +1288,18 @@ def check_upload(filename: str, data: bytes) -> None:
 
 # --- 读表 -------------------------------------------------------------------
 
+def _row_at(ws, r: int, max_col: int) -> list:
+    """读 sheet 第 r 行的前 max_col 个值。
+
+    走 iter_rows 而不是逐格 cell()：read_only 工作簿上逐格调用极慢，
+    而一次一行的迭代只解析一遍共享字符串表。
+    """
+    for tup in ws.iter_rows(min_row=r, max_row=r, max_col=max_col,
+                            values_only=True):
+        return list(tup)
+    return []
+
+
 def _blank(vals) -> bool:
     return all((v or "") == "" for v in vals)
 
@@ -1314,15 +1328,18 @@ def read_source(path: Path, header_row: int = 1) -> SheetView:
             h = wsv.cell(row=header_row, column=col).value
             headers.append(str(h).strip() if h is not None else f"列{col}")
 
+        max_col = wsv.max_column or 1
         row_numbers: list[int] = []
         preview: list[list[str]] = []
         for r in range(header_row + 1, wsv.max_row + 1):
-            row_vals = wsv.cell(row=r, column=1, values_only=True) or ()
-            raw_vals = wsr.cell(row=r, column=1, values_only=True) or ()
+            # 一次读整行。**不要写 ws.cell(..., values_only=True)**——cell()
+            # 返回 Cell 对象，values_only 是 iter_rows 的参数，传给它直接 TypeError。
+            row_vals = _row_at(wsv, r, max_col)
+            raw_vals = _row_at(wsr, r, max_col)
             line = []
-            for i in range(1, wsv.max_column + 1):
-                val = row_vals[i - 1] if i - 1 < len(row_vals) else None
-                raw = raw_vals[i - 1] if i - 1 < len(raw_vals) else None
+            for i in range(max_col):
+                val = row_vals[i] if i < len(row_vals) else None
+                raw = raw_vals[i] if i < len(raw_vals) else None
                 if val is None and isinstance(raw, str) and raw.startswith("="):
                     val = raw
                 line.append(str(val)[:CELL_MAX] if val is not None else "")
@@ -1350,8 +1367,8 @@ def row_values(path: Path, view: SheetView, row_index: int) -> dict[int, str]:
     wbr = load_workbook(path, data_only=False, read_only=True)
     try:
         r = view.row_numbers[row_index]
-        vals = wb[view.sheet].cell(row=r, column=1, values_only=True) or ()
-        raws = wbr[view.sheet].cell(row=r, column=1, values_only=True) or ()
+        vals = _row_at(wb[view.sheet], r, view.col_count)
+        raws = _row_at(wbr[view.sheet], r, view.col_count)
         out: dict[int, str] = {}
         for i in range(view.col_count):
             val = vals[i] if i < len(vals) else None
@@ -1372,19 +1389,38 @@ def check_context_columns(path: Path, view: SheetView,
     悄悄取第一行的后果是：用户以为整表共用一个值，实际前几行悄悄不同，
     而整批结果看起来都正常。
     """
-    for col in context_cols:
-        seen = None
-        for idx in range(len(view.row_numbers)):
-            val = row_values(path, view, idx).get(col, "")
-            if val == "":
-                continue
-            if seen is None:
-                seen = val
-            elif val != seen:
-                raise store.Invalid(
-                    f"第 {col + 1} 列「{view.headers[col]}」被设成上下文，"
-                    f"但它每一行都不一样（第 {idx + 1} 行是「{val[:30]}」，"
-                    f"前面是「{seen[:30]}」）。要么改成输入列，要么删掉这列。")
+    if not context_cols:
+        return
+    # **两个工作簿只开一次，整表读进内存再比。** 逐行调 row_values 等于
+    # 每行重新 load 一遍——1000 行的表就是 2000 次整表加载，20MB 的表
+    # 根本跑不完，而且用户看到的是「保存转圈很久没有任何提示」。
+    wb = load_workbook(path, data_only=True, read_only=True)
+    wbr = load_workbook(path, data_only=False, read_only=True)
+    try:
+        for col in context_cols:
+            seen = None
+            seen_row = 0
+            for idx, r in enumerate(view.row_numbers):
+                vals = _row_at(wb[view.sheet], r, view.col_count)
+                raws = _row_at(wbr[view.sheet], r, view.col_count)
+                val = vals[col] if col < len(vals) else None
+                raw = raws[col] if col < len(raws) else None
+                if val is None and isinstance(raw, str) and raw.startswith("="):
+                    val = raw
+                val = str(val)[:CELL_MAX] if val is not None else ""
+                if val == "":
+                    continue
+                if seen is None:
+                    seen, seen_row = val, idx
+                elif val != seen:
+                    raise store.Invalid(
+                        f"第 {col + 1} 列「{view.headers[col]}」被设成上下文，"
+                        f"但它每一行都不一样（第 {idx + 1} 行是「{val[:30]}」，"
+                        f"第 {seen_row + 1} 行是「{seen[:30]}」）。"
+                        f"要么改成输入列，要么删掉这列。")
+    finally:
+        wb.close()
+        wbr.close()
 
 
 # --- 渲染 -------------------------------------------------------------------
@@ -1547,7 +1583,10 @@ def test_write_back_is_atomic(tmp_path):
     for i in range(3):
         workflow.write_back(src, dest, "S1", 1,
                             [(i, workflow.OutputCol(2, "status"), "done")])
-    leftovers = list(Path(tmp_path).glob("*.tmp"))
+    # 注意 glob 的形状：临时文件叫 result.tmp.xlsx（**不是** result.tmp）。
+    # 写成 glob("*.tmp") 的话这条断言恒真——临时文件根本不在匹配范围内，
+    # 于是清理写错了也照样绿。这正是「断言恒真」最常见的一种伪装。
+    leftovers = list(Path(tmp_path).glob("*.tmp.xlsx"))
     assert leftovers == [], f"临时文件没清掉：{leftovers}"
     assert load_workbook(dest)["S1"].cell(row=4, column=3).value == "done"
 
@@ -2728,18 +2767,19 @@ def save_upload(filename: str, data: bytes, owner_id: int) -> dict:
         return info
 
     @app.post("/api/workflows")
-    def create_workflow(body: WorkflowIn, user=Depends(auth.current_user)):
+    def save_workflow(body: WorkflowIn, user=Depends(auth.current_user)):
+        """上传端点已经建好了记录，这里只负责**配列映射与模板**。
+
+        越权先判（404），再强校验，再落库——顺序反了会把「别人的工作流」
+        这个信息通过 400/409 的差异泄露出去。
+        """
         import workflow as wfmod
+        wf = store.get_workflow(body.workflow_id, owner_id=user["id"])
         cols = [c.model_dump() for c in body.columns]
         wfmod.validate_binding(body.prompt_template, cols)     # 服务端强校验
-        cols = store.list_workflow_columns(body.workflow_id) if body.workflow_id else cols
-        if body.workflow_id:
-            wf = store.get_workflow(body.workflow_id, owner_id=user["id"])
-            store.update_workflow(body.workflow_id,
-                                  prompt_template=body.prompt_template)
-            store.set_workflow_columns(body.workflow_id, cols)
-        else:
-            raise PreciseHTTPException(400, "请先上传表格再建工作流")
+        store.update_workflow(body.workflow_id,
+                              prompt_template=body.prompt_template)
+        store.set_workflow_columns(body.workflow_id, cols)
         return {"workflow": store.get_workflow(wf["id"], owner_id=user["id"])}
 
     @app.get("/api/workflows")
@@ -3468,14 +3508,26 @@ const ROLE_LABEL = {
 function renderRows(d) {
   const body = $("#wf-body");
   body.innerHTML = "";
-  for (const [i, row] of d.rows.entries()) {
+  // 表头是「行号列 + 每一列角色」共 1+N 格，所以数据行也必须 1+N 格。
+  // 少写一个 td，浏览器会把后面的行整体左移，读起来像是列错位了。
+  const cols = d.columns;
+  for (const row of d.rows) {
     const tr = document.createElement("tr");
     tr.addEventListener("click", () => loadPreview(row.workflow_row));
     const th = document.createElement("th");
     th.textContent = String(row.workflow_row + 1);
     th.title = row.title || "";
     tr.appendChild(th);
-    tr.appendChild(document.createElement("td"));   // 占位列，预览接口补
+    for (let i = 0; i < cols.length; i += 1) {
+      const td = document.createElement("td");
+      if (cols[i].role === "output") {
+        // 结果列：显示状态，其余交给详情页与结果表
+        td.textContent = row.status === "done" ? "已完成"
+                    : row.status === "failed" ? "失败" : row.status || "";
+        td.className = "cell-status";
+      }
+      tr.appendChild(td);
+    }
     body.appendChild(tr);
   }
 }
