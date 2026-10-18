@@ -539,6 +539,18 @@ def _server(name: str) -> str:
     return _read(REPO / "server" / name)
 
 
+def _root_vars(css: str) -> dict[str, str]:
+    """``:root`` 里定义的**颜色**变量 -> 字面色值。
+
+    只解析 ``:root`` 块本身，不扫全文：``--shadow`` 那种 rgba() 不是颜色变量，
+    而散落在各处的局部变量也不该被当成色板成员。
+    """
+    m = re.search(r":root\s*\{([^}]*)\}", css)
+    assert m, "style.css 里找不到 :root 块"
+    return dict(re.findall(r"(--[a-z0-9-]+):\s*(#[0-9A-Fa-f]{3,8})\s*;",
+                           m.group(1)))
+
+
 def test_workflow_card_shows_the_failed_row_count_and_the_number_is_real():
     """U1：卡片上要有失败数（规格 8.2 列表那条 + 7.4「失败行数放到最显眼处」）。
 
@@ -758,6 +770,36 @@ def test_workflow_table_is_styled_as_the_spec_demands():
         "状态色点没有绑到既有的 --st-failed 上（不许另起一套色值）"
     assert "wf-rownum" in js and "wf-dot" in js, \
         "JS 没有给行号与状态点挂上这两个类，样式等于没挂"
+
+
+def test_skipped_rows_get_a_colour_of_their_own_not_the_queued_one():
+    """跳过的行：文案已经是「已跳过」，色点也得是它自己那一档。
+
+    上一版修复把 ``data-status="skipped"`` 挂上了，属性对了，**颜色没跟上**：没有
+    对应规则时 ``.wf-dot`` 基类给的是 ``--st-queued``，于是这一行文案说「已跳过」、
+    色点却是排队那档灰蓝——正是同一版刚消灭的「文案一套、颜色另一套」，搬到了
+    色觉通道上。
+
+    **断具体取值，不断「skipped 出现过」**：那种断言在色值写错时照样绿。这里把规则
+    里的 background 变量抠出来，解析成 hex，再拿颜色值本身去比 queued 与 failed。
+    """
+    css = _read(CSS)
+    m = re.search(r'\.wf-dot\[data-status="skipped"\]\s*\{([^}]*)\}', css)
+    assert m, ("跳过的行没有自己的状态色点规则，它会回落成 .wf-dot 基类的 "
+               "--st-queued——文案写「已跳过」、颜色却是排队那档灰蓝")
+    used = re.search(r"background:\s*var\((--[a-z0-9-]+)\)", m.group(1))
+    assert used, "跳过的色点没有引既有色板里的变量（不许写死色值，也不许另起一套）"
+
+    root = _root_vars(css)
+    name = used.group(1)
+    assert name == "--fg-dim", (
+        f"跳过的色点绑到了 {name}，应该是 --fg-dim（中性灰，和 .chip-none 同一档）："
+        "跳过不是在干活，也不是失败——暖色是干活的度，红色只留给失败")
+    assert name in root, f"{name} 不在 :root 的色板里——又另起了一套色"
+    assert root[name] != root["--st-queued"], \
+        "跳过与排队画成了同一个颜色，跳过的行看着还在排队"
+    assert root[name] != root["--st-failed"], \
+        "跳过画成了失败那档红色——用户分不清「我跳过的」和「跑失败的」"
 
 
 def test_homepage_links_to_the_workflow_page():

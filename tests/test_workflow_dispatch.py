@@ -67,7 +67,43 @@ def disp(tmp_path, monkeypatch):
                             task_id, "failed", actor="system", message=msg))
     d._spawned = spawned
     yield d
+    _shutdown_archive(d)
+
+
+def _shutdown_archive(d, timeout: float = 30.0) -> None:
+    """夹具收尾：**先把归档做完**，再停机；并断言收尾之后一条线程都不剩。
+
+    为什么不能只调 ``d._archive_stop()``（复审已用 threading.Event 确定性复现）：
+
+    - ``_archive_stop`` 给每条线程投结束哨兵，但线程正在 ``write_back`` 里
+      （openpyxl 整表重写，结果表被 Excel 独占时更久）就看不见哨兵，join 的
+      ``poll_interval * 3 + 2.0`` 一到就返回；紧接着 ``self._archive_threads = []``
+      把唯一的引用也抹了——活着的线程既没被等到，也不再被任何一次后续 join 引用。
+    - ``db.connect()`` **每次现读** ``PROTFORGE_WEB_DB``，而 autouse 夹具每个测试
+      换一块库。于是收尾返回之后那条线程连到的是**下一个测试**的库：轻则
+      ``no such table: tasks`` 告警，重则 id 撞上时**静默**把下一个测试的一号行
+      任务改成 ``workflow_archived = 1``——失败落在无关的用例上，没人查得回根因。
+
+    **只改测试侧**：产品里环境变量不变、``stop()`` 之后进程立刻退出，而
+    ``write_back`` 是临时文件 + ``os.replace`` 原子写，最坏只是某行没置位，
+    闸门② 与 ``recover()`` 兜住，那是设计里已经写明并接受的形状。产品侧那半步
+    （留住引用、让第二次 stop 还能重试 join）修不了这条：线程照样活着去按新环境
+    连库——它只能让「还有线程没停」看得见，挡不住污染。而 Python 也没有杀线程
+    的办法（卡在 write_back 里的那条只能等它自己返回）。真正能改的是夹具：
+    **别把没做完的活扔下就走**。
+    """
+    # _archive_stop 会把 _archive_threads 清空，先留住这份引用——否则连
+    # 「到底有没有线程没停」都没法回答了。
+    mine = list(d._archive_threads)
+    drained = d._archive_wait(timeout)
     d._archive_stop()
+    # 自己再等一轮真退出，不指望 _archive_stop 那个预算（它就是本条缺陷的出处）。
+    deadline = time.time() + timeout
+    while time.time() < deadline and any(t.is_alive() for t in mine):
+        time.sleep(0.02)
+    alive = [t.name for t in mine if t.is_alive()]
+    assert drained, f"归档队列 {timeout} 秒没排空，收尾放行了没收完的活"
+    assert not alive, f"夹具收尾返回之后还有归档线程活着：{alive}"
 
 
 def _user(name="u1", role="user"):
@@ -1447,4 +1483,67 @@ def test_writeback_on_writes_every_row_and_they_all_survive(disp, tmp_path):
     ws = load_workbook(Path(result))["S1"]
     assert [ws.cell(row=2 + i, column=4).value for i in range(3)] == \
         ["done", "done", "done"]
+
+
+# --- F-1：夹具收尾不许放行没收完的活 ------------------------------------------
+
+
+def test_shutdown_waits_for_the_archive_to_finish_before_returning(disp, tmp_path,
+                                                                  monkeypatch):
+    """围栏：**归档还在途就收尾，收尾必须等它做完**，做完之后一条线程都不剩。
+
+    复审已用 threading.Event 确定性复现过原缺陷（`_archive_stop` 用时 2.31 秒就
+    返回，线程仍活着；下一个测试的一号行任务被静默改成 ``workflow_archived=1``）。
+    这里造的是同一个形状，**不用多进程、也不靠 sleep 碰运气**：
+
+    - write_back 里用一个 Event 把归档线程按在原地，而**只有本用例会去 set 它**——
+      「归档没做完」这个状态是夹具自己造出来的，与机器快慢无关；
+    - 把 ``poll_interval`` 调成负数：``_archive_stop`` 的 join 预算
+      ``poll_interval * 3 + 2.0`` 于是变负，等于**一秒都不等**。「等」与
+      「不等」因此在毫秒级上分出胜负，不必真的耗掉那 5 秒。而正确的收尾靠
+      :func:`_shutdown_archive` 自己那个真等待循环，不依赖这个被调小的预算，
+      所以下面两条断言仍然是实的。
+
+    判据是**收尾返回之后的状态**：没有归档线程存活，且那一行确实被归档完成了
+    （等它做完，而不是把它扔下）。
+    """
+    import workflow as wfmod
+    uid = _user()
+    wf = _workflow(uid, tmp_path)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    store.update_task(r0["id"], status="done", summary="ok")
+
+    entered = threading.Event()
+    release = threading.Event()
+    real = wfmod.write_back
+
+    def blocked(*a, **k):
+        entered.set()
+        release.wait(30)
+        return real(*a, **k)
+
+    monkeypatch.setattr(wfmod, "write_back", blocked)
+    disp._workflow_archive_pass()
+    assert entered.wait(5), "归档线程根本没开工，这条用例测不到想测的东西"
+    assert _archived(r0["id"]) == 0
+
+    disp.poll_interval = -0.7          # join 预算 → -0.1：_archive_stop 不再等
+    stopper = threading.Thread(target=_shutdown_archive, args=(disp,),
+                               name="wf-teardown", daemon=True)
+    stopper.start()
+    # 归档还被 Event 按着，收尾此刻**不可能**返回。返回了就说明它把没做完的活
+    # 扔下了——那条线程会活过夹具，去连下一个测试的库。
+    # （判据用 is_alive()，不是 join 的返回值：Python 3 的 Thread.join 恒返回 None。）
+    stopper.join(0.5)
+    assert stopper.is_alive(), "收尾没等归档做完就返回了"
+    assert _archived(r0["id"]) == 0, "归档还没放行，这一行就已经被置位了"
+
+    release.set()
+    stopper.join(30)
+    assert not stopper.is_alive(), "收尾之后归档还没停"
+    assert not [t.name for t in threading.enumerate()
+                if t.name.startswith("wf-archive-") and t.is_alive()], \
+        "收尾返回之后还有归档线程活着——它会去改下一个测试的库"
+    assert _archived(r0["id"]) == 1, "收尾把没收完的活丢掉了（得等它做完）"
 

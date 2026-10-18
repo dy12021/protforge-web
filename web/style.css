@@ -543,6 +543,10 @@ button { cursor: pointer; }
 .wf-dot[data-status="packaging"] { background: var(--st-packaging); }
 .wf-dot[data-status="done"]      { background: var(--st-done); }
 .wf-dot[data-status="failed"]    { background: var(--st-failed); }
+/* 跳过：**中性灰**，不是排队的灰蓝。它既没在干活（暖色是干活的度）也不是失败
+ * （红色只给失败，见 :root 那段色序注释），语义是「用户主动不跑」——和 .chip-none
+ * 用的是同一档中性色。文案已经写着「已跳过」，颜色再说一次「已排队」就成了两套话。 */
+.wf-dot[data-status="skipped"]  { background: var(--fg-dim); }
 
 /* 卡片上的两行数：失败多少行 + 当前在跑第几行（规格 8.2 列表那条 /
    7.4「失败行数放到最显眼处」）。这一整行排在进度条**上面**，失败数在这一行
