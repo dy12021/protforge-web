@@ -134,10 +134,18 @@ def read_source(path: Path, header_row: int = 1) -> SheetView:
         if header_row < 1:
             raise store.Invalid("表头行号从 1 开始")
         # 缺 <dimension> 时 openpyxl 给不出列数（None），定位也做不了。
-        # 上一版崩在「按列数循环读表头」那行，现在那里没有了，改在这里显式抛，
-        # **崩溃条件保持不变**（只有 max_column 为 None 才崩），不静默按 1 列读。
-        if wsv.max_column is None:
-            raise TypeError("这张表没有 <dimension> 元素，openpyxl 读不出列数")
+        # **必须在碰 max_column / max_row 之前抛**：HTTP 层会把 store.Invalid
+        # 转成 422 + 人话，TypeError 漏出去就是 **500 Internal Server Error**
+        # ——用户上传一个非 Excel 工具生成的文件，看到的是「服务器错误」
+        # 而不是「这张表读不了，请另存为 xlsx 再传」。
+        # max_column 与 max_row 同出于 openpyxl 的**一次** parse_dimensions
+        # 调用（缺 <dimension> 时双双为 None），而下面 iter_rows 直接用了
+        # wsv.max_row——所以这里两个一起判：只判 max_column 会漏掉 max_row。
+        if wsv.max_column is None or wsv.max_row is None:
+            raise store.Invalid(
+                "这张表读不了：文件里缺少行列范围声明（<dimension> 元素），"
+                "不是标准 Excel 写出来的 xlsx。请在 Excel 或 WPS 里打开它，"
+                "另存为 xlsx 后重新上传。")
 
         max_col = wsv.max_column or 1
         # **单遍顺序读完，表头也在同一次迭代里，绝不按行号或列号反复定位。**

@@ -10,10 +10,13 @@
 - **整表只许读一遍**：read_only 工作簿上按行号或按列号定位都要重开 XML 流、
   从流头重扫。逐行定位是 O(n^2)（800 行 19.8 秒），逐格 ``cell()`` 更狠
   （800 行 253.85 秒）——而 Task 5 每放行一行就调一次 read_source。
-  这条数**重开流的次数**，不测时间（CI 上必抖）。
+  这条数**重开流的次数**，不测时间（CI 上必抖）：开 N 个工作簿就只许开
+  N 次流——上界跟着实际工作簿数走，不写死，免得加工作簿时误红一个正确的改动。
 """
 from __future__ import annotations
 
+import re
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -166,6 +169,58 @@ def test_read_source_names_unnamed_headers(tmp_path):
     assert workflow.read_source(p4).headers == ["编号", "列2"]
 
 
+# --- 缺 <dimension> 的表（用户可见行为）---------------------------------------
+
+def _without_dimension(p: Path) -> Path:
+    """造一个**缺 ``<dimension>`` 元素**的 xlsx：解开 zip 改 XML 再重新打包。
+
+    非 Excel 工具（WPS 另存、Google Sheets 导出、部分生成库）写出来的 xlsx
+    真的会缺这个元素。openpyxl 只在 ``_get_size()`` 里解析它，元素不在时
+    ``max_column`` 与 ``max_row`` **双双为 None**（同一次 parse_dimensions
+    调用出来的），所以只判其中一个等于漏了另一个。
+    """
+    out = p.with_name(p.stem + "_nodim.xlsx")
+    with zipfile.ZipFile(p) as src:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                data = src.read(item.filename)
+                if item.filename == "xl/worksheets/sheet1.xml":
+                    xml = data.decode("utf-8")
+                    stripped = re.sub(r"<dimension[^>]*/>", "", xml, count=1)
+                    # 围栏围的是「读不出列数」这个状态；元素名若变了，
+                    # 夹具会静默造出一个正常的表，下面 assert 会替我们喊出来
+                    assert stripped != xml, "夹具没找到 <dimension>，围不到东西"
+                    data = stripped.encode("utf-8")
+                dst.writestr(item, data)
+    return out
+
+
+def test_read_source_reports_missing_dimension_as_invalid(tmp_path):
+    """缺 ``<dimension>`` 要抛 ``store.Invalid``，不是 TypeError。
+
+    HTTP 层会把 ``store.Invalid`` 转成 422 + 人话；TypeError 漏出去是
+    **500 Internal Server Error**——用户上传一个非 Excel 工具生成的文件，
+    看到的是「服务器错误」而不是「这张表读不了，请另存为 xlsx 再传」。
+    """
+    p = _without_dimension(_wb(tmp_path, [["编号", "序列"], ["1", "AAA"]]))
+    # 先证夹具真的造出了目标状态：否则下面断言围的是一个正常表，空转。
+    wb = load_workbook(p, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        assert ws.max_column is None, "夹具没生效：max_column=%r" % (ws.max_column,)
+        assert ws.max_row is None, "夹具只清了列数，max_row=%r" % (ws.max_row,)
+    finally:
+        wb.close()
+
+    with pytest.raises(store.Invalid) as ei:
+        workflow.read_source(p)
+    msg = str(ei.value)
+    # 围**文案**而不只围异常类型：TypeError 那版即使换成别的消息，
+    # 用户照样拿到 500——所以「说了什么、能怎么办」才是可验收的行为。
+    assert "dimension" in msg, "没说清为什么读不了：%s" % msg
+    assert "另存为" in msg, "没告诉用户该怎么办：%s" % msg
+
+
 # --- 读表不许退化成按行/按格定位（性能围栏，规格 5.1）---------------------------
 
 def _count_stream_opens(monkeypatch):
@@ -184,8 +239,9 @@ def _count_stream_opens(monkeypatch):
     **扣掉 ``_get_size`` 的那一次**：``ReadOnlyWorksheet.__init__`` 会调
     ``_get_size()`` 探一次 ``<dimension>``，它也重开一次流，但那是「打开这个
     sheet」的固定开销，与行数、列数都无关。不扣的话每次计数都多个常数偏移，
-    上限断言就得写成一个说不清来历的魔数。扣掉之后计数只剩「定位次数」，
-    一个工作簿单遍读完就是 1。
+    跟「开了几个工作簿」没法直接比。扣掉之后计数只剩「定位次数」，
+    一个工作簿单遍读完就是 1——这样才能钉住不变式「**开 N 次工作簿就开
+    N 次流**」，而不用把 2 写死当上限（配 ``_count_workbook_loads`` 用）。
 
     **这是 openpyxl 的私有 API，随版本可能改名或挪位置**（本次实测版本
     3.1.5）。升级 openpyxl 时这条围栏**要先验证仍能命中**再提交：
@@ -213,6 +269,34 @@ def _count_stream_opens(monkeypatch):
 
     monkeypatch.setattr(ReadOnlyWorksheet, "_get_size", probing_size)
     monkeypatch.setattr(ReadOnlyWorksheet, "_get_source", counted)
+    return calls
+
+
+def _count_workbook_loads(monkeypatch):
+    """数 workflow 调了几次 ``load_workbook``——也就是**开了几个工作簿**。
+
+    **为什么不再把 2 写死当上限**：``read_source`` 开两个工作簿
+    （``data_only=True`` 取值 / ``False`` 取公式），所以 ``<= 2`` 恰好
+    等于工作簿数——但那是**巧合式的硬编码**。将来有人加第三个工作簿
+    （比如更细的容错、读 defined names），计数变 3 而上限还是 2，
+    围栏会误红一个**正确的**改动。
+
+    改成数 ``load_workbook`` 的次数，两件事就解耦了：不变式从
+    「不许超过 2」变成「**每个工作簿只开一次流**」。加工作簿时
+    两边一起涨，断言自动跟随；真正的退化（同工作簿定位两次、
+    逐格 ``cell()``、逐行 ``iter_rows``）才红。
+
+    另外各处都留一条 ``len(loads) >= 2``：只写 ``calls == loads`` 时，
+    把两个工作簿砍成一个的话两边都变成 1，等式照样成立、围栏空转。
+    """
+    calls: list[int] = []
+    real = workflow.load_workbook
+
+    def counted(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(workflow, "load_workbook", counted)
     return calls
 
 
@@ -279,20 +363,31 @@ def test_stream_fence_hits_per_row_iter_rows(tmp_path, monkeypatch):
 
 def test_read_source_scans_the_sheet_once(tmp_path, monkeypatch):
     calls = _count_stream_opens(monkeypatch)
+    loads = _count_workbook_loads(monkeypatch)
     v = workflow.read_source(_big_xlsx(tmp_path, 100))
     assert len(v.row_numbers) == 100
-    assert len(calls) <= 2, (
-        "重开流 %d 次：一个工作簿一条流就够（两个工作簿 = 2 次）" % len(calls))
+    # 上界跟着实际工作簿数走，不是写死的 2
+    assert len(loads) >= 2, "只开了 %d 个工作簿：公式回退那一份呢" % len(loads)
+    assert len(calls) == len(loads), (
+        "开了 %d 个工作簿却重开流 %d 次：每个工作簿只许单遍读完一次"
+        % (len(loads), len(calls)))
 
 
 def test_read_source_scan_count_does_not_grow_with_rows(tmp_path, monkeypatch):
     calls = _count_stream_opens(monkeypatch)
+    loads = _count_workbook_loads(monkeypatch)
     workflow.read_source(_big_xlsx(tmp_path, 100, "small.xlsx"))
-    small = len(calls)
+    small, small_loads = len(calls), len(loads)
     calls.clear()
+    loads.clear()
     workflow.read_source(_big_xlsx(tmp_path, 800, "big.xlsx"))
-    big = len(calls)
-    assert small <= 2
+    big, big_loads = len(calls), len(loads)
+    assert small_loads >= 2
+    assert small == small_loads, (
+        "100 行：开了 %d 个工作簿却重开流 %d 次" % (small_loads, small))
+    assert big_loads >= 2
+    assert big == big_loads, (
+        "800 行：开了 %d 个工作簿却重开流 %d 次" % (big_loads, big))
     assert big == small, "重开流次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
 
 
@@ -304,14 +399,18 @@ def test_read_source_header_shares_the_single_pass(tmp_path, monkeypatch):
     种子——留着它，下一个人顺手改成 ``min_row=r`` 就是 O(n^2)。
     """
     calls = _count_stream_opens(monkeypatch)
+    loads = _count_workbook_loads(monkeypatch)
     v5 = workflow.read_source(_wide_xlsx(tmp_path, 5, 100, "n5.xlsx"))
-    narrow = len(calls)
+    narrow, narrow_loads = len(calls), len(loads)
     calls.clear()
+    loads.clear()
     v40 = workflow.read_source(_wide_xlsx(tmp_path, 40, 100, "n40.xlsx"))
-    wide = len(calls)
+    wide, wide_loads = len(calls), len(loads)
     assert (v5.col_count, len(v5.headers)) == (5, 5)
     assert (v40.col_count, len(v40.headers)) == (40, 40)
-    assert narrow <= 2
+    assert narrow_loads >= 2
+    assert narrow == narrow_loads
+    assert wide == wide_loads
     assert wide == narrow, (
         "40 列比 5 列多开了 %d 次流：表头还在逐列定位" % (wide - narrow))
 
@@ -319,27 +418,40 @@ def test_read_source_header_shares_the_single_pass(tmp_path, monkeypatch):
 def test_check_context_columns_scans_the_sheet_once(tmp_path, monkeypatch):
     """一列 context 就扫一次全表，三列也不能变成三遍全表。"""
     calls = _count_stream_opens(monkeypatch)
+    loads = _count_workbook_loads(monkeypatch)
     p = _big_xlsx(tmp_path, 200)
     v = workflow.read_source(p)
     calls.clear()
+    loads.clear()
     workflow.check_context_columns(p, v, [1, 2, 3])
-    assert len(calls) <= 2, "重开流 %d 次：逐列逐行重新定位了" % len(calls)
+    assert len(loads) >= 2, "只开了 %d 个工作簿" % len(loads)
+    assert len(calls) == len(loads), (
+        "开了 %d 个工作簿却重开流 %d 次：逐列逐行重新定位了" % (len(loads), len(calls)))
 
 
 def test_check_context_columns_scan_count_does_not_grow(tmp_path, monkeypatch):
     calls = _count_stream_opens(monkeypatch)
+    loads = _count_workbook_loads(monkeypatch)
     p1 = _big_xlsx(tmp_path, 100, "small.xlsx")
     v1 = workflow.read_source(p1)
     calls.clear()
+    loads.clear()
     workflow.check_context_columns(p1, v1, [1, 2, 3])
-    small = len(calls)
+    small, small_loads = len(calls), len(loads)
     calls.clear()
+    loads.clear()
     p2 = _big_xlsx(tmp_path, 800, "big.xlsx")
     v2 = workflow.read_source(p2)
     calls.clear()
+    loads.clear()
     workflow.check_context_columns(p2, v2, [1, 2, 3])
-    big = len(calls)
-    assert small <= 2
+    big, big_loads = len(calls), len(loads)
+    assert small_loads >= 2
+    assert small == small_loads, (
+        "100 行：开了 %d 个工作簿却重开流 %d 次" % (small_loads, small))
+    assert big_loads >= 2
+    assert big == big_loads, (
+        "800 行：开了 %d 个工作簿却重开流 %d 次" % (big_loads, big))
     assert big == small, "重开流次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
 
 
