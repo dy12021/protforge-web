@@ -407,13 +407,24 @@ def create_admin_app() -> FastAPI:
     # --- 计算任务 --------------------------------------------------------------
 
     @app.get("/api/admin/tasks")
-    def list_tasks(user: dict = Depends(require_admin)):
-        """全部任务 + 队列 + 待确认产物。
+    def list_tasks(
+            scope: Literal["regular", "workflow", "all"] = "regular",
+            user: dict = Depends(require_admin)):
+        """计算任务 + 队列 + 待确认产物。
 
         `pending_artifacts` 随任务一起给：确认区要按任务分组列时间窗产物，
         单独再开一个接口就得在前端做一遍 join，而这里 join 本来就在服务端。
+
+        `scope` 与用户侧 `GET /api/tasks?scope=` 同一套白名单（Literal），
+        默认 `regular`：**值班台是「现在有什么不对」的地方**，几百个正常跑的
+        行任务会把故障排查视图糊满；行任务的排查走工作流详情页（规格 8.3）。
+        队列与 counts 跟着 scope 走——它们描述的是这一屏里的东西，不是全库。
         """
         rows = store.list_tasks(None, None, is_admin=True, limit=500)
+        if scope == "regular":
+            rows = [r for r in rows if r.get("workflow_id") is None]
+        elif scope == "workflow":
+            rows = [r for r in rows if r.get("workflow_id") is not None]
         tasks = []
         for t in rows:
             view = _task_view(t)
@@ -474,10 +485,26 @@ def create_admin_app() -> FastAPI:
         target = (body.status or "").strip()
         if target not in db.VALID_STATUSES:
             raise store.Invalid(f"未知状态：{target}")
-        store.get_task(task_id, is_admin=True)
+        task = store.get_task(task_id, is_admin=True)
+        is_row = task.get("workflow_id") is not None
+        if is_row and target in ("running", "packaging"):
+            # 库里真写成非终态之后没有任何人能接走它：claim_queued 只认 queued，
+            # 闸门⑤「有没有行正在跑」从此恒真，**整批从这一行起永久卡死**，
+            # 而界面显示「正在跑第 N 行」且没有任何进程（规格 6.5）。
+            raise PanelError(
+                409,
+                "这是工作流行任务。把它改成「计算中」或「打包中」会让整批卡死："
+                "库里写成非终态之后没人能接走它。要重跑请用「重跑」，"
+                "要标成完成或失败请选终态。")
         if target not in db.TERMINAL_STATUSES:
             # 离开终态要清 done_at，否则「已完成于」的时间会一直挂在非终态任务上。
             store.update_task(task_id, done_at=None)
+        if is_row and target != task["status"]:
+            # workflow_archived 必须和 status 一起清，**与 retry 同理**：它的
+            # 语义是「本行的结果已经写回 Excel」，而归档 pass 扫的是
+            # 「终态 **且** archived=0」。管理员 force 成 done 之后这行 archived
+            # 还是 1 的话，它永远不会被扫到——界面说完成了，表里那行还是旧值。
+            store.update_task(task_id, workflow_archived=0)
         updated = store.set_status(task_id, target, actor="admin",
                                    message=body.note or "管理员改写了状态")
         return _task_view(updated)
@@ -498,6 +525,11 @@ def create_admin_app() -> FastAPI:
         # finish 会被 422 拒掉，而调度器 _settle 读到的是上一轮的标记，会把第二轮
         # 任何退出（包括直接崩溃）判成"正常收口"，最后打出一份与本次运行无关的旧包。
         store.clear_finished(task_id)
+        # workflow_archived 也必须清：它的语义是「**本行的结果已写回表**」，
+        # 不清的话重跑的行带着 archived=1，归档 pass 扫「终态 且 archived=0」，
+        # 于是这行的新结果永远不写回表，而平台上看起来一切正常（规格 6.5）。
+        # 动作上无关行任务：常规任务这一列恒为 0，写回 0 是空操作。
+        store.update_task(task_id, workflow_archived=0)
         updated = store.set_status(task_id, "queued", actor="admin",
                                    message="管理员把任务放回队列")
         return _task_view(updated)
