@@ -7,14 +7,11 @@
 from __future__ import annotations
 
 import re
-import shutil
-import uuid
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
 
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
 import store
 
@@ -63,6 +60,42 @@ def check_upload(filename: str, data: bytes) -> None:
 
 # --- 读表 -------------------------------------------------------------------
 
+def _cell_text(val, raw) -> str:
+    """单元格取文本：**公式回退**（规格 5.3）+ `CELL_MAX` 截断。
+
+    openpyxl 自己写的公式没有缓存值，`data_only=True` 读回来是 None——
+    不回退的话整列提示词全是 None，而任务照跑不误，只是算了个空。
+
+    read_source / row_values / check_context_columns **三处共用这一份**，
+    免得改了一处另外两处悄悄不同。
+    """
+    if val is None and isinstance(raw, str) and raw.startswith("="):
+        val = raw
+    return str(val)[:CELL_MAX] if val is not None else ""
+
+
+def _row_texts(vals, raws, max_col: int) -> list[str]:
+    """一整行前 max_col 个单元格的文本。
+
+    zip_longest 给两个工作簿补的 None、iter_rows 给短行补的空位，都在这里
+    兜成空串，所以调用方拿到的永远是 max_col 个 str。
+    """
+    vals = vals or ()
+    raws = raws or ()
+    return [_cell_text(vals[i] if i < len(vals) else None,
+                       raws[i] if i < len(raws) else None)
+            for i in range(max_col)]
+
+
+def _header_text(text: str, col: int) -> str:
+    """列名：去掉首尾空白，空的（None / 空串 / 纯空白）占位成「列N」。
+
+    纯空白表头塌成空串会往前端塞一个**空列名**——前端列表要拿它当列名显示，
+    用户看到的是一列表头里有一列是空的，还以为程序没读到这一列。
+    """
+    return text.strip() or f"列{col}"
+
+
 def _row_at(ws, r: int, max_col: int) -> list:
     """读 sheet 第 r 行的前 max_col 个值。**只给 row_values 用**（逐行取值）。
 
@@ -100,42 +133,39 @@ def read_source(path: Path, header_row: int = 1) -> SheetView:
         sheet = wsv.title
         if header_row < 1:
             raise store.Invalid("表头行号从 1 开始")
-
-        headers: list[str] = []
-        for col in range(1, wsv.max_column + 1):
-            h = wsv.cell(row=header_row, column=col).value
-            headers.append(str(h).strip() if h is not None else f"列{col}")
+        # 缺 <dimension> 时 openpyxl 给不出列数（None），定位也做不了。
+        # 上一版崩在「按列数循环读表头」那行，现在那里没有了，改在这里显式抛，
+        # **崩溃条件保持不变**（只有 max_column 为 None 才崩），不静默按 1 列读。
+        if wsv.max_column is None:
+            raise TypeError("这张表没有 <dimension> 元素，openpyxl 读不出列数")
 
         max_col = wsv.max_column or 1
+        # **单遍顺序读完，表头也在同一次迭代里，绝不按行号或列号反复定位。**
+        # read_only 工作簿上每定位一行（或一格）都要重开 archive 流、新建 parser
+        # 从 XML 流头重扫：iter_rows(min_row=r) 逐行定位是 O(n^2)
+        # （实测 800 行 19.8 秒），逐格 cell() 更狠（实测 800 行 253.85 秒）——
+        # 而 Task 5 每放行一行就调一次 read_source，用户看到的是
+        # 「保存转圈很久没有任何提示」。表头单独再读一遍虽然只有几毫秒，
+        # 却是同一类退化的种子，所以并进这一次迭代。
+        headers: list[str] = [f"列{i + 1}" for i in range(max_col)]
         row_numbers: list[int] = []
         preview: list[list[str]] = []
-        # **单遍顺序读完，绝不按行号反复定位。** read_only 工作簿上
-        # iter_rows(min_row=r, max_row=r) 每次都要从 XML 流头重新扫到第 r 行
-        # （openpyxl 的 ReadOnlyWorksheet._cells_by_row 每次调用都新建 parser），
-        # 于是逐行定位是 O(n^2)：实测 800 行 19.8 秒，而 Task 5 每放行一行就调
-        # 一次 read_source，用户看到的是「保存转圈很久没有任何提示」。
-        it_vals = wsv.iter_rows(min_row=header_row + 1, max_row=wsv.max_row,
+        it_vals = wsv.iter_rows(min_row=header_row, max_row=wsv.max_row,
                                 max_col=max_col, values_only=True)
-        it_raw = wsr.iter_rows(min_row=header_row + 1, max_row=wsv.max_row,
+        it_raw = wsr.iter_rows(min_row=header_row, max_row=wsv.max_row,
                                max_col=max_col, values_only=True)
-        for r, pair in enumerate(zip_longest(it_vals, it_raw),
-                                 start=header_row + 1):
+        for r, pair in enumerate(zip_longest(it_vals, it_raw), start=header_row):
             # zip_longest 补 None：两个工作簿行数不一致时短的那个按空行算。
-            row_vals, raw_vals = pair
-            row_vals = row_vals or ()
-            raw_vals = raw_vals or ()
-            line = []
-            for i in range(max_col):
-                val = row_vals[i] if i < len(row_vals) else None
-                raw = raw_vals[i] if i < len(raw_vals) else None
-                if val is None and isinstance(raw, str) and raw.startswith("="):
-                    val = raw
-                line.append(str(val)[:CELL_MAX] if val is not None else "")
-            if _blank(line):
+            vals, raws = pair
+            texts = _row_texts(vals, raws, max_col)
+            if r == header_row:
+                headers = [_header_text(t, i + 1) for i, t in enumerate(texts)]
+                continue
+            if _blank(texts):
                 continue
             row_numbers.append(r)
             if len(preview) < PREVIEW_ROWS:
-                preview.append(line)
+                preview.append(texts)
 
         if not row_numbers:
             raise store.Invalid("表里没有有效数据行")
@@ -157,14 +187,7 @@ def row_values(path: Path, view: SheetView, row_index: int) -> dict[int, str]:
         r = view.row_numbers[row_index]
         vals = _row_at(wb[view.sheet], r, view.col_count)
         raws = _row_at(wbr[view.sheet], r, view.col_count)
-        out: dict[int, str] = {}
-        for i in range(view.col_count):
-            val = vals[i] if i < len(vals) else None
-            raw = raws[i] if i < len(raws) else None
-            if val is None and isinstance(raw, str) and raw.startswith("="):
-                val = raw
-            out[i] = (str(val)[:CELL_MAX] if val is not None else "")
-        return out
+        return dict(enumerate(_row_texts(vals, raws, view.col_count)))
     finally:
         wb.close()
         wbr.close()
@@ -189,7 +212,8 @@ def check_context_columns(path: Path, view: SheetView,
         return
     order: dict[int, int] = {}
     for idx, r in enumerate(view.row_numbers):
-        order.setdefault(r, idx)      # 重复行号取第一次，与逐行比较的下标一致
+        if r not in order:      # 重复行号取第一次，与逐行比较的下标一致
+            order[r] = idx
     first = min(order)
     last = max(order)
     # 按数据行下标存，row_numbers 里的下标原样保留（跳过的全空行不参与）。
@@ -212,11 +236,9 @@ def check_context_columns(path: Path, view: SheetView,
             vals = vals or ()
             raws = raws or ()
             for col in context_cols:
-                val = vals[col] if col < len(vals) else None
-                raw = raws[col] if col < len(raws) else None
-                if val is None and isinstance(raw, str) and raw.startswith("="):
-                    val = raw
-                col_values[col][idx] = str(val)[:CELL_MAX] if val is not None else ""
+                col_values[col][idx] = _cell_text(
+                    vals[col] if col < len(vals) else None,
+                    raws[col] if col < len(raws) else None)
         for col in context_cols:
             seen = None
             seen_row = 0

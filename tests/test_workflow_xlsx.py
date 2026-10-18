@@ -7,9 +7,10 @@
 - **全空数据行要剔除**：真实 Excel 尾部常有一两行格式残留，``ws.max_row``
   会把它们算成数据行——不剔的话工作流会跑出一堆「输入全空」的行任务。
 - **context 列必须整列恒定**：不恒定就报错，不能悄悄取第一行。
-- **整表只许读一遍**：read_only 工作簿上按行号定位要从 XML 流头重扫，
-  逐行定位是 O(n^2)——Task 5 每放行一行就调一次 read_source，800 行的表
-  单次就要 19 秒。这条用 `iter_rows` 调用次数围，不测时间（CI 上必抖）。
+- **整表只许读一遍**：read_only 工作簿上按行号或按列号定位都要重开 XML 流、
+  从流头重扫。逐行定位是 O(n^2)（800 行 19.8 秒），逐格 ``cell()`` 更狠
+  （800 行 253.85 秒）——而 Task 5 每放行一行就调一次 read_source。
+  这条数**重开流的次数**，不测时间（CI 上必抖）。
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet._read_only import ReadOnlyWorksheet
 
 import store
 import workflow
@@ -153,58 +155,64 @@ def test_read_source_names_unnamed_headers(tmp_path):
     p = _wb(tmp_path, [["编号", None, None], ["1", "AAA", "CCC"]])
     v = workflow.read_source(p)
     assert v.headers == ["编号", "列2", "列3"]
-    # 只占位 None：纯空白表头是 strip 成空串（规格原样行为，见报告待裁决项）
+    # 纯空白（"  "）同样占位成「列N」，不是空串：塌成空串会往前端塞一个
+    # 空列名，用户看到的是一列表头里有一列是空的，还以为程序没读到。
     p2 = _wb(tmp_path, [["编号", "  "], ["1", "AAA"]], "ws.xlsx")
-    assert workflow.read_source(p2).headers == ["编号", ""]
+    assert workflow.read_source(p2).headers == ["编号", "列2"]
+    # 空串、只有制表符也要占位——它们同样是「这一列没有表头」
+    p3 = _wb(tmp_path, [["编号", ""], ["1", "AAA"]], "es.xlsx")
+    assert workflow.read_source(p3).headers == ["编号", "列2"]
+    p4 = _wb(tmp_path, [["编号", "\t"], ["1", "AAA"]], "tab.xlsx")
+    assert workflow.read_source(p4).headers == ["编号", "列2"]
 
 
-# --- 读表不许退化成逐行定位（性能围栏，规格 5.1）---------------------------
+# --- 读表不许退化成按行/按格定位（性能围栏，规格 5.1）---------------------------
 
-class _CountingWS:
-    """数 workflow 自己发起多少次 iter_rows。包一层，不改行为。"""
+def _count_stream_opens(monkeypatch):
+    """数 workflow 发起了多少次**定位**（每次定位重开一次 read_only XML 流）。
 
-    def __init__(self, ws, calls):
-        self._ws = ws
-        self._calls = calls
+    计数点是 ``openpyxl.worksheet._read_only.ReadOnlyWorksheet._get_source``——
+    openpyxl 每定位一次（不论按行还是按格）都调它一次：重开 archive 流 + 新建
+    一个 WorkSheetParser 从流头重扫。
 
-    def iter_rows(self, *a, **k):
-        self._calls.append(1)
-        return self._ws.iter_rows(*a, **k)
+    **为什么不能只数 iter_rows**：read_only 工作表的 ``cell(row=, column=)``
+    根本不经过 iter_rows（它内部直接调 ``_cells_by_row``），只围 iter_rows
+    的话，把 read_source 改成逐格 ``cell()`` **四条围栏会全绿**——而那条路
+    比逐行定位还慢两个数量级（实测 800 行 253.85 秒 vs 单遍 0.085 秒）。
+    围在 ``_get_source`` 上，两条退化路径一次抓住。
 
-    def __getattr__(self, name):
-        return getattr(self._ws, name)
+    **扣掉 ``_get_size`` 的那一次**：``ReadOnlyWorksheet.__init__`` 会调
+    ``_get_size()`` 探一次 ``<dimension>``，它也重开一次流，但那是「打开这个
+    sheet」的固定开销，与行数、列数都无关。不扣的话每次计数都多个常数偏移，
+    上限断言就得写成一个说不清来历的魔数。扣掉之后计数只剩「定位次数」，
+    一个工作簿单遍读完就是 1。
 
+    **这是 openpyxl 的私有 API，随版本可能改名或挪位置**（本次实测版本
+    3.1.5）。升级 openpyxl 时这条围栏**要先验证仍能命中**再提交：
+    ``test_stream_fence_hits_per_cell_cell_access`` 就是那个验证，它围的是
+    计数点本身。计数点失效时下面几条会**恒绿**，比没有围栏更危险。
 
-class _CountingWB:
-    def __init__(self, wb, calls):
-        self._wb = wb
-        self._calls = calls
-
-    def __getitem__(self, key):
-        return _CountingWS(self._wb[key], self._calls)
-
-    def close(self):
-        self._wb.close()
-
-    @property
-    def sheetnames(self):
-        return self._wb.sheetnames
-
-
-def _count_iter_rows(monkeypatch):
-    """把 workflow.load_workbook 换成会数 iter_rows 的替身。
-
-    **不测时间**——CI 上必然抖动。数调用次数才是确定的，且精确指向根因：
-    read_only 工作簿上 iter_rows(min_row=r, max_row=r) 每次都要从 XML 流头
-    重扫到第 r 行，所以逐行定位必然是「行数 × 行数」次调用。
+    **不测时间**——CI 上必然抖动。数次数才是确定的，且精确指向根因。
     """
     calls: list[int] = []
-    real = workflow.load_workbook
+    real_source = ReadOnlyWorksheet._get_source
+    real_size = ReadOnlyWorksheet._get_size
+    probing: list[int] = [0]
 
-    def fake(*a, **k):
-        return _CountingWB(real(*a, **k), calls)
+    def probing_size(self):
+        probing[0] += 1
+        try:
+            return real_size(self)
+        finally:
+            probing[0] -= 1
 
-    monkeypatch.setattr(workflow, "load_workbook", fake)
+    def counted(self):
+        if not probing[0]:
+            calls.append(1)
+        return real_source(self)
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "_get_size", probing_size)
+    monkeypatch.setattr(ReadOnlyWorksheet, "_get_source", counted)
     return calls
 
 
@@ -216,36 +224,110 @@ def _big_xlsx(tmp_path, n, name="big.xlsx"):
     return _wb(tmp_path, rows, name)
 
 
+def _wide_xlsx(tmp_path, cols, n, name):
+    """cols 列 × n 行，用来验「表头不是按列逐个定位」。"""
+    rows = [["表头%d" % (i + 1) for i in range(cols)]]
+    rows += [["v%d-%d" % (i + 1, r) for i in range(cols)] for r in range(n)]
+    return _wb(tmp_path, rows, name)
+
+
+def test_stream_fence_hits_per_cell_cell_access(tmp_path, monkeypatch):
+    """围栏的**正向对照**：计数点本身必须能抓住逐格 cell()。
+
+    这条围的不是 workflow，是**围栏自己**。`_get_source` 是私有 API：升级
+    openpyxl 之后它可能改名、被挪位置，或者 ReadOnlyWorksheet.cell() 不再
+    经过它——那时下面四条会恒绿，而表已经慢到不能用了。
+    这里直接数一遍逐格读取，开流次数必须与读取格数**逐个相等**，数错就红。
+    """
+    p = _big_xlsx(tmp_path, 20, "bad.xlsx")
+    calls = _count_stream_opens(monkeypatch)
+    wb = load_workbook(p, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        n = 0
+        for r in range(1, ws.max_row + 1):
+            for c in range(1, ws.max_column + 1):
+                ws.cell(row=r, column=c)
+                n += 1
+    finally:
+        wb.close()
+    assert n == 21 * 5, "夹具行数变了，%d" % n
+    assert len(calls) == n, (
+        "计数点没抓住逐格 cell()：读了 %d 格，只数到 %d 次开流。" % (n, len(calls)))
+
+
+def test_stream_fence_hits_per_row_iter_rows(tmp_path, monkeypatch):
+    """反向对照：计数点也必须能抓住 iter_rows(min_row=r) 逐行定位。
+
+    和上面那条一起，说明计数点覆盖的是两条退化路径，不只是其中一条。
+    """
+    p = _big_xlsx(tmp_path, 20, "bad2.xlsx")
+    calls = _count_stream_opens(monkeypatch)
+    wb = load_workbook(p, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        n = 0
+        for r in range(1, ws.max_row + 1):
+            list(ws.iter_rows(min_row=r, max_row=r, values_only=True))
+            n += 1
+    finally:
+        wb.close()
+    assert n == 21
+    assert len(calls) == n, (
+        "计数点没抓住逐行定位：读了 %d 行，只数到 %d 次开流。" % (n, len(calls)))
+
+
 def test_read_source_scans_the_sheet_once(tmp_path, monkeypatch):
-    calls = _count_iter_rows(monkeypatch)
+    calls = _count_stream_opens(monkeypatch)
     v = workflow.read_source(_big_xlsx(tmp_path, 100))
     assert len(v.row_numbers) == 100
-    assert len(calls) <= 2, "iter_rows 调了 %d 次：逐行重新定位了" % len(calls)
+    assert len(calls) <= 2, (
+        "重开流 %d 次：一个工作簿一条流就够（两个工作簿 = 2 次）" % len(calls))
 
 
 def test_read_source_scan_count_does_not_grow_with_rows(tmp_path, monkeypatch):
-    calls = _count_iter_rows(monkeypatch)
+    calls = _count_stream_opens(monkeypatch)
     workflow.read_source(_big_xlsx(tmp_path, 100, "small.xlsx"))
     small = len(calls)
     calls.clear()
     workflow.read_source(_big_xlsx(tmp_path, 800, "big.xlsx"))
     big = len(calls)
     assert small <= 2
-    assert big == small, "iter_rows 次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
+    assert big == small, "重开流次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
+
+
+def test_read_source_header_shares_the_single_pass(tmp_path, monkeypatch):
+    """表头不许另开一遍流逐列读——那是按列定位，同一类退化，只是短。
+
+    原来的 ``wsv.cell(row=header_row, column=col)`` 每列重开一次流：
+    40 列的表就是 40 次。列数本身拉不高单次耗时，但它是「按坐标定位」那颗
+    种子——留着它，下一个人顺手改成 ``min_row=r`` 就是 O(n^2)。
+    """
+    calls = _count_stream_opens(monkeypatch)
+    v5 = workflow.read_source(_wide_xlsx(tmp_path, 5, 100, "n5.xlsx"))
+    narrow = len(calls)
+    calls.clear()
+    v40 = workflow.read_source(_wide_xlsx(tmp_path, 40, 100, "n40.xlsx"))
+    wide = len(calls)
+    assert (v5.col_count, len(v5.headers)) == (5, 5)
+    assert (v40.col_count, len(v40.headers)) == (40, 40)
+    assert narrow <= 2
+    assert wide == narrow, (
+        "40 列比 5 列多开了 %d 次流：表头还在逐列定位" % (wide - narrow))
 
 
 def test_check_context_columns_scans_the_sheet_once(tmp_path, monkeypatch):
     """一列 context 就扫一次全表，三列也不能变成三遍全表。"""
-    calls = _count_iter_rows(monkeypatch)
+    calls = _count_stream_opens(monkeypatch)
     p = _big_xlsx(tmp_path, 200)
     v = workflow.read_source(p)
     calls.clear()
     workflow.check_context_columns(p, v, [1, 2, 3])
-    assert len(calls) <= 2, "iter_rows 调了 %d 次：逐列逐行重新定位了" % len(calls)
+    assert len(calls) <= 2, "重开流 %d 次：逐列逐行重新定位了" % len(calls)
 
 
 def test_check_context_columns_scan_count_does_not_grow(tmp_path, monkeypatch):
-    calls = _count_iter_rows(monkeypatch)
+    calls = _count_stream_opens(monkeypatch)
     p1 = _big_xlsx(tmp_path, 100, "small.xlsx")
     v1 = workflow.read_source(p1)
     calls.clear()
@@ -258,7 +340,7 @@ def test_check_context_columns_scan_count_does_not_grow(tmp_path, monkeypatch):
     workflow.check_context_columns(p2, v2, [1, 2, 3])
     big = len(calls)
     assert small <= 2
-    assert big == small, "iter_rows 次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
+    assert big == small, "重开流次数随行数增长：100 行 %d 次 → 800 行 %d 次" % (small, big)
 
 
 # --- 取值 -------------------------------------------------------------------
@@ -317,6 +399,40 @@ def test_read_source_preview_falls_back_to_formula_text(tmp_path):
     assert v.preview[0][1].startswith("=")
     assert v.preview[0][2] == "AAA"
     assert v.row_numbers == [2]
+
+
+def test_header_cell_falls_back_to_formula_text(tmp_path):
+    """**表头**里的公式也要回退，它走的是同一次迭代的另一个分支。
+
+    不回退的表现：列名塌成占位的「列1」，而同一张表的数据列有回退——
+    用户看到的是「表头叫列1，下面那列明明有内容」。
+    """
+    p = Path(tmp_path) / "hf.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws.append(["=LEN(B1)", "b"])     # 表头里的公式，没有缓存值
+    ws.append(["1", "AAA"])
+    wb.save(p)
+    v = workflow.read_source(p)
+    assert v.headers == ["=LEN(B1)", "b"], "表头公式没回退：列名=%r" % (v.headers,)
+    assert v.headers[0].startswith("="), "列名退化成占位名：%r" % (v.headers[0],)
+
+
+def test_header_cell_wholly_blank_falls_back_before_naming(tmp_path):
+    """回退和占位的顺序：公式回退先做，strip 后仍空才占位成「列N」。
+
+    顺序反了的话，公式表头会先被判成空、占位成「列N」，等于没回退。
+    """
+    p = Path(tmp_path) / "hb.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws.append(["编号", "  "])         # 第 2 列：纯空白
+    ws.append(["1", "AAA"])
+    wb.save(p)
+    v = workflow.read_source(p)
+    assert v.headers == ["编号", "列2"]
 
 
 # --- context 列恒定性（规格 5.1）--------------------------------------------
