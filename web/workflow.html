@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- SPEC 12：与首页同一口径——不做移动端适配，只保证桌面 1280px 以上 -->
+<meta name="viewport" content="width=1280">
+<title>工作流 · 自动化计算平台</title>
+<!-- 空 data URI 当 favicon：省掉一次必然 404 的 /favicon.ico 请求 -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="toolbar">
+  <a class="who" href="index.html">← 回到计算任务看板</a>
+  <h1>工作流</h1>
+  <span class="toolbar-gap"></span>
+  <span class="who">表格每行一个计算任务，逐行串行跑</span>
+</header>
+
+<!-- 全局提示条：上传失败、保存被服务端驳回、令牌过期都落在这里。
+     不能塞进某一栏里——那一栏关着的时候用户看不见。 -->
+<div id="wf-msg" class="board-msg" hidden></div>
+
+<main>
+  <!-- 列表 -->
+  <section id="wf-list" hidden>
+    <div class="toolbar">
+      <input type="file" id="wf-file" accept=".xlsx" aria-label="选一个 xlsx 表格">
+      <button id="wf-upload" class="primary" type="button">上传表格</button>
+      <span class="who" id="wf-upload-state"></span>
+    </div>
+    <div id="wf-cards"></div>
+  </section>
+
+  <!-- 详情 -->
+  <section id="wf-detail" hidden>
+    <div class="toolbar">
+      <button id="wf-back" class="secondary" type="button">← 全部工作流</button>
+      <span class="who" id="wf-name"></span>
+      <span class="who" id="wf-sheet"></span>
+      <span class="toolbar-gap"></span>
+      <span class="who" id="wf-progress-text"></span>
+    </div>
+
+    <div class="toolbar">
+      <button id="wf-start" class="primary" type="button">开始</button>
+      <button id="wf-pause" class="secondary" type="button">暂停（当前行跑完再停）</button>
+      <button id="wf-abort" class="secondary" type="button">中止整批（立刻停掉当前行）</button>
+      <!-- href 由 JS 在跑完之后才填：没跑完就没有结果表。
+           与其挂一个指向本页的占位死链，不如让它暂时还不是链接。 -->
+      <a id="wf-download" class="secondary" hidden>下载结果表</a>
+    </div>
+
+    <!-- 列映射：角色、绑定的变量、结果字段都在这一块里改。
+         改完点「保存映射」，服务端校验通过才落库，校验不过原样退回并在这里说原因。 -->
+    <div class="toolbar"><span class="who">列映射</span></div>
+    <div id="wf-cols"></div>
+
+    <div class="toolbar">
+      <span class="who">提示词模板（列绑定的变量写成两个大括号，例如 序列）</span>
+    </div>
+    <div class="toolbar">
+      <textarea id="wf-template" rows="4" style="flex:1 1 40rem"
+                placeholder="例：请按下面的条件计算，序列号是 序列。"></textarea>
+      <button id="wf-save" class="primary" type="button">保存映射</button>
+    </div>
+
+    <!-- 表格预览：点任意一行，下面显示那一行渲染出来的提示词 -->
+    <div class="toolbar"><span class="who">每一行</span></div>
+    <table>
+      <thead><tr id="wf-head"></tr></thead>
+      <tbody id="wf-body"></tbody>
+    </table>
+
+    <div class="toolbar">
+      <span class="who">第 <span id="wf-preview-row">1</span> 行渲染出来的提示词</span>
+    </div>
+    <pre id="wf-preview"></pre>
+  </section>
+</main>
+
+<script src="workflow.js"></script>
+</body>
+</html>

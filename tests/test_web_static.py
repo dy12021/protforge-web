@@ -22,10 +22,22 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-WEB = Path(__file__).resolve().parent.parent / "web"
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent
+WEB = REPO / "web"
+# 单文件的旧别名，保留给可能从外部引用它们的用例；**下面的检查一律走
+# _html()/_js()**，不然新文件（workflow.html/js）会整片落在检查范围外。
 HTML = WEB / "index.html"
 CSS = WEB / "style.css"
 JS = WEB / "app.js"
+# 工作流页是**新文件**，而这套检查原本只扫三个写死的文件——不把新文件加进
+# _files()，它就完全在检查范围外：禁用词、外链、状态色几类一个都不查。
+# 而工作流页必然要写「计算任务/计算进程」这类文案，正是最容易顺手写出
+# 禁用词的地方（规格 8.4）。
+_HTML_FILES = ["index.html", "workflow.html"]
+_CSS_FILES = ["style.css"]
+_JS_FILES = ["app.js", "workflow.js"]
 
 # 界面禁用词。**"AI" 必须大小写敏感**：app.js 里全是 detail / chain / main 这类
 # 小写词，用小写去查会误报一片。真正的风险是文案里混进大写的 AI。
@@ -37,8 +49,19 @@ def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
+def _html(name: str) -> str:
+    return _read(WEB / name)
+
+
+def _js(name: str) -> str:
+    return _read(WEB / name)
+
+
 def _files() -> dict[str, str]:
-    return {"index.html": _read(HTML), "style.css": _read(CSS), "app.js": _read(JS)}
+    out = {}
+    for name in _HTML_FILES + _CSS_FILES + _JS_FILES:
+        out[name] = _read(WEB / name)
+    return out
 
 
 # --- 零外链 / 零构建 -----------------------------------------------------
@@ -50,12 +73,19 @@ def test_no_external_resource_links():
     CSP 头是 `default-src 'self'`，任何一个 http(s) 外链都会被浏览器当场拦掉，
     而且拦掉的表现是"图标不显示"这种静默降级，不报错。
     """
-    html = _read(HTML)
-    refs = re.findall(r'(?:src|href)\s*=\s*"([^"]*)"', html)
-    assert refs, "index.html 一个资源引用都没有，八成是写坏了"
-    for r in refs:
-        assert not r.startswith(("http://", "https://", "//")), f"外链资源：{r}"
-        assert r in ("style.css", "app.js", "data:,"), f"意外的引用：{r}"
+    for name in _HTML_FILES:
+        html = _html(name)
+        refs = re.findall(r'(?:src|href)\s*=\s*"([^"]*)"', html)
+        assert refs, f"{name} 一个资源引用都没有，八成是写坏了"
+        for r in refs:
+            assert not r.startswith(("http://", "https://", "//")), \
+                f"{name} 外链资源：{r}"
+            # 白名单里刻意只列这几个同源文件，**不放宽成「任意同源路径」**——
+            # 放宽了等于放弃「首页只准引这几个」这条当初为了拦外链 CDN 而加的
+            # 约束。index.html 是工作流页「回到看板」的入口，与 Step 6 的
+            # 页面骨架一致。
+            assert r in ("style.css", "app.js", "workflow.js", "workflow.html",
+                         "index.html", "data:,"), f"{name} 意外的引用：{r}"
 
 
 def test_no_css_import_or_webfont():
@@ -64,6 +94,23 @@ def test_no_css_import_or_webfont():
     assert "@import" not in css
     for host in ("fonts.googleapis", "fonts.gstatic", "cdn.", "unpkg", "jsdelivr"):
         assert host not in css, f"CSS 里出现了外链来源：{host}"
+
+
+def test_user_ui_files_match_disk_both_ways():
+    """白名单里有而磁盘上没有 → 红；磁盘上有而白名单里没有 → 红。
+
+    后一种就是线上 404 而所有测试全绿的形状（规格 8.4）。
+    """
+    import sys
+    if str(REPO / "server") not in sys.path:
+        sys.path.insert(0, str(REPO / "server"))
+    import app as svc
+
+    whitelisted = set(svc.USER_UI_FILES)
+    on_disk = {p.name for p in WEB.iterdir()
+               if p.suffix in (".html", ".js", ".css")}
+    assert whitelisted <= on_disk, f"白名单里有磁盘上没有的：{whitelisted - on_disk}"
+    assert on_disk <= whitelisted, f"磁盘上有白名单里没有的：{on_disk - whitelisted}"
 
 
 # --- 坑 1：[hidden] 必须显式压回 display:none ----------------------------
@@ -104,7 +151,7 @@ def test_hidden_attribute_is_forced_to_display_none():
 
 def test_edit_block_starts_hidden():
     """编辑容器开局必须是 hidden：抽屉详情默认只读。"""
-    js = _read(JS)
+    js = _js("app.js")
     m = re.search(r"function editable\((.*?)\n}", js, re.S)
     assert m, "找不到 editable()：只读/编辑两态的骨架没了"
     body = m.group(1)
@@ -119,7 +166,7 @@ def test_confirm_dialog_finish_is_guarded_and_unbinds():
 
     否则第二次确认会被第一次的闭包直接 resolve 掉——那不是"取消"，是中止/删错。
     """
-    js = _read(JS)
+    js = _js("app.js")
     m = re.search(r"function confirmAction\((.*?)\n}", js, re.S)
     assert m, "找不到两步确认"
     body = m.group(1)
@@ -135,7 +182,7 @@ def test_global_escape_ignores_open_dialog():
     否则确认表开着按 Esc：底下的抽屉一起关掉，而 cancel 事件又没正常走到，
     Promise 永远不 resolve，按钮卡在 disabled 再也点不动。
     """
-    js = _read(JS)
+    js = _js("app.js")
     assert 'dialog[open]' in js, "全局 Esc 没有给模态 dialog 让路"
 
 
@@ -144,10 +191,11 @@ def test_no_native_prompt_confirm_or_alert():
 
     这是用户在创意面板上明确纠正过的第三件事。
     """
-    js = _read(JS)
-    for fn in ("window.prompt", "prompt(", "window.confirm", "confirm(", "alert("):
-        assert fn not in js, f"用了原生弹窗：{fn}"
-
+    for name in _JS_FILES:
+        js = _js(name)
+        for fn in ("window.prompt", "prompt(", "window.confirm", "confirm(",
+                   "alert("):
+            assert fn not in js, f"{name} 用了原生弹窗：{fn}"
 
 # --- 界面口径 -----------------------------------------------------------
 
@@ -188,7 +236,7 @@ def test_status_colors_bound_to_css_variables():
     css = _read(CSS)
     for v in ("--st-queued", "--st-running", "--st-packaging", "--st-done", "--st-failed"):
         assert v in css, f"缺变量 {v}"
-    js = _read(JS)
+    js = _js("app.js")
     assert 'style.setProperty("--seg", "var(--st-' in js, "流转轨应当只引 CSS 变量"
 
 
@@ -202,13 +250,13 @@ def test_rail_has_a_dot_per_station():
     """
     css = _read(CSS)
     assert ".rail-dot" in css, "流转轨没有圆点元素"
-    js = _read(JS)
+    js = _js("app.js")
     assert "rail-dot" in js, "JS 没有为每一站生成圆点"
 
 
 def test_rail_has_exactly_four_stations_and_excludes_failed():
     """轨只画四站；failed 是终点，不占一站（否则轨会读成五段进度条）。"""
-    js = _read(JS)
+    js = _js("app.js")
     m = re.search(r"const STATUS_ORDER\s*=\s*\[([^\]]*)\]", js)
     assert m, "找不到 STATUS_ORDER"
     stations = [x.strip().strip('"\'') for x in m.group(1).split(",") if x.strip()]
@@ -220,7 +268,7 @@ def test_failed_colors_only_the_current_station():
 
     整线变红会丢掉"走到哪一步"，正是流转轨存在的意义。
     """
-    js = _read(JS)
+    js = _js("app.js")
     assert re.search(r"failed\s*&&\s*i\s*===\s*idx", js), (
         "failed 必须只给当前站染色（而不是整条线涂红）"
     )
@@ -228,7 +276,7 @@ def test_failed_colors_only_the_current_station():
 
 def test_running_card_shows_step():
     """running 的卡片要在轨下方显示 task.step（后端已按 80 码点截断）。"""
-    js = _read(JS)
+    js = _js("app.js")
     assert re.search(r"t\.step|step\)\s*\{", js), "卡片没有渲染 step"
     assert "step" in js
 
@@ -238,7 +286,7 @@ def test_running_card_shows_step():
 
 def test_drawer_starts_hidden():
     """抽屉开局关着，且 JS 在拿到数据前不主动打开。"""
-    html = _read(HTML)
+    html = _html("index.html")
     m = re.search(r"<aside[^>]*>", html)
     assert m and 'id="drawer"' in m.group(0), "找不到抽屉"
     assert "hidden" in m.group(0), "抽屉开局就是打开的"
@@ -264,7 +312,7 @@ def test_save_uses_server_echoed_value():
     现在钉的是真正的不变量：**同一个变量**先从 PATCH 的返回值来，随后被交给
     done() 重绘。中间隔着几行、变量叫什么，都不影响它成立。
     """
-    js = _read(JS)
+    js = _js("app.js")
     saved = re.compile(
         r"const\s+(\w+)\s*=\s*detailTask\(\s*await api\(\s*\"PATCH\".*?\);"
         r".*?done\(\s*\1\s*\.",
@@ -314,14 +362,14 @@ def _save_callbacks(js: str) -> list[str]:
 
 def test_api_base_is_overridable_and_same_origin_by_default():
     """api() 的 base 走同源 /api，开发时可用 PROTFORGE_WEB_BASE 覆盖。"""
-    js = _read(JS)
+    js = _js("app.js")
     assert "PROTFORGE_WEB_BASE" in js
     assert '"/api"' in js
 
 
 def test_token_is_bearer_in_header_not_cookie():
     """鉴权走 Authorization: Bearer（不放 Cookie），localStorage 取 token。"""
-    js = _read(JS)
+    js = _js("app.js")
     assert "Bearer" in js
     assert "localStorage" in js
 
@@ -332,7 +380,7 @@ def test_brief_upper_bound_is_enforced_client_side():
     断言必须**认准需求说明那个 textarea**：标题也有 maxlength（200），
     只找"第一个 maxlength"会把标题的当成 brief 的。
     """
-    html = _read(HTML)
+    html = _html("index.html")
     m = re.search(r"<textarea[^>]*id=\"c-brief\"[^>]*>", html)
     assert m, "提交表单里没有需求说明输入框"
     bound = re.search(r"maxlength=\"(\d+)\"", m.group(0))
@@ -342,25 +390,31 @@ def test_brief_upper_bound_is_enforced_client_side():
 
 def test_stream_is_read_with_fetch_not_eventsource():
     """Bearer 走请求头，EventSource 带不了 Authorization —— 必须用 fetch 读流。"""
-    js = _read(JS)
+    js = _js("app.js")
     assert "new EventSource" not in js, "EventSource 发不了 Authorization 头"
     assert "getReader" in js
     assert "Last-Event-ID" in js
 
 
-def test_every_dom_id_the_script_touches_exists_in_the_html():
-    """app.js 引用的 id 必须在 HTML 里（或是它自己动态挂上去的）。
+@pytest.mark.parametrize("js_name,html_name",
+                         [("app.js", "index.html"),
+                          ("workflow.js", "workflow.html")])
+def test_every_dom_id_the_script_touches_exists_in_the_html(
+        js_name, html_name):
+    """脚本引用的 id 必须在它自己那个 HTML 里（或是它自己动态挂上去的）。
 
     少一个 id 的话，`document.getElementById("x").oninput = ...` 就是
     null.oninput —— 顶层直接抛异常，后面的脚本一行都不执行。
     而页面看着是活的（HTML 渲染得好好的），其实一个按钮都没绑事件，
     排查时最容易误判成"后端没返回数据"。
     """
-    js, html = _read(JS), _read(HTML)
+    js, html = _js(js_name), _html(html_name)
     used = set(re.findall(r'getElementById\("([^"]+)"\)', js))
+    used |= set(re.findall(r'\$\(\s*["\']#([\w-]+)["\']\s*\)', js))
     have = set(re.findall(r'id="([^"]+)"', html))
     made = set(re.findall(r'\.id\s*=\s*"([^"]+)"', js))   # JS 自己建出来的（如抽屉提示条）
     missing = used - have - made
-    assert not missing, f"app.js 引用了不存在的 id：{sorted(missing)}"
+    assert not missing, f"{js_name} 引用了不存在的 id：{sorted(missing)}"
     # 反过来也钉一下：HTML 上的控件没人引用，多半是只写了壳忘了绑事件
-    assert not (have - used), f"HTML 里有没人用的 id：{sorted(have - used)}"
+    assert not (have - used), \
+        f"{html_name} 里有没人用的 id：{sorted(have - used)}"

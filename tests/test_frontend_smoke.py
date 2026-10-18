@@ -32,7 +32,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 SMOKE = REPO / "tests" / "frontend_smoke.mjs"
 FIXTURES = REPO / "tests" / "_real_fixtures.json"
-TARGETS = [REPO / "web" / "app.js", REPO / "admin-ui" / "app.js"]
+TARGETS = [REPO / "web" / "app.js", REPO / "web" / "workflow.js",
+           REPO / "admin-ui" / "app.js"]
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None,
                                 reason="没装 node，跑不了前端脚本")

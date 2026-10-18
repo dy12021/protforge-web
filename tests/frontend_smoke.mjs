@@ -144,6 +144,62 @@ function loadFixtures() {
     task: FIXTURES['/tasks'].tasks[0],
     events: [], artifacts: [],
   };
+
+  // 工作流页的夹具。形状照 server/app.py 里的 _wf_view / 列模型 / 详情路由写，
+  // 不是随手编的：冒烟抓到过的「响应没拆信封就 .map」就是形状不对。
+  // 未知路径的兜底是 {}，于是 d.workflows 会是 undefined，
+  // for...of 直接抛 TypeError——所以这一段缺了会让冒烟红。
+  //
+  // 三条从代码里核出来、照抄直觉会写错的点：
+  //   1. **没有 writeback 字段**：_wf_view() 明确把它 pop 掉了（v1 不暴露）。
+  //      夹具里加一个 writeback: false 会让前端以为它存在，掩盖真 bug。
+  //   2. workflow.status 的 CHECK 是 ('draft','running','paused','finished')，
+  //      **终态是 finished，不是 done**（行任务才是 done/failed）。
+  //   3. 详情路由还返回 skips；列表只返回 workflows 一个键。
+  //
+  // 键的顺序有讲究：stubFetch 用 startsWith(k + '/') 找夹具，**先插入的赢**。
+  // 具体的（/preview）必须排在笼统的（/api/workflows）前面，否则预览会拿到
+  // 列表的信封——而信封形状错了前端照样不报错，只是渲染出 undefined。
+  const WF = {
+    id: 1, owner_id: 1, name: '示例工作流', status: 'running',
+    sheet: 'Sheet1', source_path: 'C:/data/workflows/wf1/source.xlsx',
+    prompt_template: '请计算 {{seq}}',
+    header_row: 1, key_col: 0,
+    total_rows: 3, cursor: 1,
+    writeback_pending: 0, abort_requested: 0,
+    result_path: '', created_at: '2026-10-18 10:00:00',
+    updated_at: '2026-10-18 10:05:00',
+  };
+  FIXTURES['/api/workflows/1/preview'] = {
+    row: 0,
+    rendered: '请计算 SEQ-001',
+    values: { Sheet1: { 0: 'SEQ-001', 1: '' } },
+  };
+  FIXTURES['/api/workflows/1'] = {
+    workflow: WF,
+    // workflow_columns 是 SELECT * ：id / workflow_id 也在里面
+    columns: [
+      { id: 1, workflow_id: 1, col_index: 0, header: '标识',
+        role: 'key', slot: '', field: '' },
+      { id: 2, workflow_id: 1, col_index: 1, header: '序列',
+        role: 'input', slot: 'seq', field: '' },
+      { id: 3, workflow_id: 1, col_index: 2, header: '结果',
+        role: 'output', slot: '', field: 'summary' },
+    ],
+    skips: [],
+    // 行就是普通计算任务（tasks 表），status 走主链那套词
+    rows: [
+      { id: 11, title: '行 1', status: 'done', summary: '算完了', error: '',
+        workflow_id: 1, workflow_row: 0, workflow_archived: 1 },
+      { id: 12, title: '行 2', status: 'running', summary: '', error: '',
+        workflow_id: 1, workflow_row: 1, workflow_archived: 0 },
+    ],
+  };
+  FIXTURES['/api/workflows'] = { workflows: [WF] };
+  FIXTURES['/api/workflows/upload'] = {
+    workflow: WF, headers: ['标识', '序列', '结果'], row_count: 3,
+    preview: [['A1', 'SEQ-001', '']],
+  };
   return FIXTURES;
 }
 
@@ -198,6 +254,10 @@ function stubFetch(calls, ctl = {}) {
 const REQUIRED = {
   'web\\app.js': ['/api/me', '/api/tasks'],
   'web/app.js': ['/api/me', '/api/tasks'],
+  // workflow.js 的这条**必须**在：isWeb 只匹配 app.js，查不到键时 required 是
+  // 空数组，于是「boot() 走完了」那条检查变成恒真——页面整个死了也是绿的。
+  'web\\workflow.js': ['/api/workflows'],
+  'web/workflow.js': ['/api/workflows'],
   'admin-ui\\app.js': ['/me', '/tasks', '/users'],
   'admin-ui/app.js': ['/me', '/tasks', '/users'],
 };
