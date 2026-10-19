@@ -99,6 +99,12 @@ function makeEl(tag, id) {
     set(v) { text = String(v); if (v === '') node.children = []; },
     enumerable: true,
   });
+  // 真 DOM 里 childNodes 也在。少了它，`ul.childNodes.length` 那类写法在桩里
+  // 是 undefined.length —— 直接抛，于是「写进经验」那个按钮的行为根本测不了。
+  Object.defineProperty(node, 'childNodes', {
+    get() { return node.children; },
+    enumerable: true,
+  });
   return node;
 }
 
@@ -538,6 +544,93 @@ async function smoke(file) {
   };
 }
 
+/**
+ * 反思那四个**危险按钮**的行为围栏：重跑 / 否决 / 写进经验 / 应用方案。
+ *
+ * 这条围栏是被一条真缺陷逼出来的。`confirmBody` 的第三个参数是「读表单值」
+ * 的回调——onOk 里是 `read()`，**不传参**；而这四个按钮照着**用户面板**
+ * `confirmAction` 的写法写成了「拿到一个回调再调它」。那个参数是 undefined，
+ * 一调就抛：抛在接口调用之前，重跑按钮完全空转；抛在之后，那张确认表永远
+ * 不关，Promise 悬着。
+ *
+ * 静态断言看不出这个：形状完全正确，正则也匹配得上，58 条静态围栏照绿。
+ * 所以这里**真的点一遍**：先点按钮（这时不许有任何写接口调用），再点确认表
+ * 里的确认（这时必须正好一次），最后确认表要关上。
+ */
+async function checkReflectionConfirms(r) {
+  const errs = [];
+  const sb = r.sandbox;
+  const calls = [];
+  const realApi = sb.api;
+  sb.api = (method, path) => {
+    calls.push([method, path]);
+    if (method === 'GET') {
+      return Promise.resolve({
+        id: 7, diff: '--- a/x\n+++ b/x', proposal_target: 'skills/x/SKILL.md',
+      });
+    }
+    return Promise.resolve({ ok: true, message: 'stub' });
+  };
+  const dlg = sb.document.getElementById('confirm');
+  /** 确认表里的「确认」按钮：#confirm > .confirm-inner > .confirm-actions > [算了, 确认] */
+  const okButton = () => {
+    const inner = dlg.children[0];
+    const acts = inner.children[inner.children.length - 1];
+    return acts.children[acts.children.length - 1];
+  };
+  /** 动作型调用：只有这几个是「点了确认才该发生」的写操作。 */
+  const writes = () => calls.filter((c) => c[0] === 'POST' && String(c[1]).includes('/reflections/'));
+  const cases = [
+    ['retryBtn', { id: 7, error: 'boom' }, '/reflections/7/retry', '重跑'],
+    ['rejectBtn', { id: 7 }, '/reflections/7/reject', '否决'],
+    ['landBtn', { id: 7 }, '/reflections/7/land', '写进去'],
+    ['applyBtn', { id: 7 }, '/reflections/7/apply', '应用'],
+  ];
+  try {
+    for (const [fn, arg, path, label] of cases) {
+      calls.length = 0;
+      let btn;
+      try {
+        btn = sb[fn](arg);
+        // applyBtn 的处理函数是 async 的（要先取回方案），所以要等它跑完。
+        await Promise.all(btn.fire('click'));
+      } catch (e) {
+        errs.push(`${fn}() 点下去就抛了：${e && e.message}`);
+        continue;
+      }
+      if (writes().length) {
+        errs.push(`${fn}() 没过确认就写接口了：${JSON.stringify(writes())}`);
+        continue;
+      }
+      let ok;
+      try {
+        ok = okButton();
+        if (ok.textContent !== label) {
+          errs.push(`${fn}() 的确认按钮写着「${ok.textContent}」，应该是「${label}」`);
+          continue;
+        }
+        ok.fire('click');
+      } catch (e) {
+        errs.push(`${fn}() 点了确认之后抛异常：${e && e.message}`);
+        continue;
+      }
+      await new Promise((res) => setImmediate(res));
+      const hit = writes().filter((c) => String(c[1]) === path);
+      if (hit.length !== 1) {
+        errs.push(`${fn}() 确认之后${hit.length ? '写了 ' + hit.length + ' 次' : '没有写'} `
+          + `${path}：实际 ${JSON.stringify(calls)}`);
+      }
+      if (dlg.open) {
+        errs.push(`${fn}() 确认之后确认表没有关闭（回调抛了或没返回）`);
+        dlg.close();
+      }
+    }
+  } finally {
+    sb.api = realApi;
+  }
+  return errs;
+}
+
 const files = process.argv.slice(2);
 if (!files.length) {
   console.error('用法：node tests/frontend_smoke.mjs <app.js> [...]');
@@ -589,6 +682,10 @@ for (const f of files) {
     if (/web[\\/]workflow\.js$/.test(f)) {
       for (const m of await checkSkippedRows(r)) errs.push(new Error(m));
       for (const m of checkParity(r.sandbox)) errs.push(new Error(m));
+    }
+    // 值班台的反思按钮：确认之前不许写，确认之后必须写。
+    if (/admin-ui[\\/]app\.js$/.test(f)) {
+      for (const m of await checkReflectionConfirms(r)) errs.push(new Error(m));
     }
   } catch (e) {
     errs.push(e);

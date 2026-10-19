@@ -781,6 +781,34 @@ def create_admin_app() -> FastAPI:
         user, _ = who
         return store.reject_reflection(reflection_id, user["username"])
 
+    @app.post("/api/admin/reflections/{reflection_id}/retry")
+    def retry_reflection(reflection_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
+        """重跑：作废这条失败的反思，让巡检重新做一遍。
+
+        **为什么必须有这条路**：``generate`` 见到记录就直接返回，所以一条失败
+        了的反思永远停在失败态——模型调不通也好、正文写坏了也好，没有任何
+        出口能让它重做。而在管理员眼里「这条没复盘成」和「这条就这样吧」
+        是两回事，前者该有重试的后者该有否决。
+
+        **这里只删，不生成**：生成由 dispatcher 那一个进程做（admin 与 public
+        是两个进程，各生成一次的话两份正文会互相覆盖）。删掉记录之后这条
+        任务重新变成「终态但还没反思」，巡检下一轮就会扫到它。
+        """
+        user, _ = who
+        rec = store.get_reflection(reflection_id)
+        if rec["status"] != "failed":
+            raise store.Invalid(
+                "只有「生成失败」的反思能重跑。已经分类或已落地的那些，"
+                "重跑会把管理员的判断一起冲掉。")
+        store.delete_reflection(reflection_id)
+        reflection.discard_body(rec["path"])
+        return {
+            "ok": True,
+            "task_id": rec["task_id"],
+            "message": (f"已作废任务 #{rec['task_id']} 的这条失败反思，"
+                        "巡检会重新生成一次（新的那条会以新的编号出现）。"),
+        }
+
     @app.post("/api/admin/reflections/{reflection_id}/land")
     def land(reflection_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
         """落地。分类为「经验」时写进全局经验文件与对应技能的 references。

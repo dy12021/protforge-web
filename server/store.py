@@ -997,6 +997,31 @@ def create_reflection(task_id: int, path: str, suggested: str = "") -> dict:
         c.close()
 
 
+def delete_reflection(reflection_id: int) -> dict:
+    """删掉一条反思记录。**只给「重跑」用。**
+
+    为什么需要它：``generate`` 见到记录就直接返回，所以一条失败了的反思
+    永远停在失败态——模型调不通也好、数据根在飞行中变了也好，没有任何出口
+    能让它重做一遍。而失败的那条在管理员眼里是「这条没复盘成」，不是
+    「这条就这样吧」。
+
+    删掉记录之后，这条任务重新变成「终态但还没反思」，巡检下一轮就会
+    重新扫到它、重新生成一次。**生成只由 dispatcher 那一个进程做**，
+    这里不代劳——两个进程各写一次正文，正文就会互相覆盖。
+    """
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM reflections WHERE id = ?",
+                        (int(reflection_id),)).fetchone()
+        if row is None:
+            raise NotFound("反思记录不存在")
+        c.execute("DELETE FROM reflections WHERE id = ?", (int(reflection_id),))
+        c.commit()
+    finally:
+        c.close()
+    return _fix_reflection_row(row)
+
+
 def _fix_reflection_row(row) -> dict:
     d = dict(row)
     # 建议分类必须落在词表内：模型可能吐出任何字符串，写进库里之前先归一。

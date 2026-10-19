@@ -361,6 +361,19 @@ def read_body(path: str) -> str:
         raise store.Invalid(f"读不到反思正文：{p.name}（{exc}）") from exc
 
 
+def discard_body(path: str) -> bool:
+    """删掉一份反思正文。**重跑时用**：那份存根写的是「生成失败」，留着只会
+    让下一个人以为这条还是坏的。删不掉不算错——下一次生成会写同一个路径。"""
+    try:
+        Path(path).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        log.warning("删不掉反思正文 %s，下次生成会覆盖它", path)
+        return False
+
+
 # --- 生成 ---------------------------------------------------------------------
 
 def generate(task_id: int) -> dict:

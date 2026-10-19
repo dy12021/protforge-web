@@ -1194,7 +1194,15 @@ function confirmAction(spec) {
  * 留下的监听会让**第二次确认被第一次的闭包直接 resolve 掉**——那就不是
  * 「取消」而是中止错任务。所以收尾统一走 finish()，且**幂等**（answered 守卫）
  * + 解绑监听。监听 close 而不是 cancel：Esc、点「算了」、点确认都走 close，
- * 于是「没点确认就关掉了」一律判成取消，不会出现 Promise 悬着、按钮卡 disabled。 */
+ * 于是「没点确认就关掉了」一律判成取消，不会出现 Promise 悬着、按钮卡 disabled。
+ *
+ * **第三个参数 `read` 是「读值」回调**：确认被点了才跑，而且**不传参**——
+ * 它的返回值就是这张表 resolve 出去的东西。于是只有两种用法：
+ *   - 要读表单值：read 返回那个值（改状态读下拉、重置密码读输入框）；
+ *   - 只是「确认完就跑动作」：read 里把动作做了，返回 true。
+ *
+ * 别按「拿到一个回调再调它」的写法来：那个参数是 undefined，一调就抛。
+ * 抛在接口调用之前，按钮就是完全空转；抛在之后，那张表永远不关。 */
 function confirmBody(content, okLabel, read) {
   const dlg = document.getElementById("confirm");
   const inner = el("div", "confirm-inner");
@@ -1369,11 +1377,49 @@ function reflCard(r) {
     acts.append(reclassifyBtn(r, "tool_gap", "其实该改工具"));
   } else if (r.status === "reviewed" && r.kind === "tool_gap") {
     acts.append(proposeRow(r));
+  } else if (r.status === "failed") {
+    /* 失败的那条必须有个重跑的口子。
+     *
+     * 没有的话，模型调不通一次、或者正文写坏一次，这条反思就**永远**停在
+     * 失败态——而管理员看到的只是一条没有按钮的卡片，既不能重试也不能
+     * 否决，只能干看着。 */
+    acts.append(retryBtn(r));
   }
   if (acts.childNodes.length) box.append(acts);
 
   box.append(panel);
   return box;
+}
+
+/* 重跑：作废这条，让巡检重新做一遍。
+ *
+ * 走两步确认：它把一条记录从库里删了，管理员得知道「这条没了」是本意，
+ * 不是出错了。 */
+function retryBtn(r) {
+  const b = el("button", "btn btn-warn", "重新生成");
+  b.type = "button";
+  b.addEventListener("click", () => {
+    const body = el("div");
+    body.append(el("h2", "confirm-title", "让这条反思重新生成一次？"));
+    body.append(el("p", "confirm-lead",
+      "这一条当前是「生成失败」。重跑会把它作废，巡检会再试一次——"
+      + "新的那条会以新的编号出现在列表里。"));
+    body.append(el("p", "confirm-lead",
+      r.error ? "失败原因：" + r.error : ""));
+    confirmBody(body, "重跑", () => {
+      api("POST", "/reflections/" + r.id + "/retry")
+        .then(got => {
+          state.reflOpenId = null;
+          setMsg(document.getElementById("board-msg"),
+                 (got && got.message) || "已重新排队", "ok");
+          return loadReflections();
+        })
+        .catch(e => setMsg(document.getElementById("board-msg"),
+                            e.message || "重跑失败", "bad"));
+      return true;
+    });
+  });
+  return b;
 }
 
 function classifyBtn(r, kind, label) {
@@ -1409,12 +1455,12 @@ function rejectBtn(r) {
     body.append(el("h2", "confirm-title", "否决这条反思？"));
     body.append(el("p", "confirm-lead",
       "否决之后它不再出现在待办里，但反思正文仍然留着，随时能翻出来看。"));
-    confirmBody(body, "否决", ok => {
+    confirmBody(body, "否决", () => {
       api("POST", "/reflections/" + r.id + "/reject")
         .then(() => loadReflections())
         .catch(e => setMsg(document.getElementById("board-msg"),
                             e.message || "否决失败", "bad"));
-      ok();
+      return true;
     });
   });
   return b;
@@ -1437,12 +1483,12 @@ function landBtn(r) {
       ul.append(el("li", null, "（正文还没取到，先点「看正文」再写）"));
     }
     body.append(ul);
-    confirmBody(body, "写进去", ok => {
+    confirmBody(body, "写进去", () => {
       api("POST", "/reflections/" + r.id + "/land")
         .then(() => loadReflections())
         .catch(e => setMsg(document.getElementById("board-msg"),
                             e.message || "写经验失败", "bad"));
-      ok();
+      return true;
     });
   });
   return b;
@@ -1507,12 +1553,12 @@ function applyBtn(r) {
       + "这一步之后技能立刻生效，写错了只能靠 git 回退。"));
     const pre = el("pre", "refl-diff", detail.diff);
     body.append(pre);
-    confirmBody(body, "应用", ok => {
+    confirmBody(body, "应用", () => {
       api("POST", "/reflections/" + r.id + "/apply")
         .then(() => loadReflections())
         .catch(e => setMsg(document.getElementById("board-msg"),
                             e.message || "应用失败", "bad"));
-      ok();
+      return true;
     });
   });
   return b;
@@ -1566,6 +1612,9 @@ async function renderReflPanel(panel, r) {
     acts.append(landBtn(fresh));
   } else if (fresh.status === "reviewed" && fresh.kind === "tool_gap") {
     acts.append(proposeRow(fresh));
+  } else if (fresh.status === "failed") {
+    // 失败那条的重跑入口：漏了它的话，点一下「看正文」重跑按钮就没了。
+    acts.append(retryBtn(fresh));
   }
   if (acts.childNodes.length) panel.insertBefore(acts, panel.firstChild);
 }

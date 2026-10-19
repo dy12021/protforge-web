@@ -55,6 +55,139 @@ def _files() -> dict[str, str]:
     return {"index.html": _read(HTML), "style.css": _read(CSS), "app.js": _read(JS)}
 
 
+# --- JS 注释剥离 -------------------------------------------------------------
+#
+# 静态围栏是拿正则去源码里找形状的。**注释里写着一模一样的形状时，正则照样
+# 匹配上**——于是「确认整个去掉了，只在别处留一句提到 confirmBody 的注释」
+# 这种缺陷照样绿。这不是假设：有一条变异就是这么写的（注释里留着
+# `confirmBody(body, "重跑", ok => {`），围栏没咬住，测了两轮才发现。
+#
+# 抹掉的是**注释**，不是字符串：字符串里的 `//`（URL、正则）不能当注释。
+# 所以下面是个小词法器，认三样东西：行注释、块注释、字符串（' " `）。
+# 还有一样容易漏的：**正则字面量**——`/[",\n]/` 里就有个引号，按字符串处理
+# 会把后面一大段当成字符串，注释就抹不掉了。正则靠「前一个有效字符」区分：
+# 前面是 `=(,:[!&|?{};` 这类，或者 return/typeof 这类关键字，就是正则；
+# 否则是除号。
+
+_REGEX_KEYWORDS = ("return", "typeof", "case", "in", "of", "new", "delete",
+                   "void", "do", "else", "await", "yield")
+#: 这些字符之后出现的 `/` 是**正则**的开始，不是除号。
+_REGEX_AFTER = set("=(,:[!&|?{};")
+
+
+def _regex_can_start_here(prev: str, prev_word: str) -> bool:
+    if prev == "":
+        return True
+    if prev in _REGEX_AFTER:
+        return True
+    return prev_word in _REGEX_KEYWORDS
+
+
+def _strip_js_comments(src: str) -> str:
+    """把 JS 源码里的注释抹掉，只留可执行代码。行数与缩进保持不变。
+
+    抹掉的部分用空格替掉（换行保留），于是按缩进找函数收尾的那套逻辑
+    （`_fn` / `_branch`）照旧成立。
+    """
+    out: list[str] = []
+    word: list[str] = []
+    prev = ""            # 上一个有效字符（跳过空白）
+    prev_word = ""       # 上一个有效标识符
+    i, n = 0, len(src)
+
+    def flush_word() -> None:
+        nonlocal prev_word
+        if word:
+            prev_word = "".join(word)
+            word.clear()
+
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+
+        if c == "/" and nxt == "/":                       # 行注释
+            j = src.find("\n", i)
+            j = n if j == -1 else j
+            out.append(" " * (j - i))
+            i = j
+            continue
+
+        if c == "/" and nxt == "*":                       # 块注释
+            j = src.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in src[i:j]))
+            i = j
+            continue
+
+        if c == "/" and _regex_can_start_here(prev, prev_word):   # 正则字面量
+            j = i + 1
+            in_class = False
+            while j < n:
+                ch = src[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == "\n":                            # 没闭合就别当正则
+                    break
+                if ch == "[":
+                    in_class = True
+                elif ch == "]":
+                    in_class = False
+                elif ch == "/" and not in_class:
+                    j += 1
+                    while j < n and src[j].isalpha():     # 标志位（g / i / m）
+                        j += 1
+                    break
+                j += 1
+            out.append(src[i:j])
+            flush_word()
+            prev = "/"
+            i = j
+            continue
+
+        if c in "\"'`":                                    # 字符串
+            j = i + 1
+            while j < n:
+                ch = src[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == c:
+                    j += 1
+                    break
+                if ch == "\n" and c != "`":               # 没闭合就别一直吞
+                    break
+                j += 1
+            out.append(src[i:j])
+            flush_word()
+            prev = c
+            i = j
+            continue
+
+        out.append(c)
+        if c.isalnum() or c in "_$":
+            word.append(c)
+        else:
+            flush_word()
+            if not c.isspace():
+                prev = c
+        i += 1
+
+    flush_word()
+    return "".join(out)
+
+
+_JS_CODE: str | None = None
+
+
+def _js_code() -> str:
+    """整份 app.js 去掉注释后的代码。缓存一份：`_fn` 一轮下来要调几十次。"""
+    global _JS_CODE
+    if _JS_CODE is None:
+        _JS_CODE = _strip_js_comments(_read(JS))
+    return _JS_CODE
+
+
 def _fn(name: str) -> str:
     """取 JS 里某个函数的源码（到**同缩进的**收尾 `}` 为止）。
 
@@ -62,8 +195,11 @@ def _fn(name: str) -> str:
     它们的 `}` 也是行首，朴素匹配会在函数**中间**截断——于是断言"函数体里有
     某个按钮"时，恰恰在按钮之前就返回了后半段看不到的假阴性。
     按缩进配对才是对的：取该函数声明所在行的缩进，收尾是同缩进的 `}`。
+
+    拿的是**去掉注释之后**的代码：注释里留着一样的形状时，正则会照样匹配上，
+    于是「代码删了、注释里还留着」的缺陷照样绿。
     """
-    js = _read(JS)
+    js = _js_code()
     m = re.search(r"^([ \t]*)(?:async )?function " + re.escape(name) + r"\(", js, re.M)
     assert m, f"找不到函数 {name}()"
     indent = m.group(1)
@@ -908,6 +1044,99 @@ def test_apply_proposal_shows_the_real_diff_before_touching_anything():
     assert re.search(r'el\("pre",\s*"refl-diff",\s*detail\.diff\)', body), \
         "diff 没有进确认表正文——确认的是一句说明，不是改动本身"
     assert "/apply" in body, "确认之后没有真的调应用端点"
+
+
+def test_a_failed_reflection_offers_a_way_to_run_it_again():
+    """失败的那条必须给一个「重跑」的出口。
+
+    这条是被真机抓出来的：值班台上「生成失败」的反思卡片上**一个按钮都没有**。
+    而 `generate` 见到记录就直接返回，于是模型调不通一次、正文写坏一次，
+    这条反思就**永远**停在失败态——管理员既不能重试也不能否决。
+
+    少这一条按钮的代价不是"少个功能"，是这条反思彻底没人管了：它既不在
+    待办里（不算 draft），又永远回不来。
+    """
+    card = _fn("reflCard")
+    failed = _branch(card, 'else if (r.status === "failed")')
+    assert "retryBtn" in failed, \
+        "失败的那条反思没有重跑入口：它永远停在失败态，管理员干看着"
+    # 展开正文会重画动作条，那里也得有——不然点一下「看正文」按钮就没了。
+    panel = _fn("renderReflPanel")
+    failed2 = _branch(panel, 'else if (fresh.status === "failed")')
+    assert "retryBtn" in failed2, \
+        "展开正文后重画的动作条里没有重跑入口：点一下「看正文」按钮就消失了"
+
+
+def test_retry_goes_through_a_confirmation_and_calls_the_retry_endpoint():
+    """重跑要两步确认，且**接口调用必须在确认回调里面**。
+
+    只查「函数体里出现过 confirmBody」是不够的：把确认整个去掉、别处留一句
+    提到 confirmBody 的注释，照样能过——而那正是"管理员没确认，记录就被删了"。
+    这条围栏第一次就是这么写的，被一条变异当场揭穿；第二次仍然没咬住，
+    因为那句注释被正则当成了真的调用（`_fn` 现在只给**去注释后**的代码）。
+
+    所以这里查的是**确认回调的函数体里有没有那个接口调用**：
+    confirmBody 的第一个参数是表体，第二个是按钮文案，第三个才是回调。
+    """
+    body = _fn("retryBtn")
+    m = re.search(
+        r'confirmBody\(\s*body\s*,\s*"重跑"\s*,\s*\(\s*\)\s*=>\s*\{(.*?)\n\s*\}\);',
+        body, re.S)
+    assert m, "重跑没有走两步确认（找不到「确认表 → 回调」这个形状）"
+    inner = m.group(1)
+    assert "/retry" in inner, \
+        "重跑的接口调用不在确认回调里：管理员还没确认，记录就被删了"
+    # 只出现一次：回调里一次、回调外一次，说明有另一条路绕过了确认。
+    assert body.count("/retry") == 1, \
+        "重跑按钮里有多于一处接口调用：有一条绕过了确认"
+
+
+def test_reflection_actions_use_the_read_contract_not_a_callback():
+    """反思那四个按钮的确认回调必须**不接参数**。
+
+    `confirmBody` 的第三个参数是「读表单值」的回调——onOk 里是 `read()`，
+    **不传参**，它的返回值就是那张表 resolve 出去的东西。于是只有两种用法：
+    要读表单值就返回那个值；只是「确认完就跑动作」就把动作做了、返回 true。
+
+    写成「拿到一个回调再调它」（也就是当它是个 `ok`）是错的：那个参数是
+    undefined，一调就抛。抛在接口调用之前，重跑按钮完全空转；抛在之后，
+    确认表永远不关、Promise 悬着。
+
+    **这条是被真机抓出来的**：那四个按钮照着**用户面板** `confirmAction` 的
+    写法写进了**值班台**，两套约定串了。静态形状完全正确，58 条静态围栏全绿
+    ——只有真把确认点一遍才看得见（行为围栏在 tests/frontend_smoke.mjs）。
+    """
+    for fn, label in (("retryBtn", "重跑"), ("rejectBtn", "否决"),
+                      ("landBtn", "写进去"), ("applyBtn", "应用")):
+        body = _fn(fn)
+        m = re.search(r'confirmBody\(\s*body\s*,\s*"' + label + r'"\s*,(.*)', body, re.S)
+        assert m, f"{fn}() 的确认表不是 confirmBody(body, \"{label}\", ...)"
+        arg = m.group(1).lstrip()
+        assert arg.startswith("() =>"), (
+            f"{fn}() 的确认回调声明了参数「{arg.splitlines()[0]}」："
+            "confirmBody 的第三参是读值回调，不传参——那个参数是 undefined，"
+            "一调就抛，抛在接口调用之前按钮就完全空转"
+        )
+
+
+def test_the_comment_stripper_keeps_code_and_drops_comments():
+    """剥注释的词法器本身要有围栏：它错了，全盘的静态围栏就都瞎了。
+
+    三个容易错的地方：字符串里的 `//` 不是注释；正则字面量里的引号不是
+    字符串的开始；行数不能变（按缩进找函数收尾的那套逻辑靠它）。
+    """
+    src = (
+        'const a = 1; // 注释里也有 confirmBody(\n'
+        '/* 块注释\n'
+        '第二行 */ const b = "http://x//y";\n'
+        'const re = /[",\\n]/;\n'
+    )
+    code = _strip_js_comments(src)
+    assert "注释里也有" not in code, "行注释没被抹掉"
+    assert "块注释" not in code, "块注释没被抹掉"
+    assert "http://x//y" in code, "字符串里的 // 被当成注释抹掉了"
+    assert '/[",\\n]/' in code, "正则字面量里的引号被当成了字符串的开始"
+    assert code.count("\n") == src.count("\n"), "抹注释时行数变了"
 
 
 def test_reflections_render_the_models_guess_as_a_guess():
