@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS reflections (
   proposal_target TEXT NOT NULL DEFAULT '',
   proposal_base TEXT NOT NULL DEFAULT '',
   proposal_state TEXT NOT NULL DEFAULT '',
+  proposal_error TEXT NOT NULL DEFAULT '',
   decided_by TEXT NOT NULL DEFAULT '',
   decided_at TEXT,
   applied_at TEXT,
@@ -249,6 +250,13 @@ _MISSING_TASK_COLUMNS = (
     "workflow_archived INTEGER NOT NULL DEFAULT 0",
 )
 
+# 反思表补列。**方案失败的原因要单独一列**：reflections.error 是「这次反思
+# 没生成出来」用的（而且分类那一步会把它清空），把方案失败的原因塞进去，
+# 管理员在界面上看到的还是「生成失败」四个字——原因只进了日志。
+_MISSING_REFLECTION_COLUMNS = (
+    "proposal_error TEXT NOT NULL DEFAULT ''",
+)
+
 # 但**建在被补齐的新列上的索引不能写进 SCHEMA**：executescript(SCHEMA) 跑在
 # _add_missing_columns 之前，旧库那时还没有 workflow_id，一句
 # `CREATE INDEX ... ON tasks(workflow_id)` 就会以 `no such column` 让整段
@@ -260,7 +268,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_workflow ON tasks(workflow_id);
 """
 
 
-def _add_column(c: sqlite3.Connection, spec: str) -> None:
+def _add_column(c: sqlite3.Connection, spec: str, table: str = "tasks") -> None:
     """加一列，容忍「别的进程刚加过」这一种失败。
 
     平台上有三个进程同时开着同一个库（public / admin / internal），它们都在
@@ -271,7 +279,7 @@ def _add_column(c: sqlite3.Connection, spec: str) -> None:
     迁移失败却报告成功——那是这个项目最熟的一种静默失效形状。
     """
     try:
-        c.execute(f"ALTER TABLE tasks ADD COLUMN {spec}")
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {spec}")
     except sqlite3.OperationalError as exc:
         if "duplicate column" not in str(exc).lower():
             raise
@@ -282,6 +290,10 @@ def _add_missing_columns(c: sqlite3.Connection) -> None:
     for spec in _MISSING_TASK_COLUMNS:
         if spec.split()[0] not in have:
             _add_column(c, spec)
+    have_r = {r[1] for r in c.execute("PRAGMA table_info(reflections)")}
+    for spec in _MISSING_REFLECTION_COLUMNS:
+        if spec.split()[0] not in have_r:
+            _add_column(c, spec, "reflections")
 
 
 def init_db() -> None:

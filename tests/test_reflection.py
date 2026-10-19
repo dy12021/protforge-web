@@ -98,7 +98,12 @@ def fake_llm(monkeypatch):
     """把模型换成一个可控的桩。返回 {text, calls}，``text`` 可随时改。"""
     box = {"text": GOOD_REPLY, "calls": 0}
 
-    def _fake(prompt, *, system="", max_tokens=None, timeout=None):
+    def _fake(prompt, *, system="", max_completion_tokens=None,
+              reasoning_effort=None, timeout=None):
+        # 签名**显式写全**：chat_completion 改过参数名（max_tokens →
+        # max_completion_tokens，还多了 reasoning_effort），桩写成 **kwargs
+        # 就再也发现不了调用方用错了参数名——而那种错在真机上表现为
+        # TypeError，整个反思悄无声息地标成 failed。
         box["calls"] += 1
         return box["text"]
 

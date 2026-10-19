@@ -1183,7 +1183,8 @@ def set_reflection_proposal(reflection_id: int, proposal: str, target: str,
             raise Invalid("这条已经落地了，不能再挂新方案")
         c.execute(
             "UPDATE reflections SET proposal = ?, proposal_target = ?,"
-            " proposal_base = ?, proposal_state = 'ready' WHERE id = ?",
+            " proposal_base = ?, proposal_state = 'ready', proposal_error = ''"
+            " WHERE id = ?",
             (str(proposal), str(target), str(base_hash), int(reflection_id)))
         _touch_reflection(c, reflection_id)
         c.commit()
@@ -1191,15 +1192,21 @@ def set_reflection_proposal(reflection_id: int, proposal: str, target: str,
         c.close()
 
 
-def set_proposal_state(reflection_id: int, state: str) -> None:
+def set_proposal_state(reflection_id: int, state: str, error: str = "") -> None:
     """只改方案状态。``running`` 在调模型**之前**就写：管理员看到「正在生成」
-    就知道该等，而看到空白就该重试——把这两者混在一列里就成了猜。"""
+    就知道该等，而看到空白就该重试——把这两者混在一列里就成了猜。
+
+    **失败原因一起写下来。** 原来失败只改状态、不留原因：界面上是
+    「生成失败」四个字，原因只在日志里，而日志是管理员不会去看的地方。
+    ``error`` 一律覆盖：重新生成时状态回到 running，**旧原因必须一起清掉**，
+    否则界面上会挂着一个上一轮的错，而这一轮还没跑完。
+    """
     if state not in db.PROPOSAL_STATES:
         raise Invalid(f"方案状态不合法：{state}")
     c = db.connect()
     try:
-        c.execute("UPDATE reflections SET proposal_state = ? WHERE id = ?",
-                  (state, int(reflection_id)))
+        c.execute("UPDATE reflections SET proposal_state = ?, proposal_error = ?"
+                  " WHERE id = ?", (state, str(error)[:500], int(reflection_id)))
         _touch_reflection(c, reflection_id)
         c.commit()
     finally:

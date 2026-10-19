@@ -416,7 +416,7 @@ def generate(task_id: int) -> dict:
 
     try:
         raw = llm.chat_completion(build_prompt(task), system=REFLECT_SYSTEM,
-                                  max_tokens=4096)
+                                  max_completion_tokens=8192)
         parsed = parse_reflection(raw)
     except (llm.LLMError, ReflectionError) as exc:
         try:
@@ -619,16 +619,29 @@ def build_proposal(reflection_id: int, target: str) -> dict:
     # 「正在生成」而不是一个转不出来的按钮。
     store.set_proposal_state(reflection_id, "running")
     try:
-        raw = llm.chat_completion(prompt, system=PROPOSE_SYSTEM, max_tokens=8192)
-    except Exception:
-        store.set_proposal_state(reflection_id, "failed")
+        # **思考档位 low + 预算 32k。** 这两项都不是"调优"，是"能不能跑通"：
+        # 默认档实测思考了 9,441 tokens（43k 字符）、花 165 秒，而 8192 的预算
+        # 正好被思考吃光 → finish_reason=length → 正文一个字都没有 →
+        # 「模型回的不是预期的 chat 结构」。改档位还顺带把改动收住了：
+        # 同一份反馈，默认档改出 246 行（把 46 行的文件重写了一遍），
+        # low 档 79 行——提示词里「不要顺手重构」那条守住了。
+        raw = llm.chat_completion(prompt, system=PROPOSE_SYSTEM,
+                                  max_completion_tokens=32768,
+                                  reasoning_effort="low")
+    except Exception as exc:
+        # **失败原因必须留下来**：原来只把状态标成 failed，原因只进日志。
+        # 界面上管理员看到的是「生成失败」四个字，没有别的——他连
+        # 「模型调不通」还是「路径写错了」都分不出来。
+        store.set_proposal_state(reflection_id, "failed", str(exc))
         raise
     after = strip_fence(raw)
     if not after.strip():
-        store.set_proposal_state(reflection_id, "failed")
+        store.set_proposal_state(reflection_id, "failed", "模型回了空的修改后内容")
         raise ReflectionError("模型回了空的修改后内容")
     if after == before:
-        store.set_proposal_state(reflection_id, "failed")
+        store.set_proposal_state(
+            reflection_id, "failed",
+            "模型说不用改——那这条就不是「工具不够用」，该否决")
         raise ReflectionError("模型说不用改——那这条就不是「工具不够用」，该否决")
 
     patch = diff_for(rel, before, after)

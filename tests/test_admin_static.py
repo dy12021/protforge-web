@@ -1146,6 +1146,22 @@ def test_landing_lets_the_admin_pick_the_skill_and_says_what_it_wrote():
         "模型的建议连提示都没给：管理员不知道该填什么"
 
 
+def test_a_failed_proposal_says_why_it_failed():
+    """方案生成失败时，界面要说出**原因**。
+
+    原来只有一句「上一次生成没成功，可以改完再试」——管理员既分不清是模型
+    调不通还是路径写错，也不知道自己该改什么再试。而「改完再试」的前提
+    正是他知道哪里不对。
+
+    服务端已经把原因记进 ``proposal_error`` 了，界面不显示就等于没记。
+    """
+    body = _fn("proposeRow")
+    assert "proposal_error" in body, \
+        "方案失败时界面不说原因：管理员只看到「生成失败」四个字"
+    assert "proposal_state" in body and "failed" in body, \
+        "proposeRow() 里没有处理方案失败这条路径"
+
+
 def test_the_comment_stripper_keeps_code_and_drops_comments():
     """剥注释的词法器本身要有围栏：它错了，全盘的静态围栏就都瞎了。
 

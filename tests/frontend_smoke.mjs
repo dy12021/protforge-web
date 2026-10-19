@@ -576,6 +576,40 @@ function findInput(root) {
   return null;
 }
 
+/**
+ * 方案生成失败时，界面要说出**原因**。
+ *
+ * 服务端把原因记进 proposal_error 了——原来只进日志，界面上一个字都没有，
+ * 管理员只看到「生成失败」四个字，既分不清是模型调不通还是路径写错，
+ * 也不知道自己该改什么再试。界面不显示就等于没记。
+ *
+ * 这里**真的渲染一次**看那句话在不在，而不是查源码里有没有出现过这个词。
+ */
+async function checkProposalFailureNotice(r) {
+  const errs = [];
+  const sb = r.sandbox;
+  if (typeof sb.proposeRow !== 'function') {
+    errs.push('admin-ui/app.js 没有 proposeRow()：工具意见那条就没有生成方案的入口');
+    return errs;
+  }
+  let wrap;
+  try {
+    wrap = sb.proposeRow({
+      id: 7, status: 'reviewed', kind: 'tool_gap',
+      proposal_state: 'failed',
+      proposal_error: '模型输出在 8192 tokens 处被截断',
+    });
+  } catch (e) {
+    errs.push(`proposeRow() 渲染失败态就抛了：${e && e.message}`);
+    return errs;
+  }
+  const text = textOf(wrap);
+  if (!/截断/.test(text)) {
+    errs.push(`方案失败时界面没说原因：${JSON.stringify(text)}`);
+  }
+  return errs;
+}
+
 async function checkReflectionConfirms(r) {
   const errs = [];
   const sb = r.sandbox;
@@ -763,6 +797,7 @@ for (const f of files) {
     // 值班台的反思按钮：确认之前不许写，确认之后必须写。
     if (/admin-ui[\\/]app\.js$/.test(f)) {
       for (const m of await checkReflectionConfirms(r)) errs.push(new Error(m));
+      for (const m of await checkProposalFailureNotice(r)) errs.push(new Error(m));
     }
   } catch (e) {
     errs.push(e);

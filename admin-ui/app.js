@@ -1557,7 +1557,13 @@ function proposeRow(r) {
   if (r.proposal_state === "running") {
     wrap.append(el("span", "who", "方案正在生成，要一两分钟…"));
   } else if (r.proposal_state === "failed") {
+    /* 失败要说出**为什么**。原来只有一句「上一次生成没成功，可以改完再试」，
+     * 管理员既分不清是模型调不通还是路径写错，也不知道该不该改完再试——
+     * 而「改完再试」的前提正是他知道哪里不对。 */
     wrap.append(el("span", "refl-bad", "上一次生成没成功，可以改完再试"));
+    if (r.proposal_error) {
+      wrap.append(el("div", "refl-bad", "原因：" + r.proposal_error));
+    }
   } else if (r.proposal) {
     wrap.append(applyBtn(r));
   }
