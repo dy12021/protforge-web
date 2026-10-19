@@ -1483,9 +1483,42 @@ function landBtn(r) {
       ul.append(el("li", null, "（正文还没取到，先点「看正文」再写）"));
     }
     body.append(ul);
+    /* 技能归属：模型大多不认识真实的技能名（它写「通用」），所以这里给一个
+     * **人**能填的输入。填了它，这些经验会**同时**落进那个技能的 references
+     * ——那是「知识待在离工具最近的地方」的一层；不填就只留在全局经验文件里。
+     * 候选项就是真实技能目录（#refl-skill-list 是那个 datalist）。 */
+    body.append(el("p", "confirm-lead",
+      "这些经验属于哪个技能（可留空；留空就只留在全局经验文件里）"));
+    const skill = el("input", null, "");
+    skill.type = "text";
+    /* **不预填。**
+     *
+     * 预填会把「模型的猜测」变成「管理员明确指定」——而这两者的区别正是归属
+     * 的依据：模型正文标「通用」= 这条经验是跨技能的通用做法，就只留全局；
+     * 管理员**明确填了**某个技能，才说明它就该待在那个技能旁边。
+     * 一旦预填，「通用」那条就会被自动塞进某个技能目录，那是污染。
+     *
+     * 模型的建议改成 placeholder：看得见、抄得动，但**没填就不算指定**。 */
+    const guess = (state.reflDetail && state.reflDetail.id === r.id
+      ? (state.reflDetail.suggested_skill || "") : "") || (r.skill || "");
+    skill.placeholder = guess
+      ? ("技能名（模型建议：" + guess + "；留空就只留全局）")
+      : "技能名（留空就只留全局）";
+    skill.setAttribute("list", "refl-skill-list");
+    body.append(skill);
     confirmBody(body, "写进去", () => {
-      api("POST", "/reflections/" + r.id + "/land")
-        .then(() => loadReflections())
+      api("POST", "/reflections/" + r.id + "/land", { skill: skill.value.trim() })
+        .then(got => {
+          /* 落地**可能只落了一半**：没指定技能、模型标的又对不上真实技能时，
+           * 那几条只进了全局经验文件。服务端把这件事写在 note 里，界面必须
+           * 说出来——不然管理员以为技能目录里也已经有它了。 */
+          const note = got && got.note;
+          setMsg(document.getElementById("board-msg"),
+                 note || ("已写进经验文件 "
+                          + ((got && got.landed) || 0) + " 条"),
+                 note ? "warn" : "ok");
+          return loadReflections();
+        })
         .catch(e => setMsg(document.getElementById("board-msg"),
                             e.message || "写经验失败", "bad"));
       return true;

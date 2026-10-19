@@ -323,6 +323,18 @@ class ProposeIn(BaseModel):
     target: str = Field(min_length=1, max_length=400)
 
 
+class LandIn(BaseModel):
+    """落地时管理员指定的技能。**空 = 按模型标的来。**
+
+    模型大多不认识真实的技能名（它写「通用」），而「知识待在离工具最近的地方」
+    这一层需要一个**真知道技能目录**的人来指。
+
+    **填了就必须是真存在的技能**：对不上会报错（422），不悄悄退回模型标的。
+    技能名由服务端归一（大小写、前缀差异都能对上）。
+    """
+    skill: str = Field(default="", max_length=200)
+
+
 # 面板只认这四条命令。它们是 `admin/rpc/{task_id}` 的白名单，不是给 agent 的：
 # 面板是值班台，不该成为往计算进程里塞任意命令的口子。
 RPC_COMMANDS = ("steer", "follow_up", "abort", "set_model", "set_thinking_level")
@@ -380,7 +392,7 @@ def _proposal_diff(rec: dict) -> str:
         return ""
 
 
-def _land_lesson(rec: dict, who: str) -> dict:
+def _land_lesson(rec: dict, who: str, skill_override: str = "") -> dict:
     """把一条「经验」真的写下去。
 
     **分类校验在这里再拦一道**，不是只在端点上：这是唯一会往用户的经验文件
@@ -391,6 +403,18 @@ def _land_lesson(rec: dict, who: str) -> dict:
     **全局经验文件是那一步的主体**：它每个任务都会被注入，是唯一保证生效的
     通道。写进技能 references 是「知识待在离工具最近的地方」的那一层，写失败
     不许把前者一起判失败——否则一条技能目录权限问题会让全局经验也写不进去。
+
+    **技能归属按这个顺序找**：管理员明确指定的 > 模型正文里标的。
+    模型正文里标「通用」的意思是**这条经验是跨技能的通用做法**，那就只留在
+    全局经验文件里——塞进某一个技能的 references 反而是污染。而模型不认识
+    真实的技能名（它写的多半也是「通用」），所以「知识待在离工具最近的地方」
+    这一层需要一个**真知道技能目录**的人来指：管理员在落地那一步指定。
+
+    **记录里那个技能不参与归属**：它是模型猜的（分类时自动带上的），拿它去
+    覆盖模型自己标的「通用」，等于把一条跨技能的经验按猜测塞进某个技能。
+
+    **管理员指定的技能必须真的存在**：对不上就报错，**不悄悄退回模型标的**。
+    退回去等于「我说了放 A 技能，你放进了 B 技能」，而界面什么也不说。
     """
     if rec.get("kind") != "lesson":
         raise store.Invalid(
@@ -403,7 +427,15 @@ def _land_lesson(rec: dict, who: str) -> dict:
     except StopIteration:
         raise store.Invalid("这份反思里没有「经验」一节，没什么可沉淀的") from None
 
-    written, skill_hit = 0, 0
+    want = reflection.normalize_skill(skill_override)
+    if (skill_override or "").strip() and not want:
+        # 管理员**明确指定**了一个技能，那就不能悄悄退回模型标的：
+        # 退回去等于「我说了放 A 技能，你放进了 B 技能」，而界面什么也不说。
+        # 技能名是下拉里选的，对不上就是选错了，该说。
+        raise store.Invalid(
+            f"技能「{(skill_override or '').strip()}」不在技能目录里，"
+            "技能名请从下拉里挑一个真存在的。")
+    written, skill_hit, only_global = 0, 0, 0
     for ln in lines[start + 1:]:
         if ln.lstrip().startswith("#"):
             break                                           # 下一节了
@@ -412,12 +444,15 @@ def _land_lesson(rec: dict, who: str) -> dict:
         m = re.match(r"^-\s*\[技能\s*([^\]]*)\]\s*(.+)$", ln.strip())
         if not m:
             continue
-        skill, text = m.group(1).strip(), m.group(2).strip()
+        raw_skill, text = m.group(1).strip(), m.group(2).strip()
         if text in ("", "无"):
             continue
-        reflection.append_lesson(skill, text, int(rec["task_id"]), who)
-        if reflection.append_skill_lesson(skill, text, int(rec["task_id"])):
+        skill = want or reflection.normalize_skill(raw_skill)
+        reflection.append_lesson(skill or raw_skill, text, int(rec["task_id"]), who)
+        if skill and reflection.append_skill_lesson(skill, text, int(rec["task_id"])):
             skill_hit += 1
+        else:
+            only_global += 1
         written += 1
 
     if not written:
@@ -426,9 +461,16 @@ def _land_lesson(rec: dict, who: str) -> dict:
     out["landed"] = written
     out["landed_into_skill"] = skill_hit
     if skill_hit < written:
+        # **只落了一半必须说出来**，而且要说清是哪一种「一半」：
+        # 「模型标的是通用做法」是设计，「技能目录写不进去」是故障，
+        # 两者的措辞不能混——混了管理员就会以为那是设计而不再管它。
+        if want:
+            why = f"剩下 {only_global} 条没能写进技能目录，只留在全局经验文件里。"
+        else:
+            why = (f"其中 {only_global} 条模型标的是跨技能的通用做法（或对不上真实技能），"
+                   "按设计只留在全局经验文件里。")
         out["note"] = (f"{written} 条已写进全局经验文件，其中 {skill_hit} 条同时进了"
-                       "技能的 references。剩下的对不上任何真实技能，"
-                       "只留在全局文件里。")
+                       f"技能的 references。{why}")
     return out
 
 
@@ -810,11 +852,16 @@ def create_admin_app() -> FastAPI:
         }
 
     @app.post("/api/admin/reflections/{reflection_id}/land")
-    def land(reflection_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
+    def land(reflection_id: int, body: LandIn | None = None,
+             who: tuple[dict, str] = Depends(require_admin_token)):
         """落地。分类为「经验」时写进全局经验文件与对应技能的 references。
 
         只处理「经验」这一类：工具意见的落地是**改代码 + git 提交**，走
         propose/apply 那两步，中间必须有一双眼睛看过 diff。
+
+        **返回体带上落地报告**（写了多少条、其中多少条进了技能目录、有没有
+        只落了一半的说明）：上一次这里把 `_land_lesson` 算出来的报告直接丢掉，
+        界面于是什么也不说——「这几条只进了全局经验文件」管理员永远不知道。
         """
         user, _ = who
         rec = store.get_reflection(reflection_id)
@@ -822,8 +869,12 @@ def create_admin_app() -> FastAPI:
             raise store.Invalid(
                 "只有「经验」能一步落地。工具意见要改的是技能文件，"
                 "请走「生成修改方案 → 看过 diff → 应用」。")
-        rec = _land_lesson(rec, user["username"])
-        return store.get_reflection(reflection_id)
+        if rec["status"] == "applied":
+            # 重复落地会把同一条经验写两遍，而全局经验文件是**每个任务都读**的：
+            # 重复的经验会被反复灌进上下文。这里该幂等。
+            raise store.Invalid("这条已经落地过了，再写一次会把同一条经验灌两遍。")
+        skill = (body.skill if body else "") or ""
+        return _land_lesson(rec, user["username"], skill)
 
     @app.post("/api/admin/reflections/{reflection_id}/propose")
     def propose(reflection_id: int, body: ProposeIn,

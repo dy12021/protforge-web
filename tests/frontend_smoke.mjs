@@ -557,17 +557,41 @@ async function smoke(file) {
  * 所以这里**真的点一遍**：先点按钮（这时不许有任何写接口调用），再点确认表
  * 里的确认（这时必须正好一次），最后确认表要关上。
  */
+/**
+ * 在确认表里找第一个 <input>（落地那一步的技能输入框）。
+ *
+ * 桩的 `setAttribute` 是空实现、`getAttribute` 恒回 null，所以没法按
+ * `list="refl-skill-list"` 找——只能按标签名走树。
+ */
+function findInput(root) {
+  const stack = [root];
+  while (stack.length) {
+    const n = stack.shift();
+    if (!n || !n.children) continue;
+    for (const c of n.children) {
+      if (c && c.tagName === 'input') return c;
+      stack.push(c);
+    }
+  }
+  return null;
+}
+
 async function checkReflectionConfirms(r) {
   const errs = [];
   const sb = r.sandbox;
   const calls = [];
   const realApi = sb.api;
-  sb.api = (method, path) => {
-    calls.push([method, path]);
+  sb.api = (method, path, body) => {
+    calls.push([method, path, body]);
     if (method === 'GET') {
       return Promise.resolve({
         id: 7, diff: '--- a/x\n+++ b/x', proposal_target: 'skills/x/SKILL.md',
       });
+    }
+    if (String(path).endsWith('/land')) {
+      // 落地端点会带回一份报告：写了多少条、其中多少条进了技能目录。
+      return Promise.resolve({ ok: true, landed: 2, landed_into_skill: 1,
+                               note: '只有 1 条进了技能目录' });
     }
     return Promise.resolve({ ok: true, message: 'stub' });
   };
@@ -583,7 +607,7 @@ async function checkReflectionConfirms(r) {
   const cases = [
     ['retryBtn', { id: 7, error: 'boom' }, '/reflections/7/retry', '重跑'],
     ['rejectBtn', { id: 7 }, '/reflections/7/reject', '否决'],
-    ['landBtn', { id: 7 }, '/reflections/7/land', '写进去'],
+    ['landBtn', { id: 7, skill: 'protforge-demo' }, '/reflections/7/land', '写进去'],
     ['applyBtn', { id: 7 }, '/reflections/7/apply', '应用'],
   ];
   try {
@@ -609,6 +633,24 @@ async function checkReflectionConfirms(r) {
           errs.push(`${fn}() 的确认按钮写着「${ok.textContent}」，应该是「${label}」`);
           continue;
         }
+        /* 落地那一条：技能是管理员在**这张表里**填的，所以得先去表里填上。
+         *
+         * 顺带钉住「不许预填」：预填等于把「模型的猜测」变成「管理员明确指定」，
+         * 而「通用」那条经验的归属正是靠这个区别才说得清——预填过的话，
+         * 模型标的「通用」会被自动塞进某个技能目录。 */
+        if (path.endsWith('/land')) {
+          const input = findInput(dlg);
+          if (!input) {
+            errs.push('landBtn() 的确认表里没有技能输入框：管理员没法指定归属');
+            continue;
+          }
+          if (input.value) {
+            errs.push(`landBtn() 把技能预填成了「${input.value}」：`
+              + '模型标的「通用」会被当成管理员指定，跨技能的经验被塞进某个技能');
+            continue;
+          }
+          input.value = 'protforge-demo';
+        }
         ok.fire('click');
       } catch (e) {
         errs.push(`${fn}() 点了确认之后抛异常：${e && e.message}`);
@@ -624,6 +666,41 @@ async function checkReflectionConfirms(r) {
         errs.push(`${fn}() 确认之后确认表没有关闭（回调抛了或没返回）`);
         dlg.close();
       }
+      // 落地那一条多两件事：管理员填的技能要发给服务端，落地报告要显示出来。
+      // 少了第一条，模型标的技能（它写「通用」）对不上真实技能时，经验永远
+      // 落不进技能目录；少了第二条，「只落了一半」管理员一个字都不会看到。
+      if (path.endsWith('/land')) {
+        const sent = calls.find((c) => c[0] === 'POST' && String(c[1]).endsWith('/land'));
+        const skill = sent && sent[2] && sent[2].skill;
+        if (skill !== 'protforge-demo') {
+          errs.push(`landBtn() 没把管理员填的技能发给服务端：skill=${JSON.stringify(skill)}`);
+        }
+        const msg = sb.document.getElementById('board-msg');
+        if (!/只有 1 条进了技能目录/.test(textOf(msg))) {
+          errs.push('landBtn() 没把落地报告显示出来：只落了一半也不会有人知道');
+        }
+      }
+    }
+
+    /* 管理员**不填**技能 → 发过去的是空。
+     *
+     * 这条和上面那条不是重复：上面钉的是「填了要发出去」，这条钉的是
+     * 「没填不许替模型填」。预填过的实现这里会是某个技能名——那条经验
+     * 就被按**猜测**塞进技能目录了，而模型标的明明是「通用」。 */
+    calls.length = 0;
+    try {
+      const btn2 = sb.landBtn({ id: 8, skill: 'protforge-demo' });
+      await Promise.all(btn2.fire('click'));
+      okButton().fire('click');
+      await new Promise((res) => setImmediate(res));
+      const sent = calls.find((c) => c[0] === 'POST' && String(c[1]).endsWith('/land'));
+      if (!sent) {
+        errs.push('landBtn() 管理员什么都没填，反而没调用落地接口');
+      } else if (sent[2] && sent[2].skill) {
+        errs.push(`landBtn() 管理员没填技能却发了一个技能名上去：${JSON.stringify(sent[2])}`);
+      }
+    } catch (e) {
+      errs.push(`landBtn() 不填技能那条路径抛了：${e && e.message}`);
     }
   } finally {
     sb.api = realApi;

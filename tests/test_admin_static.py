@@ -1119,6 +1119,33 @@ def test_reflection_actions_use_the_read_contract_not_a_callback():
         )
 
 
+def test_landing_lets_the_admin_pick_the_skill_and_says_what_it_wrote():
+    """落地那一步要能指定技能，而且**落地报告要显示出来**。
+
+    两条都是真机抓出来的：模型标的技能是「通用」（它不认识真实的技能名），
+    记录里那个技能落地时没人读；落地报告被端点丢掉之后，「只落了一半」这件
+    事界面上一个字都不说——管理员以为技能目录里也已经有了那一条。
+    """
+    body = _fn("landBtn")
+    assert "refl-skill-list" in body, \
+        "落地的确认表里没有技能输入：模型标的技能对不上真实技能时，经验落不进技能目录"
+    assert re.search(
+        r'api\("POST",\s*"/reflections/"\s*\+\s*r\.id\s*\+\s*"/land",\s*\{\s*skill:',
+        body), "落地时没有把管理员填的技能发给服务端"
+    assert re.search(r"got\s*&&\s*got\.note", body), \
+        "落地报告没被显示：只落了一半也不会有人知道"
+    # **不许预填。** 预填把「模型的猜测」变成「管理员明确指定」，而归属语义
+    # 正是靠这个区别：模型标「通用」= 跨技能的通用做法，只留全局文件。
+    # 预填过的话，「通用」那条会被自动塞进某个技能目录。模型的建议只能进
+    # placeholder（看得见、抄得动，但没填就不算指定）。
+    assert not re.search(r"skill\.value\s*=\s*[^;]*r\.skill", body), \
+        "落地确认表把技能预填成了记录里那个：那是模型猜的，不是管理员指定的"
+    assert not re.search(r"skill\.value\s*=\s*[^;]*suggested_skill", body), \
+        "落地确认表把技能预填成了模型建议：没填就不算管理员指定"
+    assert re.search(r"skill\.placeholder\s*=", body), \
+        "模型的建议连提示都没给：管理员不知道该填什么"
+
+
 def test_the_comment_stripper_keeps_code_and_drops_comments():
     """剥注释的词法器本身要有围栏：它错了，全盘的静态围栏就都瞎了。
 
