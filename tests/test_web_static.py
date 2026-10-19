@@ -863,3 +863,200 @@ def test_workflow_detail_shows_the_three_step_indicator():
     steps = m.group(1)
     for label in ("上传表格", "配列与模板", "确认开跑"):
         assert label in steps, f"步骤条少了「{label}」"
+
+
+# --- 窄屏适配（手机 / 平板）----------------------------------------------
+#
+# 这一段是**补上的空白**：适配做完之前，viewport 与响应式规则零覆盖——
+# 把 width=1280 改回去、把断点整段删掉，全量测试照样绿。
+#
+# 所以下面每条都取到具体那一个 @media 块里再断。写成 `assert "sticky" in css`
+# 是恒真的（.toolbar 早就是 sticky），写成 `assert "@media" in css` 也是恒真的
+# （prefers-reduced-motion 早有一条）——这种围栏比没有更坏，它让人以为有人管。
+
+PHONE = "(max-width: 759px)"     # 竖握手机；平板竖过来也在这一档之上
+TABLET = "(max-width: 1179px)"   # 平板横向 / 小笔记本；再宽就是桌面五列
+COARSE = "(pointer: coarse)"     # 手指输入，与屏幕宽度无关
+
+
+def _media_block(css: str, query: str) -> str:
+    """取出 `@media <query> { … }` 的块体（按花括号配对，含块内全部规则）。
+
+    **不能正则截到第一个 `}`**：块里第一条规则结束，后面的几十行就全落在
+    断言范围之外，于是「这条规则被改错了」照样绿。
+    同一 query 出现多次时把块体拼起来，语义等价于「这一档总共写了什么」。
+    """
+    parts = []
+    for m in re.finditer(r"@media\s+" + re.escape(query) + r"\s*\{", css):
+        depth, i = 0, m.end() - 1
+        while i < len(css):
+            if css[i] == "{":
+                depth += 1
+            elif css[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    parts.append(css[m.end():i])
+                    break
+            i += 1
+        else:
+            raise AssertionError(f"@media {query} 的块没有闭合")
+    assert parts, f"style.css 里没有 @media {query} 这一档"
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("name", ["index.html", "workflow.html"])
+def test_viewport_follows_the_device_width(name):
+    """两个页面的 viewport 都跟设备宽度走。
+
+    `width=1280` 在手机上不是「适配差一点」，而是**整页按 1280 CSS px 渲染
+    再整体缩小**：.875rem 的正文实际落到约 5px，打开是一张缩小的桌面截图。
+    不报错、不空白、控制台干净，只有拿在手机上才知道。
+
+    顺带钉住不许 `user-scalable=no`——那等于关掉低视力用户唯一的放大手段。
+    """
+    html = _html(name)
+    m = re.search(r'<meta[^>]*name="viewport"[^>]*>', html)
+    assert m, f"{name} 没有 viewport meta"
+    tag = m.group(0)
+    assert re.search(r"width\s*=\s*device-width", tag), (
+        f"{name} 的 viewport 没有 width=device-width（现在写的是 {tag}）——"
+        "窄屏会按固定宽度渲染再整体缩小，字号实际只剩几个像素")
+    assert re.search(r"initial-scale\s*=\s*1", tag), f"{name} 没有 initial-scale=1"
+    assert "user-scalable=no" not in tag, \
+        f"{name} 把用户缩放禁掉了——低视力用户唯一能放大的手段就是它"
+    # 也要挡住「顺手改成 width=1008 绕开这条断言」：任何像素宽度都是同一类故障
+    assert not re.search(r"width\s*=\s*(?!device-width)\d+", tag), \
+        f"{name} 的 viewport 仍然锁死了像素宽度：{tag}"
+
+
+def test_phone_stacks_the_board_and_pins_a_sticky_station_band():
+    """手机上五站竖着排，列头变成粘顶色带。
+
+    三件事缺一件都不成立，所以一起断：
+      ① 收成单列——不排的话五列在 375px 上每列只剩约 75px；
+      ② 列头 sticky——不粘就只是五个普通区块，滚过去不知道自己看的是哪一站；
+      ③ 色带引 .col 上那枚 --c，不另调色——另调就是五站的颜色与流转轨、
+         卡片、时间线对不上，又变成「一套文案一套颜色」。
+    """
+    phone = _media_block(_read(CSS), PHONE)
+    board = re.search(r"\.board\s*\{([^}]*)\}", phone)
+    assert board, "手机档没有改 .board"
+    assert re.search(r"grid-template-columns:\s*1fr\b", board.group(1)), (
+        "手机档没有把看板收成单列——五列在 375px 上每列只剩约 75px")
+
+    head = re.search(r"\.col-head\s*\{([^}]*)\}", phone)
+    assert head, "手机档没有动 .col-head（粘顶色带就是它）"
+    assert re.search(r"position:\s*sticky", head.group(1)), \
+        "手机档的列头没有 sticky——滚过去就不知道自己看的是哪一站"
+    assert re.search(r"(?:border-left|background)[^;]*var\(--c", head.group(1)), \
+        "粘顶色带没有引 .col 上那枚 --c：另调一个色就和流转轨、卡片对不上了"
+
+
+def test_tablet_is_three_columns_not_five():
+    """平板三列两行（3 + 2）。
+
+    五列在平板上每列只剩约 150px，卡片标题一行一个字；而 <760px 才收单列，
+    竖握的平板会突然从三列掉到一列，中间没有过渡。
+    """
+    tablet = _media_block(_read(CSS), TABLET)
+    board = re.search(r"\.board\s*\{([^}]*)\}", tablet)
+    assert board, "平板档没有改 .board"
+    assert re.search(r"grid-template-columns:\s*repeat\(\s*3\s*,", board.group(1)), (
+        "平板档不是三列")
+    assert "repeat(5" not in board.group(1), \
+        "平板档还是五列——每列只剩约 150px，卡片标题一行一个字"
+
+
+def test_phone_drawer_is_full_width_and_the_workflow_table_stays_bounded():
+    """窄屏最容易塌的两处。
+
+    抽屉 `width: min(30rem, 44vw)` 在 375px 上只有 165px，比正文栏还窄。
+
+    表格**不能**把 .wf-table-wrap 的 max-height 设成 none——文件里那条注释
+    警告过：整页滚的话 sticky 表头会一路贴在视口顶上把工具条盖掉。
+    所以钉的是「这一档仍然给了有限高度」，不是「设没设」。
+    """
+    phone = _media_block(_read(CSS), PHONE)
+    drawer = re.search(r"\.drawer\s*\{([^}]*)\}", phone)
+    assert drawer, "手机档没有动 .drawer"
+    assert re.search(r"width:\s*100%", drawer.group(1)), \
+        "手机档的抽屉不是全屏（44vw 在 375px 上只有 165px）"
+
+    wrap = re.search(r"\.wf-table-wrap\s*\{([^}]*)\}", phone)
+    assert wrap, "手机档没有动 .wf-table-wrap"
+    heights = [h.strip() for h in
+               re.findall(r"max-height:\s*([^;]+)", wrap.group(1))]
+    assert heights, "手机档没有给表格预览设高度"
+    assert all(h not in ("none", "unset", "initial") for h in heights), (
+        f"表格预览被设成不限高（{heights}）：整页滚的话 sticky 表头会盖住工具条")
+
+
+def test_narrow_toolbar_wraps_in_a_deliberate_order():
+    """窄屏工具条换行，而且换行顺序排过一遍。
+
+    只断 `flex-wrap: wrap` 不够：DOM 顺序是「标题 → 搜索 → 状态 → 勾选 → 提交」，
+    而搜索在 100% 基准下会把标题挤到单独一行，于是第一行只有标题、第二行只有
+    搜索框——技术上换行了，读起来还是坏的。
+
+    断的是**相对顺序**不是具体数字：整体改成 0/1/2 照样绿，只有「标题与提交
+    同一行、搜索独占第二行」这条被破坏时才红。
+    """
+    phone = _media_block(_read(CSS), PHONE)
+    tb = re.search(r"\.toolbar\s*\{([^}]*)\}", phone)
+    assert tb and "flex-wrap: wrap" in tb.group(1), "窄屏工具条没有换行"
+    assert re.search(r"\.toolbar-gap\s*\{[^}]*display:\s*none", phone), (
+        "窄屏没收起弹性空隙：它是 order:0，会在第一行里把标题顶到右边")
+    assert re.search(r"\.toolbar input\[type=search\][^{]*\{[^}]*flex:\s*1 1 100%",
+                     phone), \
+        "窄屏的搜索框没有独占一行（挤成约 150px 就搜不了任何东西）"
+
+    orders = {m.group(1): int(m.group(2)) for m in re.finditer(
+        r"\.toolbar\s+(h1|\.primary|input\[type=search\])\s*\{[^}]*order:\s*(\d+)",
+        phone)}
+    assert {"h1", ".primary", "input[type=search]"} <= set(orders), \
+        f"没有把工具条的换行顺序排过一遍：{orders}"
+    assert orders["h1"] < orders[".primary"] < orders["input[type=search]"], \
+        (f"窄屏工具条排错了（{orders}）：应当是标题与「提交」同一行、"
+        "搜索独占第二行")
+
+
+def test_touch_pointer_gets_44px_targets():
+    """pointer: coarse 下可点元素给到 44px。
+
+    单独分这一档而不是并进宽度档：窄屏的平板、连着鼠标的窄窗口，指针类型
+    各不相同，而这 44px 对谁都只有好处。
+    """
+    coarse = _media_block(_read(CSS), COARSE)
+    assert re.search(r"min-height:\s*44px", coarse), "触控档没有 44px 最小可点区域"
+    for sel in (".drawer-icon", ".btn", ".wf-role", ".mini"):
+        assert sel in coarse, \
+            f"{sel} 在触控设备上没有放大——手指点不准（44px 是通行下限）"
+
+
+def test_rendered_prompt_uses_the_same_container_as_the_summary():
+    """渲染出来的提示词要和上面的摘要用同一套容器，不能是裸 `<pre>`。
+
+    这一块是**浏览器复核时发现的**：`#wf-preview` 在 style.css 里一条规则都没有，
+    靠 UA 默认的 pre 渲染——没有内边距、没有边框，文字直接顶到窗口左边缘，
+    和它上面那块 `.wf-summary` 并排放一眼就像漏了个容器。窄屏上更难看：
+    被折行之后孤零零贴在屏幕最左边。
+
+    断的是**两者同一套容器处理**，不是某个具体数值：边框 / 圆角 / 面板底色 /
+    等宽体四件都要在。只断「#wf-preview 出现过」是恒真的——它在 HTML 与 JS 里
+    当然会出现，那正是它一直没有样式的原因。
+    """
+    css = _read(CSS)
+    for sel in (".wf-summary", "#wf-preview"):
+        m = re.search(re.escape(sel) + r"\s*\{([^}]*)\}", css)
+        assert m, f"{sel} 没有容器规则（它是裸 pre，靠 UA 默认样式渲染）"
+        body = m.group(1)
+        for decl, what in (
+            (r"border:\s*1px solid var\(--border\)", "容器边框"),
+            (r"border-radius:\s*var\(--r-sm\)", "容器圆角"),
+            (r"background:\s*var\(--panel\)", "面板底色"),
+            (r"font-family:\s*var\(--mono\)", "等宽体"),
+        ):
+            assert re.search(decl, body), (
+                f"{sel} 缺{what}：这两块是同一件事的两个半边，"
+                "长得不一样就像漏了容器"
+            )

@@ -2,9 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<!-- SPEC 12：不做移动端适配，只保证桌面 1280px 以上。值班台比用户面板更宽，
-     审计表要一屏放下命令原文与耗时。 -->
-<meta name="viewport" content="width=1440">
+<!-- viewport 跟着设备宽度走。原来的 width=1440 是 SPEC 12「只保证桌面」留下的，
+     在手机上会把整页缩到看不清；现在窄屏交给 style.css 末尾那组断点。
+     值班台的表格在窄屏改成**表格自己横向滚**（.grid-wrap），不是把行拆成卡片：
+     审计表要对着命令原文逐行核，拆成卡片之后行与行之间的关系就断了。
+     不设 user-scalable=no。 -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>自动化计算平台 · 值班台</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
@@ -75,16 +78,19 @@
         <select id="status-filter" aria-label="状态筛选"><option value="">全部状态</option></select>
         <label class="toggle"><input id="only-active" type="checkbox"> 只看在跑的</label>
       </div>
-      <table class="grid">
-        <thead>
-          <tr>
-            <th class="c-id">#</th><th class="c-title">标题</th><th class="c-st">状态</th>
-            <th class="c-step">当前步骤</th><th class="c-owner">提交人</th>
-            <th class="c-time">提交时间</th><th class="c-act">操作</th>
-          </tr>
-        </thead>
-        <tbody id="task-rows"></tbody>
-      </table>
+      <!-- 表格横向滚动容器：窄屏时表在自己这一格里横着滚，页面不横着滚。 -->
+      <div class="grid-wrap">
+        <table class="grid">
+          <thead>
+            <tr>
+              <th class="c-id">#</th><th class="c-title">标题</th><th class="c-st">状态</th>
+              <th class="c-step">当前步骤</th><th class="c-owner">提交人</th>
+              <th class="c-time">提交时间</th><th class="c-act">操作</th>
+            </tr>
+          </thead>
+          <tbody id="task-rows"></tbody>
+        </table>
+      </div>
       <p class="empty" id="tasks-empty">没有匹配的计算任务。</p>
     </section>
 
@@ -104,16 +110,18 @@
         <span class="toolbar-gap"></span>
         <button class="secondary" id="audit-export" type="button">导出 CSV</button>
       </div>
-      <table class="grid grid-audit">
-        <thead>
-          <tr>
-            <th class="c-id">#</th><th class="c-time">时间</th><th class="c-task">任务</th>
-            <th class="c-kind">类型</th><th class="c-cmd">命令原文</th>
-            <th class="c-code">退出码</th><th class="c-ms">耗时</th>
-          </tr>
-        </thead>
-        <tbody id="audit-rows"></tbody>
-      </table>
+      <div class="grid-wrap">
+        <table class="grid grid-audit">
+          <thead>
+            <tr>
+              <th class="c-id">#</th><th class="c-time">时间</th><th class="c-task">任务</th>
+              <th class="c-kind">类型</th><th class="c-cmd">命令原文</th>
+              <th class="c-code">退出码</th><th class="c-ms">耗时</th>
+            </tr>
+          </thead>
+          <tbody id="audit-rows"></tbody>
+        </table>
+      </div>
       <p class="empty" id="audit-empty">没有匹配的审计记录。</p>
     </section>
 
@@ -123,15 +131,17 @@
         <h2 class="pane-h">用户</h2>
         <span class="pane-sub" id="users-sub"></span>
       </div>
-      <table class="grid grid-users">
-        <thead>
-          <tr>
-            <th class="c-id">#</th><th class="c-name">用户名</th><th class="c-role">角色</th>
-            <th class="c-state">状态</th><th class="c-time">创建时间</th><th class="c-act">操作</th>
-          </tr>
-        </thead>
-        <tbody id="user-rows"></tbody>
-      </table>
+      <div class="grid-wrap">
+        <table class="grid grid-users">
+          <thead>
+            <tr>
+              <th class="c-id">#</th><th class="c-name">用户名</th><th class="c-role">角色</th>
+              <th class="c-state">状态</th><th class="c-time">创建时间</th><th class="c-act">操作</th>
+            </tr>
+          </thead>
+          <tbody id="user-rows"></tbody>
+        </table>
+      </div>
 
       <!-- 建用户。页面内的表单，不是 window.prompt。 -->
       <h3 class="sec-h" id="new-user-h">新建用户</h3>

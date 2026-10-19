@@ -573,3 +573,136 @@ def test_admin_app_binds_loopback_only():
     code = re.sub(r'""".*?"""', "", src, flags=re.S)
     code = re.sub(r"#.*", "", code)
     assert "0.0.0.0" not in code, "面板的可执行代码里不许出现 0.0.0.0"
+
+
+# --- 窄屏适配（手机 / 平板）----------------------------------------------
+#
+# 适配做完之前，viewport 与响应式规则**零覆盖**——把 width=1440 改回去、
+# 把断点整段删掉，全量测试照样绿。下面每条都取到具体那一个 @media 块里再断。
+
+ADMIN_PHONE = "(max-width: 759px)"
+ADMIN_COARSE = "(pointer: coarse)"
+
+
+def _media_block(css: str, query: str) -> str:
+    """取出 `@media <query> { … }` 的块体（按花括号配对）。
+
+    正则截到第一个 `}` 的话，块里第一条规则之后的几十行全落在断言范围外，
+    「这条规则被改错了」照样绿。
+    """
+    parts = []
+    for m in re.finditer(r"@media\s+" + re.escape(query) + r"\s*\{", css):
+        depth, i = 0, m.end() - 1
+        while i < len(css):
+            if css[i] == "{":
+                depth += 1
+            elif css[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    parts.append(css[m.end():i])
+                    break
+            i += 1
+        else:
+            raise AssertionError(f"@media {query} 的块没有闭合")
+    assert parts, f"style.css 里没有 @media {query} 这一档"
+    return "\n".join(parts)
+
+
+def test_viewport_follows_the_device_width():
+    """值班台的 viewport 也跟设备宽度走（原先锁的是 width=1440）。
+
+    锁像素宽度的后果不是「窄了点」，而是整页按 1440 CSS px 渲染再整体缩小，
+    表格里的命令原文彻底读不出来——而那正是审计日志存在的理由。
+    """
+    html = _read(HTML)
+    m = re.search(r'<meta[^>]*name="viewport"[^>]*>', html)
+    assert m, "没有 viewport meta"
+    tag = m.group(0)
+    assert re.search(r"width\s*=\s*device-width", tag), \
+        f"viewport 没有跟设备宽度走（现在写的是 {tag}）"
+    assert re.search(r"initial-scale\s*=\s*1", tag), "没有 initial-scale=1"
+    assert "user-scalable=no" not in tag, "禁掉了用户缩放"
+    assert not re.search(r"width\s*=\s*(?!device-width)\d+", tag), \
+        f"viewport 仍然锁死了像素宽度：{tag}"
+
+
+def test_every_table_gets_a_horizontal_scroll_wrapper():
+    """每张 .grid 外面都套 .grid-wrap，且只在窄屏那一档开滚动。
+
+    双向断：表套了而 CSS 没给 overflow（滚动没地方发生），或者 CSS 给了而
+    表没套（页面整条横着滚，顶栏和页签会跟着一起横移）。
+
+    桌面上**不许**给 .grid-wrap 设 overflow：`overflow-x: auto` 会把
+    overflow-y 从 visible 变成 auto，于是这个 div 成了滚动容器，
+    `.grid thead th` 的 sticky 就以它为基准——而它的高度等于内容高度，
+    根本没有纵向可滚空间，表头从此再也不粘。这是个静默降级。
+    """
+    html = _read(HTML)
+    tables = html.count('<table class="grid')
+    wraps = html.count('class="grid-wrap"')
+    assert tables, "找不到任何 .grid 表格"
+    assert wraps == tables, f"表格 {tables} 张而 .grid-wrap 只有 {wraps} 个"
+
+    css = _read(CSS)
+    phone = _media_block(css, ADMIN_PHONE)
+    wrap = re.search(r"\.grid-wrap\s*\{([^}]*)\}", phone)
+    assert wrap, "窄屏档没有动 .grid-wrap"
+    assert re.search(r"overflow-x:\s*auto", wrap.group(1)), \
+        "窄屏档没有给 .grid-wrap 开横向滚动——整页会横着滚"
+
+    before = css.split("@media", 1)[0]
+    base = re.search(r"\.grid-wrap\s*\{([^}]*)\}", before)
+    assert base, "文件里没有 .grid-wrap 的基线规则"
+    assert "overflow" not in base.group(1), \
+        "桌面上就给 .grid-wrap 设了 overflow：会把 sticky 表头的基准换成它"
+
+
+def test_phone_fixes_the_two_grids_that_would_overflow():
+    """两处 `minmax(Nrem, 1fr)` 在容器比 Nrem 窄时**照样排一列 Nrem**。
+
+      · .live-list 是 minmax(24rem, 1fr) → 整块横向溢出，页面被撑出横滚条；
+      · .grid 的列被压到读不出内容 → 要 min-width 保住列宽、自己横着滚。
+
+    形状与首页 .board 一样（都是固定下限的轨道），失败方式不同，分开断。
+    """
+    phone = _media_block(_read(CSS), ADMIN_PHONE)
+    live = re.search(r"\.live-list\s*\{([^}]*)\}", phone)
+    assert live, "窄屏档没有动 .live-list"
+    assert re.search(r"grid-template-columns:\s*1fr\b", live.group(1)), (
+        "窄屏的实时卡片列表还是 minmax(24rem, 1fr)：容器比 24rem 窄时它照样排一列 "
+        "24rem，整块横向溢出")
+
+    grid = re.search(r"\.grid\s*\{([^}]*)\}", phone)
+    assert grid and re.search(r"min-width:\s*\d+rem", grid.group(1)), (
+        "窄屏的表格没有 min-width：列会被压到读不出内容")
+
+
+def test_phone_drops_the_measured_sticky_offset():
+    """窄屏放弃两个 sticky：它们的偏移是按桌面量出来的。
+
+    页签的 `top: 2.55rem` 是桌面工具条的高度。工具条一旦换行，这个偏移
+    全错——不是偏一点，是页签会插到工具条**中间**去，或者干脆盖住它。
+    与其算不准的魔数，不如让整页正常滚：值班台上滚回去点「刷新」是常规动作。
+    """
+    phone = _media_block(_read(CSS), ADMIN_PHONE)
+    tb = re.search(r"\.toolbar\s*\{([^}]*)\}", phone)
+    assert tb and re.search(r"position:\s*static", tb.group(1)), \
+        "窄屏的工具条没有放弃 sticky"
+    tabs = re.search(r"\.tabs\s*\{([^}]*)\}", phone)
+    assert tabs and re.search(r"position:\s*static", tabs.group(1)), \
+        "窄屏的页签没有放弃 sticky：它的 top 偏移是按桌面工具条高度量出来的"
+    assert re.search(r"overflow-x:\s*auto", tabs.group(1)), \
+        "窄屏的五个页签没有横着滑"
+
+
+def test_touch_pointer_gets_44px_targets():
+    """pointer: coarse 下按钮与页签给到 44px。
+
+    表格行**故意不给** 44px：值班台的行高就是密度，撑到 44px 会让一屏放不下
+    一屏的量。真正要点的那些按钮（中止、改状态、重跑、停用、确认归属）
+    走 .btn / .secondary，在下面拿满 44px——所以这里断的是按钮。
+    """
+    coarse = _media_block(_read(CSS), ADMIN_COARSE)
+    assert re.search(r"min-height:\s*44px", coarse), "触控档没有 44px 最小可点区域"
+    for sel in (".btn", ".tab", ".primary", ".secondary"):
+        assert sel in coarse, f"{sel} 在触控设备上没有放大——手指点不准"

@@ -52,6 +52,10 @@
 
 * { box-sizing: border-box; }
 
+/* iOS Safari 会拿文本体积做自动放大，手机上字号一大整页就跟着横向溢出。
+   关掉这个推断（不关用户自己捏合缩放——那是两回事）。 */
+html { -webkit-text-size-adjust: 100%; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -566,6 +570,17 @@ button { cursor: pointer; }
   font-family: var(--mono); font-size: .74rem; line-height: 1.55;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
+/* 渲染出来的提示词（#wf-preview）与上面那块摘要是**同一件事的两个半边**：
+   一边说「配置长什么样」，一边说「这一行实际长什么样」。它们必须用同一套容器。
+   原文件里这一块**一条规则都没有**，靠 UA 默认的 pre 渲染——没有内边距、没有边框，
+   文字直接顶到窗口左边缘，和上面那块并排放一眼就像漏了容器。窄屏上更明显：
+   被折行之后孤零零贴在屏幕最左边。 */
+#wf-preview {
+  margin: .5rem 0; padding: .55rem .7rem; border: 1px solid var(--border);
+  border-radius: var(--r-sm); background: var(--panel); color: var(--fg);
+  font-family: var(--mono); font-size: .74rem; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
 /* 步骤条：能跳的那几步看上去能点，锁着的那几步看上去点不动 */
 .wf-step.is-jump { cursor: pointer; text-decoration: underline dotted var(--border); }
 .wf-step.is-jump:hover { color: var(--accent); }
@@ -600,6 +615,96 @@ button { cursor: pointer; }
 }
 .wf-role-tag[data-role="input"], .wf-role-tag[data-role="context"] { color: var(--accent); border-color: var(--accent); }
 .wf-role-tag[data-role="output"] { color: var(--st-done); border-color: var(--st-done); }
+
+/* ------------------------------------------- 窄屏适配：平板三列 / 手机单列堆叠
+ *
+ * 三档。断点值不是随手取的：
+ *   ≥1180px   五列，每列 ~205px——再窄卡片里的标题就开始一行一个字。
+ *   760–1179  平板（竖握手机 ≥600，横握 iPad 到 1180）。三列两行：3 + 2。
+ *   <760px    竖握手机。五站竖着排。
+ *
+ * 为什么手机是竖排而不是横向滑动逐屏：
+ *   横向滑轨看着更贴近桌面那条线，但列内本来就要纵向滚，两者抢同一个手势，
+ *   结果是「想看某张卡的下面一行」变成了「翻到下一站」。
+ *   而且看板的心智模型是**任务从第一站流到第四站**，把失败站提到最前
+ *   会打断这条线——顺序不能动，动的只能是排布方向。
+ *
+ * 工具条在窄屏不再 sticky：它一旦换行，高度就随内容变，粘顶色带的 top 没法
+ * 用一个魔数钉死。与其硬编一个 offset 高度，不如让整页正常滚——手机页面上
+ * 往下滚之后顶栏让位是常规行为，而「我正在第几站」由色带一直挂着回答。
+ */
+
+@media (max-width: 1179px) {
+  .toolbar { flex-wrap: wrap; }
+  .board { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .col { min-height: 10rem; }
+}
+
+@media (max-width: 759px) {
+  .toolbar {
+    position: static; flex-wrap: wrap; gap: .45rem .5rem;
+    padding: .6rem .8rem;
+  }
+  /* 换行顺序要显式排一遍：DOM 顺序是「标题 → 搜索 → 状态 → 勾选 → 提交」，
+     搜索是 100% 基准，于是第一行只剩标题，第二行只剩搜索框。改成
+     标题与「提交」同一行、搜索独占第二行。
+     顺带把 order=0 的弹性空隙排到最后——它默认排在最前，会在第一行里
+     把标题顶到右边去。 */
+  .toolbar-gap { display: none; }
+  .toolbar h1 { flex: 1 1 auto; order: 1; }
+  .toolbar .primary { order: 2; }
+  .toolbar input[type=search] { order: 3; flex: 1 1 100%; }
+  .toolbar select, .toolbar .toggle { order: 4; }
+  .toolbar .who { order: 5; }
+  .toolbar .secondary { order: 6; }
+
+  .board { grid-template-columns: 1fr; gap: .55rem; padding: .55rem .8rem 1.4rem; }
+  /* min-height 归零：五站各留 12rem 空地板的话，一屏全是空面板，
+   * 真正的卡片反而要滚到第四屏才看得到。 */
+  .col { padding: 0; min-height: 0; }
+
+  /* 粘顶色带：把列头变成车站牌。左侧一道该站的色、底色是它自己的浅染、
+   * 站名与数字都收在这一行里——滚过去时「我在第几站」一直挂在顶上。
+   * 颜色直接引 `.col` 上那枚 --c（app.js 按状态色种上去的），不另调色。 */
+  .col-head {
+    position: sticky; top: 0; z-index: 5;
+    margin: 0; padding: .5rem .65rem; align-items: center;
+    border-radius: var(--r) var(--r) 0 0;
+    border-bottom: 1px solid var(--border);
+    border-left: 3px solid var(--c, var(--st-queued));
+    background: color-mix(in srgb, var(--c, var(--st-queued)) 9%, var(--panel));
+  }
+  .col-count { font-size: 1.55rem; }
+  .col-name { margin-left: .2rem; }
+  .col-list { padding: .55rem .65rem .65rem; }
+
+  /* 抽屉全屏。44vw 在 375px 上只剩 165px，比手机上的正文栏还窄。
+     is-full 那套「收在居中阅读列」的逻辑自动生效，不用单独处理。 */
+  .drawer { width: 100%; }
+  /* 横过来时刘海/灵动岛会啃掉右上角，把粘顶的按钮条让开 */
+  .drawer-bar { top: env(safe-area-inset-top); }
+  .drawer-inner { padding-bottom: calc(2rem + env(safe-area-inset-bottom)); }
+
+  /* 表格预览：换成动态视口高度，浏览器地址栏收起时跟着让位。
+     **不能设成 none**——上面 .wf-table-wrap 那条注释警告过：整页滚的话
+     sticky 表头会一路贴在视口顶上，把工具条盖掉。 */
+  .wf-table-wrap { max-height: 65vh; max-height: 65dvh; }
+}
+
+/* 触控设备：手指没有 hover，目标小于 44px 就等于点不准。
+   这一档只看指针类型，和屏幕宽度无关——窄屏的平板一样要照顾。 */
+@media (pointer: coarse) {
+  .toolbar button, .toolbar select, .btn, .drawer-icon, .mini,
+  .wf-role, .composer-actions button, .confirm-actions button,
+  .eb-actions button, .card {
+    min-height: 44px;
+  }
+  /* 表格行的目标用内边距加高：tr/th 吃 min-height。表头可点（选列角色），要够高。 */
+  .wf-table thead th.wf-th { padding-top: .65rem; padding-bottom: .65rem; }
+  .wf-table tbody td { padding-top: .5rem; padding-bottom: .5rem; }
+  /* 正文里那些 .72rem 的辅助字，指着读要稍微放大一点 */
+  .card-id, .card-time, .col-empty, .wf-card-now, .wf-card-failed { font-size: .78rem; }
+}
 
 /* 动效只做一处（流转轨滑动），其余不加；并全部服从 prefers-reduced-motion */
 @media (prefers-reduced-motion: reduce) {

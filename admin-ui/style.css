@@ -51,6 +51,9 @@
 
 * { box-sizing: border-box; }
 
+/* iOS Safari 会按文本体积自动放大，值班台的窄表格一放大就横向溢出。 */
+html { -webkit-text-size-adjust: 100%; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -251,6 +254,13 @@ button:disabled { opacity: .45; cursor: default; }
 .filters .toggle { display: flex; align-items: center; gap: .3rem; color: var(--fg-dim); }
 .filters .toggle input { accent-color: var(--st-running); }
 
+/* 表格横向滚动容器（每张 .grid 外面各套一个）。
+ * **桌面上刻意不给它 overflow**：`overflow-x: auto` 会把 overflow-y 从
+ * visible 变成 auto，于是这个 div 变成滚动容器，`.grid thead th` 的
+ * `position: sticky; top: 0` 就以它为基准——而它的高度等于内容高度，
+ * 根本没有纵向可滚空间，表头从此再也不粘。所以只在窄屏那一档才开。 */
+.grid-wrap { min-width: 0; }
+
 .grid {
   width: 100%; border-collapse: collapse;
   background: var(--card); border: 1px solid var(--border); border-radius: var(--r);
@@ -411,6 +421,62 @@ button:disabled { opacity: .45; cursor: default; }
 }
 .confirm-actions .danger:hover { background: color-mix(in srgb, var(--st-failed) 88%, #000); }
 .confirm-actions .secondary { padding: .4rem .8rem; }
+
+/* ------------------------------------------------------- 窄屏适配（平板 / 手机）
+ *
+ * 值班台的桌面基线是 1440px：审计表要一屏放下命令原文与耗时。窄屏不拆行、
+ * 不改表格结构——审计日志的价值在于**逐行对照**，把行拆成卡片之后
+ * 「这条命令属于哪次执行」这条关系就没了。改成表格自己横向滚。
+ *
+ * <760px 那一档里工具条和页签都不再 sticky：页签原来 `top: 2.55rem` 是量出来
+ * 的工具条高度，工具条一换行这个偏移就全错。与其算不准的魔数，不如让整页
+ * 正常滚——值班台上滚回去点「刷新」是常规动作。
+ */
+
+@media (max-width: 1179px) {
+  /* 五个页签在平板宽度下开始放不下，横着滑 */
+  .tabs { overflow-x: auto; }
+}
+
+@media (max-width: 759px) {
+  .toolbar { position: static; flex-wrap: wrap; gap: .4rem .5rem; padding: .5rem .8rem; }
+  .toolbar-gap { display: none; }
+  .tabs {
+    position: static; overflow-x: auto;
+    scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  }
+  .tabs::-webkit-scrollbar { height: 0; }
+  .tab { white-space: nowrap; }
+
+  .deck { padding: .6rem .8rem 1.6rem; }
+  .pane-head { flex-wrap: wrap; }
+  /* live-list 是 minmax(24rem, 1fr)：容器比 24rem 窄时它**照样排一列 24rem**，
+     于是整块横向溢出、页面被撑出滚动条。 */
+  .live-list { grid-template-columns: 1fr; }
+
+  /* 窄屏才开横向滚动容器（理由见文件里 .grid-wrap 那段注释）：
+     min-width 42rem 是让列保持可读宽度的下限，窄了就横着滑。 */
+  .grid-wrap { overflow-x: auto; }
+  .grid { min-width: 42rem; }
+  /* 表头改为不粘：横着滚的格里没有纵向滚动空间，sticky 已经失效，
+     留着只会让它盖住自己那一行内容。 */
+  .grid thead th { position: static; }
+
+  .row-form .field { flex: 1 1 100%; }
+  .row-form .field input, .row-form .field-narrow select { width: 100%; }
+}
+
+/* 触控设备：44px 最小可点区域。表格行**不给** 44px——值班台的行高就是密度，
+ * 把每行撑到 44px 会让一屏放不下一屏的量。真要点的按钮（中止、改状态、
+ * 重跑、停用、确认归属）走 .btn / .secondary，在下面拿满 44px。 */
+@media (pointer: coarse) {
+  .primary, .secondary, .btn, .tab, .row-acts .btn,
+  .filters select, .filters input[type=search] {
+    min-height: 44px;
+  }
+  .grid tbody td { padding-top: .45rem; padding-bottom: .45rem; }
+  .row-acts .btn { padding: .3rem .6rem; }
+}
 
 /* 动效只做一处（流转轨滑动），其余不加；并全部服从 prefers-reduced-motion */
 @media (prefers-reduced-motion: reduce) {

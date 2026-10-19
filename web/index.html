@@ -2,9 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<!-- SPEC 12：不做移动端适配，只保证桌面 1280px 以上。锁死布局宽度，
-     免得窗口一小，五列被压扁。 -->
-<meta name="viewport" content="width=1280">
+<!-- viewport 跟着设备宽度走。原先的 width=1280 是 SPEC 12「只保证桌面 1280px 以上」
+     留下的：手机上整页按 1280 CSS px 渲染再整体缩小，字号实际缩到约 5px，等于没适配。
+     现在窄屏交给 style.css 末尾那组断点：≥1180px 五列 / 760–1179px 平板三列 /
+     <760px 手机单列纵向堆叠，每站的列头变成粘顶色带。
+     **不设 user-scalable=no**——禁掉用户缩放，等于把低视力用户唯一的放大手段关掉。 -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>自动化计算平台</title>
 <!-- 空 data URI 当 favicon：省掉一次必然 404 的 /favicon.ico 请求 -->
 <link rel="icon" href="data:,">
