@@ -40,6 +40,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop-services.ps1
 然后让旧版本继续对外服务。日志落仓库的 `logs\`（已 gitignore，不入版本库），
 每次启动都追加一行到 `logs\start-services.log`。
 
+`stop-services.ps1` 停两轮：先按**监听端口**杀（占着端口的那个才是会让旧版本
+继续对外服务的进程），再按**命令行**扫一遍——扫的是那些跑着本仓服务入口、
+却已经不占端口的残留（端口被别人拿走了、它没绑上、或者它是上一轮的子进程）。
+这种进程留着，下一次启动会看到「端口已占用」而跳过启动，旧版本就继续在服务，
+而日志上写的是「already listening」，看着一切正常。判断规则在
+`scripts\select_service_pids.py`（一条能测的纯函数）：只认 python 可执行文件、
+入口必须是**整个参数**且逐段对上，所以本机其它项目的 `python app.py` 不会被误杀。
+每一次杀都连同完整命令行写进 `logs\stop-services.log`。
+
 本机已注册登录自启任务 **`protforge-web-services`**（触发器 = 用户登录时，
 动作 = 上面的 `start-services.ps1`）：
 
