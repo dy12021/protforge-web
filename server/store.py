@@ -445,7 +445,7 @@ def clear_finished(task_id: int) -> None:
     ``finished`` 的语义是"**本轮**计算进程已收口"，不是"历史上曾经成功过"。
     管理员点重跑就是开新一轮，标记必须跟着清——不清的话第二轮的 finish 回调
     会被 422 拒掉，而调度器 _settle 读到的是上一轮的标记，会把第二轮任何退出
-    （包括直接崩溃）都判成"正常收口"，最后打出���一份与本次运行无关的旧结果包。
+    （包括直接崩溃）都判成"正常收口"，最后打出一份与本次运行无关的旧结果包。
 
     只删这一种 kind，其他事件一个不动：时间线是给人看的历史，不该被重跑抹掉。
     """
@@ -943,4 +943,258 @@ def user_has_live_regular_tasks(owner_id: int) -> bool:
             (int(owner_id), *_LIVE)).fetchone() is not None
     finally:
         c.close()
+
+
+# --- 反思 -----------------------------------------------------------------
+#
+# 反思是「任务收工后模型自己写的复盘」，一条任务至多一条（task_id 上有 UNIQUE，
+# 这条约束同时就是反思巡检的幂等保证：重复扫到同一任务插不进第二行）。
+#
+# **正文住在文件里，库里只存指针与处理状态。** 刻意不把正文再抄一份进库：
+# 同一段话存两遍，迟早有一次分类只改到其中一份，于是界面上写着「已沉淀」而
+# 经验文件里根本没有那条——那正是本项目最熟的一种静默失效。
+# 读正文走 reflection.read_body()，那里是唯一入口。
+
+
+def _touch_reflection(c, rid: int) -> None:
+    c.execute(
+        "UPDATE reflections SET updated_at = ? WHERE id = ?",
+        (db.now_iso(), int(rid)))
+
+
+def create_reflection(task_id: int, path: str, suggested: str = "") -> dict:
+    """给一条任务建反思记录。**同一任务第二次调用返回既有那一条**，不报错。
+
+    幂等而不是抛错：反思巡检每 tick 都可能扫到同一条刚建完还没写完正文的记录，
+    让它抛错等于把"扫到了"变成"失败了"。判据是 ``created``：新建为 True，
+    撞上已存在的为 False，调用方据此决定要不要往下写正文。
+    """
+    if suggested and suggested not in db.REFLECTION_KINDS:
+        raise Invalid(f"建议分类不合法：{suggested}")
+    now = db.now_iso()
+    c = db.connect()
+    try:
+        try:
+            cur = c.execute(
+                "INSERT INTO reflections (task_id, path, suggested, status,"
+                " created_at, updated_at) VALUES (?, ?, ?, 'draft', ?, ?)",
+                (int(task_id), str(path), str(suggested or ""), now, now))
+            c.commit()
+            rid, created = int(cur.lastrowid), True
+        except sqlite3.IntegrityError:
+            # 只吞 UNIQUE 撞车。磁盘满、只读、外键失败都会落到这里，
+            # 宽泛地吞掉会把"写不进去"报成"已经写过了"。
+            row = c.execute(
+                "SELECT id FROM reflections WHERE task_id = ?", (int(task_id),)).fetchone()
+            if row is None:
+                raise
+            rid, created = int(row[0]), False
+        row = c.execute("SELECT * FROM reflections WHERE id = ?", (rid,)).fetchone()
+        out = _fix_reflection_row(row)
+        out["created"] = created
+        return out
+    finally:
+        c.close()
+
+
+def _fix_reflection_row(row) -> dict:
+    d = dict(row)
+    # 建议分类必须落在词表内：模型可能吐出任何字符串，写进库里之前先归一。
+    if d.get("suggested") not in db.REFLECTION_KINDS:
+        d["suggested"] = ""
+    return d
+
+
+def get_reflection(reflection_id: int) -> dict:
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM reflections WHERE id = ?",
+                        (int(reflection_id),)).fetchone()
+    finally:
+        c.close()
+    if row is None:
+        raise NotFound("反思记录不存在")
+    return _fix_reflection_row(row)
+
+
+def get_reflection_by_task(task_id: int) -> dict | None:
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM reflections WHERE task_id = ?",
+                        (int(task_id),)).fetchone()
+    finally:
+        c.close()
+    return _fix_reflection_row(row) if row is not None else None
+
+
+def list_reflections(status: str | None = None, limit: int = 200) -> list[dict]:
+    if status and status not in db.REFLECTION_STATUSES:
+        raise Invalid(f"反思状态不合法：{status}")
+    c = db.connect()
+    try:
+        if status:
+            rows = c.execute(
+                "SELECT * FROM reflections WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, int(limit))).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM reflections ORDER BY id DESC LIMIT ?",
+                (int(limit),)).fetchall()
+    finally:
+        c.close()
+    return [_fix_reflection_row(r) for r in rows]
+
+
+def terminal_tasks_without_reflection(limit: int = 5) -> list[dict]:
+    """反思巡检的取数：已进入终态、但还没有反思记录的任务。
+
+    刻意**不在这里过滤工作流行任务**：一条工作流行任务跑完也是一次真实的
+    踩坑或成功，把它排除掉等于让反馈闭环在最重要的批量场景上失效。
+
+    只取最近的一小撮：巡检跑在 tick 主路径上，一次给太多会让调度器卡住。
+    """
+    marks = ",".join("?" * len(db.TERMINAL_STATUSES))
+    c = db.connect()
+    try:
+        rows = c.execute(
+            f"SELECT * FROM tasks WHERE status IN ({marks})"
+            " AND id NOT IN (SELECT task_id FROM reflections)"
+            " ORDER BY id DESC LIMIT ?",
+            (*db.TERMINAL_STATUSES, int(limit))).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def set_reflection_content(reflection_id: int, suggested: str) -> None:
+    """正文写完后回填模型给的建议分类。"""
+    if suggested not in db.REFLECTION_KINDS:
+        suggested = ""
+    c = db.connect()
+    try:
+        c.execute("UPDATE reflections SET suggested = ?, status = 'draft', error = ''"
+                  " WHERE id = ?", (suggested, int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+
+
+def mark_reflection_failed(reflection_id: int, error: str) -> None:
+    """这次反思没生成出来。如实标成 failed，别把一条空记录留在列表里冒充复盘。"""
+    c = db.connect()
+    try:
+        c.execute("UPDATE reflections SET status = 'failed', error = ? WHERE id = ?",
+                  (str(error)[:500], int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+
+
+def classify_reflection(reflection_id: int, kind: str, skill: str,
+                        actor: str) -> dict:
+    """管理员定分类。
+
+    **只有 draft / reviewed 能改**：已 applied 的再改一次等于把已经写进经验
+    文件的内容悄悄换个身份，而没人去撤掉那一条。
+    """
+    if kind not in db.REFLECTION_KINDS:
+        raise Invalid(f"分类不合法：{kind}")
+    if kind == "":
+        raise Invalid("还没定分类")
+    c = db.connect()
+    try:
+        row = c.execute("SELECT * FROM reflections WHERE id = ?",
+                        (int(reflection_id),)).fetchone()
+        if row is None:
+            raise NotFound("反思记录不存在")
+        if row["status"] in ("applied", "rejected", "failed"):
+            raise Invalid(f"这条反思已经是「{row['status']}」了，不能再改分类")
+        c.execute(
+            "UPDATE reflections SET kind = ?, skill = ?, status = 'reviewed',"
+            " decided_by = ?, decided_at = ? WHERE id = ?",
+            (kind, str(skill or "")[:200], str(actor or "")[:80], db.now_iso(),
+             int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+    return get_reflection(reflection_id)
+
+
+def reject_reflection(reflection_id: int, actor: str) -> dict:
+    """管理员判定这条不该沉淀。这是必须有的一条路：反思会一直产出，
+    没有否决的口子的话，管理员要么全收要么不看。"""
+    c = db.connect()
+    try:
+        row = c.execute("SELECT status FROM reflections WHERE id = ?",
+                        (int(reflection_id),)).fetchone()
+        if row is None:
+            raise NotFound("反思记录不存在")
+        if row["status"] == "applied":
+            raise Invalid("这条已经落地了，不能再否决")
+        c.execute(
+            "UPDATE reflections SET status = 'rejected', decided_by = ?,"
+            " decided_at = ? WHERE id = ?",
+            (str(actor or "")[:80], db.now_iso(), int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+    return get_reflection(reflection_id)
+
+
+def set_reflection_proposal(reflection_id: int, proposal: str, target: str,
+                            base_hash: str) -> None:
+    """记下修改方案：文件路径、要改的目标、方案基于的原文 sha256。"""
+    c = db.connect()
+    try:
+        row = c.execute("SELECT status FROM reflections WHERE id = ?",
+                        (int(reflection_id),)).fetchone()
+        if row is None:
+            raise NotFound("反思记录不存在")
+        if row["status"] == "applied":
+            raise Invalid("这条已经落地了，不能再挂新方案")
+        c.execute(
+            "UPDATE reflections SET proposal = ?, proposal_target = ?,"
+            " proposal_base = ?, proposal_state = 'ready' WHERE id = ?",
+            (str(proposal), str(target), str(base_hash), int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+
+
+def set_proposal_state(reflection_id: int, state: str) -> None:
+    """只改方案状态。``running`` 在调模型**之前**就写：管理员看到「正在生成」
+    就知道该等，而看到空白就该重试——把这两者混在一列里就成了猜。"""
+    if state not in db.PROPOSAL_STATES:
+        raise Invalid(f"方案状态不合法：{state}")
+    c = db.connect()
+    try:
+        c.execute("UPDATE reflections SET proposal_state = ? WHERE id = ?",
+                  (state, int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+
+
+def mark_reflection_applied(reflection_id: int) -> dict:
+    c = db.connect()
+    try:
+        row = c.execute("SELECT status FROM reflections WHERE id = ?",
+                        (int(reflection_id),)).fetchone()
+        if row is None:
+            raise NotFound("反思记录不存在")
+        if row["status"] == "applied":
+            raise Invalid("这条已经落地过了")
+        c.execute("UPDATE reflections SET status = 'applied', applied_at = ?"
+                  " WHERE id = ?", (db.now_iso(), int(reflection_id)))
+        _touch_reflection(c, reflection_id)
+        c.commit()
+    finally:
+        c.close()
+    return get_reflection(reflection_id)
 

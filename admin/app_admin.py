@@ -24,9 +24,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import sqlite3
 import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -49,6 +52,8 @@ import artifacts as prod          # noqa: E402  产物发现/打包/确认（ser
 import auth                       # noqa: E402
 import db                         # noqa: E402
 import store                      # noqa: E402
+import skills_index               # noqa: E402
+import reflection                 # noqa: E402
 
 VERSION = "0.1.0"
 
@@ -307,6 +312,17 @@ class RpcIn(BaseModel):
     thinking_level: str = Field(default="", max_length=64)
 
 
+class ClassifyIn(BaseModel):
+    """管理员定分类。**没有 default**：不选就提交是不该被接受的。"""
+    kind: Literal["lesson", "tool_gap"]
+    skill: str = Field(default="", max_length=200)
+
+
+class ProposeIn(BaseModel):
+    """要改哪个文件。必须是技能仓库内的相对路径，reflection 那边会再拦一道。"""
+    target: str = Field(min_length=1, max_length=400)
+
+
 # 面板只认这四条命令。它们是 `admin/rpc/{task_id}` 的白名单，不是给 agent 的：
 # 面板是值班台，不该成为往计算进程里塞任意命令的口子。
 RPC_COMMANDS = ("steer", "follow_up", "abort", "set_model", "set_thinking_level")
@@ -340,6 +356,113 @@ def require_admin_token(request: Request) -> tuple[dict, str]:
 
 def require_admin(user: tuple[dict, str] = Depends(require_admin_token)) -> dict:
     return user[0]
+
+
+# ---------------------------------------------------------------- 反思辅助
+
+
+def _reflection_task_title(rec: dict) -> str:
+    """反思所属任务的标题。取不到就给空串——**不让它把整个列表带崩**：
+    任务被删掉（级联带着反思一起删）不会发生，但库被手工改过就可能。"""
+    try:
+        return str(store.get_task(int(rec["task_id"]), is_admin=True).get("title") or "")
+    except Exception:                                      # noqa: BLE001
+        return ""
+
+
+def _proposal_diff(rec: dict) -> str:
+    """方案的 diff 文本。还没生成 / 失败时返回空串，不是抛错。"""
+    if rec.get("proposal_state") != "ready" or not rec.get("proposal"):
+        return ""
+    try:
+        return Path(rec["proposal"]).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _land_lesson(rec: dict, who: str) -> dict:
+    """把一条「经验」真的写下去。
+
+    **分类校验在这里再拦一道**，不是只在端点上：这是唯一会往用户的经验文件
+    与技能仓库里写东西的函数，端点那一层的校验任何新的调用方都会绕过去。
+    而绕过去的后果不显眼——一条被判为「工具意见」的复盘，它的「经验」一节
+    照样会被写进每一个任务都要读的经验文件。
+
+    **全局经验文件是那一步的主体**：它每个任务都会被注入，是唯一保证生效的
+    通道。写进技能 references 是「知识待在离工具最近的地方」的那一层，写失败
+    不许把前者一起判失败——否则一条技能目录权限问题会让全局经验也写不进去。
+    """
+    if rec.get("kind") != "lesson":
+        raise store.Invalid(
+            "只有分类为「经验」的反思能这么落地。工具意见要改的是技能文件，"
+            "请走「生成修改方案 → 看过 diff → 应用」。")
+    body = reflection.read_body(rec["path"])
+    lines = [ln.strip() for ln in body.splitlines()]
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.lstrip("# ").strip() == "经验")
+    except StopIteration:
+        raise store.Invalid("这份反思里没有「经验」一节，没什么可沉淀的") from None
+
+    written, skill_hit = 0, 0
+    for ln in lines[start + 1:]:
+        if ln.lstrip().startswith("#"):
+            break                                           # 下一节了
+        if not ln.strip().startswith("- "):
+            continue
+        m = re.match(r"^-\s*\[技能\s*([^\]]*)\]\s*(.+)$", ln.strip())
+        if not m:
+            continue
+        skill, text = m.group(1).strip(), m.group(2).strip()
+        if text in ("", "无"):
+            continue
+        reflection.append_lesson(skill, text, int(rec["task_id"]), who)
+        if reflection.append_skill_lesson(skill, text, int(rec["task_id"])):
+            skill_hit += 1
+        written += 1
+
+    if not written:
+        raise store.Invalid("「经验」一节里没有可沉淀的条目")
+    out = store.mark_reflection_applied(rec["id"])
+    out["landed"] = written
+    out["landed_into_skill"] = skill_hit
+    if skill_hit < written:
+        out["note"] = (f"{written} 条已写进全局经验文件，其中 {skill_hit} 条同时进了"
+                       "技能的 references。剩下的对不上任何真实技能，"
+                       "只留在全局文件里。")
+    return out
+
+
+# 方案生成的后台线程。**每个 id 最多一条**，重复的入队请求在 propose 里已经
+# 被 proposal_state='running' 挡掉了，这里只是第二道。
+_proposal_lock = threading.Lock()
+_proposal_threads: dict[int, threading.Thread] = {}
+
+
+def _start_proposal(reflection_id: int, target: str) -> None:
+    rid = int(reflection_id)
+
+    def _run():
+        try:
+            reflection.build_proposal(rid, target)
+        except Exception:                                  # noqa: BLE001
+            # 状态在 build_proposal 内部各条失败路径上都写了；这里兜住的是
+            # 「连状态都写不进去」那种，而线程绝不能因为它死掉。
+            logging.getLogger(__name__).exception("生成反思 %s 的修改方案失败", rid)
+            try:
+                store.set_proposal_state(rid, "failed")
+            except Exception:                              # noqa: BLE001
+                pass
+        finally:
+            with _proposal_lock:
+                _proposal_threads.pop(rid, None)
+
+    with _proposal_lock:
+        old = _proposal_threads.get(rid)
+        if old is not None and old.is_alive():
+            return
+        t = threading.Thread(target=_run, name=f"propose-{rid}", daemon=True)
+        _proposal_threads[rid] = t
+    t.start()
 
 
 # ---------------------------------------------------------------- 应用
@@ -602,6 +725,102 @@ def create_admin_app() -> FastAPI:
 
         fresh = next((u for u in _list_users() if u["id"] == int(user_id)), None)
         return fresh or target
+
+    # --- 反思（rsi）------------------------------------------------------------
+    #
+    # 反思的正文住在文件里，列表只给指针与处理状态。**分类这一步是整个功能的
+    # 关口**：模型给的建议只是建议，落地一律由管理员点确认才发生——没审过的
+    # 自动沉淀会把一条错的经验喂给后面每一个任务，而那时没人知道它从哪来。
+
+    @app.get("/api/admin/reflections")
+    def list_reflections(
+        status: Literal["", "draft", "reviewed", "applied", "rejected", "failed"] = "",
+        limit: int = Query(default=100, ge=1, le=500),
+        user: dict = Depends(require_admin)):
+        rows = store.list_reflections(status=status or None, limit=limit)
+        for r in rows:
+            r["task_title"] = _reflection_task_title(r)
+        counts = {s: 0 for s in db.REFLECTION_STATUSES}
+        for r in store.list_reflections(limit=500):
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        # 技能名一并给，界面上的技能选择框才知道有哪些真选项。
+        # 不给的话管理员得手打，而打错一个字母会静默地写进一个不存在的目录。
+        return {"reflections": rows, "counts": counts,
+                "skills": sorted(skills_index.scan().keys())}
+
+    @app.get("/api/admin/reflections/{reflection_id}")
+    def get_reflection(reflection_id: int, user: dict = Depends(require_admin)):
+        rec = store.get_reflection(reflection_id)
+        rec["task_title"] = _reflection_task_title(rec)
+        rec["body"] = reflection.read_body(rec["path"])
+        # 解析结果一并给：前端**不再自己解析一遍**。两处各写一份正则，
+        # 改了一处另一处还在用旧的那份，表现是「界面上有经验，点落地却是 0 条」。
+        rec["parsed"] = reflection.parse_or_none(rec["body"])
+        rec["suggested_skill"] = reflection.suggested_skill(rec["parsed"])
+        rec["diff"] = _proposal_diff(rec)
+        return rec
+
+    @app.post("/api/admin/reflections/{reflection_id}/classify")
+    def classify(reflection_id: int, body: ClassifyIn,
+                 who: tuple[dict, str] = Depends(require_admin_token)):
+        """定分类。**这一步不落地任何东西**，只是把状态推到 reviewed。
+
+        刻意分成两步：分类与落地之间留一个人工停顿，管理员可以在落地前再
+        想一次。合成一步的话，「看着像就点」会把未经细看的内容写进记忆。
+        """
+        user, _ = who
+        rec = store.classify_reflection(reflection_id, body.kind, body.skill,
+                                        user["username"])
+        rec["task_title"] = _reflection_task_title(rec)
+        return rec
+
+    @app.post("/api/admin/reflections/{reflection_id}/reject")
+    def reject(reflection_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
+        """否决。**必须有这条路**：反思会一直产出，没有否决口子的分类
+        队列只会越积越长，最后没人看——那等于没做。"""
+        user, _ = who
+        return store.reject_reflection(reflection_id, user["username"])
+
+    @app.post("/api/admin/reflections/{reflection_id}/land")
+    def land(reflection_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
+        """落地。分类为「经验」时写进全局经验文件与对应技能的 references。
+
+        只处理「经验」这一类：工具意见的落地是**改代码 + git 提交**，走
+        propose/apply 那两步，中间必须有一双眼睛看过 diff。
+        """
+        user, _ = who
+        rec = store.get_reflection(reflection_id)
+        if rec["kind"] != "lesson":
+            raise store.Invalid(
+                "只有「经验」能一步落地。工具意见要改的是技能文件，"
+                "请走「生成修改方案 → 看过 diff → 应用」。")
+        rec = _land_lesson(rec, user["username"])
+        return store.get_reflection(reflection_id)
+
+    @app.post("/api/admin/reflections/{reflection_id}/propose")
+    def propose(reflection_id: int, body: ProposeIn,
+                user: dict = Depends(require_admin)):
+        """生成修改方案。**后台跑**，接口立刻返回；管理员轮询这条记录。"""
+        rec = store.get_reflection(reflection_id)
+        if rec["kind"] != "tool_gap":
+            raise store.Invalid("只有「工具意见」才生成修改方案")
+        if rec["status"] == "applied":
+            raise store.Invalid("这条已经应用过了")
+        if rec["proposal_state"] == "running":
+            raise store.Invalid("方案正在生成中，稍等")
+        _start_proposal(reflection_id, body.target)
+        return {"ok": True, "proposal_state": "running"}
+
+    @app.post("/api/admin/reflections/{reflection_id}/apply")
+    def apply_proposal(reflection_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
+        """应用方案：写进技能仓库并 git 提交。
+
+        落盘前会比对原文哈希：方案是基于某一版原文生成的，管理员看 diff 到
+        点确认之间技能文件可能被人改过。不比对就写，等于拿旧方案覆盖掉
+        别人的新改动，而 git 里看不出来是谁干的。
+        """
+        user, _ = who
+        return reflection.apply_proposal(reflection_id)
 
     # --- 干预通道（spec §8.1） -------------------------------------------------
 

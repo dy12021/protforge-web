@@ -42,6 +42,21 @@ STATUS_INDEX = {k: i for i, k in enumerate(STATUS_KEYS)}
 VALID_STATUSES = STATUS_KEYS + ["failed"]
 TERMINAL_STATUSES = ("done", "failed")
 
+# 反思的处理阶段。与任务状态**无关**，别混用。
+#   draft     模型已写出反思，等管理员分类（刚生成就是这一档）
+#   reviewed  管理员已分类，等落地（写经验 / 应用修改方案）
+#   applied   已落地
+#   rejected  管理员判定不该沉淀
+#   failed    这次反思没生成出来（模型调不通之类），error 里写原因
+REFLECTION_STATUSES = ("draft", "reviewed", "applied", "rejected", "failed")
+# 管理员能定的两类。空串 = 还没定。**不要加第三类**：加进来的每一种都得
+# 在 admin 端有个对应的落地动作，没有动作的分类就是只进不出的死路。
+REFLECTION_KINDS = ("", "lesson", "tool_gap")
+# 修改方案的生成状态。**空串 = 没生成过**。单列而不是复用 proposal（存路径），
+# 是因为「正在生成」与「生成完但路径还没写进去」是两回事，合在一列里
+# 管理员就分不出「该等」和「该重试」。
+PROPOSAL_STATES = ("", "running", "ready", "failed")
+
 SCHEMA_VERSION = 1
 
 SCHEMA = """
@@ -138,6 +153,27 @@ CREATE TABLE IF NOT EXISTS audit_log (
   exit_code INTEGER, elapsed_ms INTEGER, actor TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_log(task_id, id);
+CREATE TABLE IF NOT EXISTS reflections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  suggested TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT '',
+  skill TEXT NOT NULL DEFAULT '',
+  proposal TEXT NOT NULL DEFAULT '',
+  proposal_target TEXT NOT NULL DEFAULT '',
+  proposal_base TEXT NOT NULL DEFAULT '',
+  proposal_state TEXT NOT NULL DEFAULT '',
+  decided_by TEXT NOT NULL DEFAULT '',
+  decided_at TEXT,
+  applied_at TEXT,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  CHECK (status IN ('draft','reviewed','applied','rejected','failed')),
+  CHECK (kind IN ('','lesson','tool_gap'))
+);
+CREATE INDEX IF NOT EXISTS idx_reflections_status ON reflections(status, id);
 CREATE TRIGGER IF NOT EXISTS trg_tasks_touch AFTER UPDATE ON tasks
 WHEN NEW.updated_at = OLD.updated_at
 BEGIN

@@ -70,6 +70,10 @@ const state = {
   counts: {},               // 同上，按当前范围统计的各状态计数
   filter: { q: "", status: "", activeOnly: false },
   auditFilter: { task: "", kind: "", q: "", failOnly: false },
+  reflections: [],         // 反思列表快照
+  reflCounts: {},          // 各状态计数（角标与「待处理 N 条」都从这里来）
+  reflDetail: null,        // 最近一次展开的正文详情（分类/落地按钮要读它的解析结果）
+  reflTimer: null,         // 「方案正在生成」时的自轮询句柄
   tab: "live",
   me: null,
   clockTimer: null,
@@ -1224,6 +1228,331 @@ function confirmBody(content, okLabel, read) {
   });
 }
 
+// ---------------------------------------------------------------- 反思
+//
+// 这一块的取舍只有一条：**模型的分类只是建议，落地一定经过人的手**。
+// 经验一旦写进全局经验文件，下一个任务开工就会读到它；而那之后没人说得清
+// 某条奇怪的要求是从哪来的。所以分类、落地、改技能都各是一个独立的确认动作。
+
+const REFL_LABEL = {
+  draft: "待分类", reviewed: "已分类待落地", applied: "已落地",
+  rejected: "已否决", failed: "生成失败",
+};
+const REFL_KIND_LABEL = { lesson: "经验", tool_gap: "工具不够用" };
+
+async function loadReflections() {
+  /* 每次进来先撤掉上一次挂的定时器。这一行是被 10 秒兜底轮询逼出来的：
+   * 方案生成期间一次调用挂 4 秒定时器、10 秒轮询又调一次，两条路都会挂，
+   * 不撤就成了 4 秒一次、且越挂越多的定时器群。 */
+  if (state.reflTimer) { clearTimeout(state.reflTimer); state.reflTimer = null; }
+  const status = document.getElementById("refl-status").value || "";
+  const got = await api("GET", "/reflections" + (status ? "?status=" + status : ""));
+  state.reflections = got.reflections || [];
+  state.reflCounts = got.counts || {};
+
+  const dl = document.getElementById("refl-skill-list");
+  dl.textContent = "";
+  (got.skills || []).forEach(n => dl.append(el("option", null, n)));
+
+  const todo = (state.reflCounts.draft || 0) + (state.reflCounts.reviewed || 0);
+  const badge = document.getElementById("badge-reflections");
+  badge.textContent = String(todo);
+  badge.hidden = todo === 0;
+
+  renderReflections();
+
+  // 正在生成方案的那条要自己轮询：它没有实时通道（生成在服务端的另一条线程上），
+  // 而管理员盯着这一个页面等它出来。不轮询的话表现是「按钮按了，什么都没发生」。
+  if (state.reflections.some(r => r.proposal_state === "running")) {
+    state.reflTimer = setTimeout(() => loadReflections().catch(() => {}), 4000);
+  }
+}
+
+function renderReflections() {
+  const host = document.getElementById("refl-list");
+  const empty = document.getElementById("refl-empty");
+  const note = document.getElementById("refl-note");
+  host.textContent = "";
+  const rows = state.reflections || [];
+  empty.hidden = rows.length > 0;
+  note.textContent = rows.length ? "" : "还没有反思。计算任务收工之后会自动生成。";
+
+  const counts = state.reflCounts || {};
+  document.getElementById("refl-sub").textContent = rows.length
+    ? ("共 " + rows.length + " 条 · 待处理 " +
+       ((counts.draft || 0) + (counts.reviewed || 0)) + " 条")
+    : "";
+
+  rows.forEach(r => host.append(reflCard(r)));
+}
+
+function reflCard(r) {
+  const box = el("article", "refl");
+  box.dataset.id = String(r.id);
+  /* 状态同时上到 data-*：竖条的颜色走 CSS，这里只管把状态说清楚。
+   * 不写在 JS 里拼 class 是因为那边已经有 5 个状态色，再加一套必然跑偏。 */
+  box.dataset.status = r.status;
+
+  const top = el("div", "refl-top");
+  top.append(el("span", "chip chip-" + (r.status === "failed" ? "failed"
+            : r.status === "applied" ? "done" : "queued"),
+            REFL_LABEL[r.status] || r.status));
+  top.append(el("span", "refl-task",
+            "#" + r.task_id + " " + (r.task_title || "（任务已删除）")));
+  top.append(el("span", "refl-when", (r.created_at || "").slice(5, 16).replace("T", " ")));
+  box.append(top);
+
+  const sug = el("div", "refl-suggest");
+  sug.append(el("span", null, "模型建议："));
+  sug.append(el("b", null,
+    REFL_KIND_LABEL[r.suggested] || "没给建议（等你定）"));
+  if (r.decided_by) {
+    sug.append(el("span", "refl-by", " · 由 " + r.decided_by + " 定为「" +
+      (REFL_KIND_LABEL[r.kind] || r.kind) + "」"));
+  }
+  box.append(sug);
+
+  if (r.status === "failed") {
+    box.append(el("div", "refl-bad", r.error || "生成失败，没有写明原因"));
+  }
+
+  box.append(el("div", "refl-detail-row"));
+  const detail = box.querySelector(".refl-detail-row");
+  const toggle = el("button", "btn", "看正文");
+  toggle.type = "button";
+  const panel = el("div", "refl-panel");
+  panel.hidden = true;
+  toggle.addEventListener("click", async () => {
+    panel.hidden = !panel.hidden;
+    if (panel.hidden) { panel.textContent = ""; toggle.textContent = "看正文"; return; }
+    toggle.textContent = "收起正文";
+    panel.textContent = "正在取…";
+    try {
+      await renderReflPanel(panel, r);
+    } catch (e) {
+      panel.textContent = "";
+      panel.append(el("div", "refl-bad", e.message || "取正文失败"));
+    }
+  });
+  detail.append(toggle);
+
+  const acts = el("div", "refl-acts");
+  if (r.status === "draft") {
+    acts.append(classifyBtn(r, "lesson", "判为经验"));
+    acts.append(classifyBtn(r, "tool_gap", "判为工具不够用"));
+    acts.append(rejectBtn(r));
+  } else if (r.status === "reviewed" && r.kind === "lesson") {
+    acts.append(landBtn(r));
+    acts.append(reclassifyBtn(r, "tool_gap", "其实该改工具"));
+  } else if (r.status === "reviewed" && r.kind === "tool_gap") {
+    acts.append(proposeRow(r));
+  }
+  if (acts.childNodes.length) box.append(acts);
+
+  box.append(panel);
+  return box;
+}
+
+function classifyBtn(r, kind, label) {
+  const b = el("button", "btn" + (kind === "lesson" ? " btn-ok" : " btn-warn"), label);
+  b.type = "button";
+  b.addEventListener("click", () => doClassify(r, kind));
+  return b;
+}
+
+function reclassifyBtn(r, kind, label) {
+  const b = el("button", "btn", label);
+  b.type = "button";
+  b.addEventListener("click", () => doClassify(r, kind));
+  return b;
+}
+
+async function doClassify(r, kind) {
+  const skill = (state.reflDetail && state.reflDetail.id === r.id)
+    ? (state.reflDetail.suggested_skill || "") : "";
+  try {
+    await api("POST", "/reflections/" + r.id + "/classify", { kind, skill });
+    await loadReflections();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "分类失败", "bad");
+  }
+}
+
+function rejectBtn(r) {
+  const b = el("button", "btn", "否决（这次没什么可沉淀的）");
+  b.type = "button";
+  b.addEventListener("click", () => {
+    const body = el("div");
+    body.append(el("h2", "confirm-title", "否决这条反思？"));
+    body.append(el("p", "confirm-lead",
+      "否决之后它不再出现在待办里，但反思正文仍然留着，随时能翻出来看。"));
+    confirmBody(body, "否决", ok => {
+      api("POST", "/reflections/" + r.id + "/reject")
+        .then(() => loadReflections())
+        .catch(e => setMsg(document.getElementById("board-msg"),
+                            e.message || "否决失败", "bad"));
+      ok();
+    });
+  });
+  return b;
+}
+
+function landBtn(r) {
+  const b = el("button", "btn btn-ok", "写进经验");
+  b.type = "button";
+  b.addEventListener("click", () => {
+    const body = el("div");
+    body.append(el("h2", "confirm-title", "把这些经验写进记忆？"));
+    body.append(el("p", "confirm-lead",
+      "写进去之后，之后每一个计算任务开工时都会先读到它们。"));
+    const ul = el("ul", "confirm-list");
+    (state.reflDetail && state.reflDetail.id === r.id
+      ? ((state.reflDetail.parsed && state.reflDetail.parsed.lessons) || [])
+      : []
+    ).forEach(i => ul.append(el("li", null, i.text)));
+    if (!ul.childNodes.length) {
+      ul.append(el("li", null, "（正文还没取到，先点「看正文」再写）"));
+    }
+    body.append(ul);
+    confirmBody(body, "写进去", ok => {
+      api("POST", "/reflections/" + r.id + "/land")
+        .then(() => loadReflections())
+        .catch(e => setMsg(document.getElementById("board-msg"),
+                            e.message || "写经验失败", "bad"));
+      ok();
+    });
+  });
+  return b;
+}
+
+function proposeRow(r) {
+  const wrap = el("div", "refl-propose");
+  const input = el("input", null, "");
+  input.type = "text";
+  input.placeholder = "要改的技能文件，例如 skills/protforge-xxx/SKILL.md";
+  input.className = "refl-target";
+  input.setAttribute("list", "refl-skill-list");
+  input.value = r.proposal_target || "";
+  const go = el("button", "btn", r.proposal ? "重新生成方案" : "生成修改方案");
+  go.type = "button";
+  go.addEventListener("click", async () => {
+    const target = input.value.trim();
+    if (!target) {
+      setMsg(document.getElementById("board-msg"), "先填要改哪个文件", "warn");
+      return;
+    }
+    go.disabled = true;
+    try {
+      await api("POST", "/reflections/" + r.id + "/propose", { target });
+      await loadReflections();
+    } catch (e) {
+      setMsg(document.getElementById("board-msg"), e.message || "生成方案失败", "bad");
+      go.disabled = false;
+    }
+  });
+  wrap.append(input, go);
+
+  if (r.proposal_state === "running") {
+    wrap.append(el("span", "who", "方案正在生成，要一两分钟…"));
+  } else if (r.proposal_state === "failed") {
+    wrap.append(el("span", "refl-bad", "上一次生成没成功，可以改完再试"));
+  } else if (r.proposal) {
+    wrap.append(applyBtn(r));
+  }
+  return wrap;
+}
+
+function applyBtn(r) {
+  const b = el("button", "btn btn-warn", "应用方案（改技能文件）");
+  b.type = "button";
+  b.addEventListener("click", async () => {
+    let detail;
+    try {
+      detail = await api("GET", "/reflections/" + r.id);
+    } catch (e) {
+      setMsg(document.getElementById("board-msg"), e.message || "取方案失败", "bad");
+      return;
+    }
+    if (!detail.diff) {
+      setMsg(document.getElementById("board-msg"), "方案内容读不出来，先重新生成", "warn");
+      return;
+    }
+    const body = el("div");
+    body.append(el("h2", "confirm-title", "把下面这些改动写进技能文件？"));
+    body.append(el("p", "confirm-lead",
+      "会改 " + detail.proposal_target + " 并在该仓库提交一次。"
+      + "这一步之后技能立刻生效，写错了只能靠 git 回退。"));
+    const pre = el("pre", "refl-diff", detail.diff);
+    body.append(pre);
+    confirmBody(body, "应用", ok => {
+      api("POST", "/reflections/" + r.id + "/apply")
+        .then(() => loadReflections())
+        .catch(e => setMsg(document.getElementById("board-msg"),
+                            e.message || "应用失败", "bad"));
+      ok();
+    });
+  });
+  return b;
+}
+
+async function renderReflPanel(panel, r) {
+  const detail = await api("GET", "/reflections/" + r.id);
+  state.reflDetail = detail;
+  panel.textContent = "";
+  const parsed = detail.parsed;
+  if (!parsed) {
+    panel.append(el("div", "refl-bad",
+      "这一次的正文解析不出结构（可能模型换了说法）。原话在下面："));
+  } else {
+    ["did", "went_well", "stuck", "lessons", "tool_gaps"].forEach(k => {
+      const v = parsed[k];
+      if (!v || (Array.isArray(v) && !v.length)) return;
+      panel.append(el("div", "refl-sec", k === "did" ? "这次实际做了什么"
+        : k === "went_well" ? "顺利的地方"
+        : k === "stuck" ? "卡住的地方"
+        : k === "lessons" ? "经验" : "工具意见"));
+      if (k === "did") {
+        panel.append(el("div", "body-text", v));
+      } else {
+        const ul = el("ul", "refl-ul");
+        v.forEach(i => ul.append(el("li", null,
+          typeof i === "string" ? i : "[" + (i.skill || "通用") + "] " + i.text)));
+        panel.append(ul);
+      }
+    });
+  }
+  const raw = el("pre", "refl-raw", detail.body || "");
+  raw.hidden = true;
+  const tog = el("button", "btn", "看模型原话");
+  tog.type = "button";
+  tog.addEventListener("click", () => { raw.hidden = !raw.hidden; });
+  panel.append(tog, raw);
+
+  // 判为经验/工具意见时可能要用详情里的解析结果（预览条目、预填技能名），
+  // 所以把动作条重画一遍。
+  const box = panel.closest(".refl");
+  const old = box.querySelector(".refl-acts");
+  if (old) old.remove();
+  const acts = el("div", "refl-acts");
+  const fresh = (state.reflections || []).find(x => x.id === r.id) || r;
+  if (fresh.status === "draft") {
+    acts.append(classifyBtn(fresh, "lesson", "判为经验"));
+    acts.append(classifyBtn(fresh, "tool_gap", "判为工具不够用"));
+    acts.append(rejectBtn(fresh));
+  } else if (fresh.status === "reviewed" && fresh.kind === "lesson") {
+    acts.append(landBtn(fresh));
+  } else if (fresh.status === "reviewed" && fresh.kind === "tool_gap") {
+    acts.append(proposeRow(fresh));
+  }
+  if (acts.childNodes.length) panel.insertBefore(acts, panel.firstChild);
+}
+
+document.getElementById("refl-refresh").addEventListener("click", () =>
+  loadReflections().catch(e =>
+    setMsg(document.getElementById("board-msg"), e.message || "反思拉取失败", "bad")));
+document.getElementById("refl-status").addEventListener("change", () =>
+  loadReflections().catch(() => {}));
+
 // ---------------------------------------------------------------- 页签
 
 function showTab(name) {
@@ -1237,6 +1566,12 @@ function showTab(name) {
   if (name === "audit" && !state.auditAll.length) {
     loadAudit().catch(e =>
       setMsg(document.getElementById("board-msg"), e.message || "审计日志拉取失败", "bad"));
+  }
+  // 反思每次切进来都拉（不像审计那样只拉第一次）：它是有时效的待办，
+  // 管理员判完一条回值班台、再切回来时看到的必须是最新那批。
+  if (name === "reflections") {
+    loadReflections().catch(e =>
+      setMsg(document.getElementById("board-msg"), e.message || "反思拉取失败", "bad"));
   }
 }
 
@@ -1257,12 +1592,16 @@ function signedOut(msg) {
   state.streams.forEach((ctl, id) => stopStream(id));
   state.streams.clear();
   if (state.clockTimer) { clearInterval(state.clockTimer); state.clockTimer = null; }
+  if (state.reflTimer) { clearTimeout(state.reflTimer); state.reflTimer = null; }
   state.tasks = [];
   state.byId.clear();
   state.cards.forEach(n => n.remove());
   state.cards.clear();
   state.pending.clear();
   state.users = [];
+  state.reflections = [];
+  state.reflCounts = {};
+  state.reflDetail = null;
   document.getElementById("who").textContent = "";
   showLogin(msg || "请登录");
 }
@@ -1372,6 +1711,10 @@ setInterval(() => {
   if (document.visibilityState !== "visible") return;
   load().catch(() => {});
   if (state.tab === "audit") loadAudit().catch(() => {});
+  /* 反思这里**无条件**拉，不看当前页签：页签上的角标是「有多少条等我判」，
+   * 只在打开页签时刷，那个角标会一直停在打开那一刻的值，等于没有角标。
+   * 代价只是一个只读列表接口，很便宜。 */
+  loadReflections().catch(() => {});
 }, 10000);
 
 function startClock() {
@@ -1396,10 +1739,12 @@ function startClock() {
  * 曾经就有一个 `render` 留在名单里：渲染早就拆成 renderLive / renderTasks 等
  * 几个函数，render 这个名字早就不存在了。整个值班台于是从来没活过。 */
 Object.assign(window, {
-  api, state, el, load, reload: load, loadUsers, loadAudit,
+  api, state, el, load, reload: load, loadUsers, loadAudit, loadReflections,
   renderLive, renderPending, renderTasks, renderAudit, renderUsers, setScope,
+  renderReflections, reflCard, renderReflPanel,
   fmtTime, fmtMs, fmtSize, STATUS_ORDER, STATUS_LABEL, ROLE_LABEL,
-  SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL, apiBase, token,
+  SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL, REFL_LABEL, REFL_KIND_LABEL,
+  apiBase, token,
   buildRail, paintRail, railIndex, confirmAction, confirmBody,
   exportAuditCsv, doVerify, doAbort, doRetry, sendRpc, showTab,
 });

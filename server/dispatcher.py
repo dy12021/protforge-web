@@ -58,6 +58,8 @@ from pathlib import Path
 
 import db
 import guards
+import llm
+import reflection
 import sse
 import store
 import workflow as workflow_mod
@@ -79,6 +81,14 @@ RPC_TIMEOUT = 30.0                                 # 管理员 steer 等响应�
 POLL_INTERVAL = 1.0                                # 队列轮询 + 退出检测的间隔
 GPU_PROBE_TIMEOUT = 10.0
 KILL_TIMEOUT = 15.0
+
+# --- 反思（rsi）调参 -------------------------------------------------------------
+# 一轮巡检最多入队几条。刻意给得小：巡检跑在 tick 主路径上（POLL_INTERVAL=1s），
+# 而一次模型调用要几十秒起。入队多了只是让队列更长，不会更快。
+REFLECTION_SWEEP_LIMIT = 3
+# 后台反思线程数。比归档少：归档是本地磁盘 IO，这里每一次都是一次**要花钱的**
+# 模型调用，堆线程只会更快地把 token 花掉，不会更快地拿到结果。
+REFLECTION_WORKERS = 2
 READER_JOIN_TIMEOUT = 5.0
 #: agent 报完 finish 之后，给它自己收尾（关 stdin → runRpcMode 返回 → 进程退出）
 #: 的宽限。逾时就杀进程树——宁可强杀也不能让任务永远停在「计算中」。
@@ -254,83 +264,10 @@ def agent_token_task(token) -> int | None:
 
 # --- 模型配置 ------------------------------------------------------------------------
 #
-# pi 从**用户全局**的 agent 目录读 models.json / auth.json。本机那两个文件是空的，
-# 于是 agent 起得来却永远发不出第一次模型请求：不报错、不退出、心跳照跳，状态永远
-# 停在「正在准备环境」。这里给每个任务物化一份，密钥用 $ENV 插值、不落盘。
-
-PI_AGENT_DIRNAME = ".pi-agent"
-
-LLM_BASE_URL_ENV = "PROTFORGE_LLM_BASE_URL"
-LLM_MODEL_ENV = "PROTFORGE_LLM_MODEL"
-LLM_KEY_ENV_ENV = "PROTFORGE_LLM_API_KEY_ENV"        # 放的是"环境变量名"，不是密钥本身
-LLM_CTX_ENV = "PROTFORGE_LLM_CONTEXT_WINDOW"
-LLM_MAXTOK_ENV = "PROTFORGE_LLM_MAX_TOKENS"
-LLM_PROVIDER_ID = "protforge-llm"
-
-# 默认值与 llm-quant 的 [llm] 段一致——那是本机上已经跑通过的同一套端点。
-_LLM_DEFAULTS = {
-    LLM_BASE_URL_ENV: "https://api.minimax.cn/v1",
-    LLM_MODEL_ENV: "MiniMax-M3.1-Flash-Preview",
-    LLM_KEY_ENV_ENV: "MINIMAX_API_KEY",
-    LLM_CTX_ENV: "1000000",
-    LLM_MAXTOK_ENV: "8192",
-}
-
-
-def _llm_setting(env_name: str) -> str:
-    return (os.environ.get(env_name) or _LLM_DEFAULTS[env_name]).strip()
-
-
-def materialize_model_config(work_dir: Path) -> tuple[Path, bool]:
-    """在任务工作目录里写一份 pi 的 models.json。返回 (agent 目录, 是否有密钥)。
-
-    **密钥不写进文件**：apiKey 写成 ``$MINIMAX_API_KEY``，由 pi 在运行时从环境变量插值。
-    写死密钥的话，密钥会跟着任务目录进备份、进同步、可能进 zip。
-    """
-    key_env = _llm_setting(LLM_KEY_ENV_ENV)
-    have_key = bool(os.environ.get(key_env, "").strip())
-
-    agent_dir = Path(work_dir) / PI_AGENT_DIRNAME
-    agent_dir.mkdir(parents=True, exist_ok=True)
-
-    base_url = _llm_setting(LLM_BASE_URL_ENV).rstrip("/")
-    model_id = _llm_setting(LLM_MODEL_ENV)
-
-    def _int(env_name: str) -> int:
-        raw = _llm_setting(env_name)
-        try:
-            return int(raw)
-        except ValueError:
-            log.warning("%s 不是整数（%r），退回默认值", env_name, raw)
-            return int(_LLM_DEFAULTS[env_name])
-
-    config = {
-        "providers": {
-            LLM_PROVIDER_ID: {
-                "name": "ProtForge 计算平台（OpenAI 兼容）",
-                "baseUrl": base_url,
-                "api": "openai-completions",
-                "apiKey": f"${key_env}",
-                # **models 是数组，不是按 id 建的字典**，而且每项必须有 id。
-                # 写成字典不会报任何错，整个 provider 会被静默丢掉——表现是
-                # ModelRuntime.getModels(provider) 返回空，agent 就一直不吭声。
-                "models": [{
-                    "id": model_id,
-                    "name": model_id,
-                    "api": "openai-completions",
-                    "reasoning": True,
-                    "input": ["text"],
-                    "contextWindow": _int(LLM_CTX_ENV),
-                    "maxTokens": _int(LLM_MAXTOK_ENV),
-                    "cost": {"input": 0, "output": 0,
-                             "cacheRead": 0, "cacheWrite": 0},
-                }],
-            },
-        },
-    }
-    (agent_dir / "models.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return agent_dir, have_key
+# 端点、密钥来源、物化 models.json 这几件事住在 llm.py（反思也用同一套端点，
+# 两边各抄一份的话，改了一边另一边不跟着变）。这里只留一个别名，
+# 免得外部按 dispatcher.LLM_PROVIDER_ID 取这个名字的地方断掉。
+LLM_PROVIDER_ID = llm.LLM_PROVIDER_ID
 
 
 # --- GPU 探测 ------------------------------------------------------------------------
@@ -832,6 +769,20 @@ class Dispatcher:
         #: 已经就「卡住」告过警的行。同一行不重复告警，否则又是一条事件风暴。
         self._archive_warned: set[int] = set()
 
+        # --- 反思工作线程 -----------------------------------------------------------
+        # 反思要调一次模型（几十秒到几分钟），放在 tick 主路径里同步做等于整个
+        # 调度器每轮都停在那里。所以和归档一样：**只查库、只入队**，模型调用与
+        # 写文件都发生在后台线程上。
+        self._refl_lock = threading.Lock()
+        self._refl_q: queue.Queue = queue.Queue()
+        #: 已在队列里或正在复盘的任务。防止两次 tick 把同一条投两遍——真投两遍
+        #: 也不会产生第二条记录（reflections.task_id 上有 UNIQUE），但那意味着
+        #: 白烧一次模型调用，而 token 是要花钱的。
+        self._refl_inflight: set[int] = set()
+        self._refl_thread: threading.Thread | None = None
+        self._refl_threads: list[threading.Thread] = []
+        self._refl_stopped = False
+
     # --- 并发上限 ---------------------------------------------------------------
 
     def _resolve_limit(self, manual) -> int:
@@ -1138,6 +1089,8 @@ class Dispatcher:
         # 归档线程是 daemon 的：不等它也不会挂住进程。但排队里的行**必须留给下一轮**
         # ——它们还没置 workflow_archived，闸门② 会让这个工作流停住等它们，正是要的行为。
         self._archive_stop()
+        # 反思同理：没做完的那条没建记录，下次启动巡检会重新扫到。
+        self._reflection_stop()
 
     def _loop(self) -> None:
         while not self._stopping:
@@ -1167,7 +1120,90 @@ class Dispatcher:
             self._workflow_archive_pass()
         except Exception:                          # noqa: BLE001
             log.exception("工作流归档巡检出错")
+        # 反思排在最后：它最慢也最不紧急（反馈闭环晚一轮无所谓，
+        # 而它排在前面会让一次模型调用慢的巡检拖住整轮调度）。
+        try:
+            self._reflection_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("反思巡检出错")
         return admitted
+
+    # --- 反思 ---------------------------------------------------------------------
+    #
+    # 巡检只做两件事：**查库**、**入队**。一次模型调用都不在这里发生。
+    #
+    # 为什么不挂在 _settle 上：终态不止一处会写。agent 正常收口走 packaging
+    # 再由打包改成 done，用户中止、打包超时、janitor 清理写的都是 failed。
+    # 只盯一个入口的后果很安静——另外几条路径收工的任务永远没有反思，
+    # 而界面上看不出任何异常。
+
+    def _reflection_pass(self) -> int:
+        """扫一轮：找进终态但还没反思的任务，入队。返回入队条数。"""
+        if self._stopping or self._refl_stopped:
+            return 0
+        try:
+            rows = store.terminal_tasks_without_reflection(limit=REFLECTION_SWEEP_LIMIT)
+        except Exception:                          # noqa: BLE001
+            log.exception("读取待反思任务失败")
+            return 0
+        queued = 0
+        for row in rows:
+            tid = int(row["id"])
+            with self._refl_lock:
+                if tid in self._refl_inflight:
+                    continue
+                self._refl_inflight.add(tid)
+            self._refl_q.put(tid)
+            queued += 1
+        if queued:
+            self._reflection_ensure_thread()
+        return queued
+
+    def _reflection_ensure_thread(self) -> None:
+        with self._refl_lock:
+            if self._refl_stopped:
+                return
+            alive = [t for t in self._refl_threads if t.is_alive()]
+            for i in range(len(alive), REFLECTION_WORKERS):
+                t = threading.Thread(target=self._reflection_loop,
+                                     name=f"reflect-{i}", daemon=True)
+                t.start()
+                alive.append(t)
+            self._refl_threads = alive
+            self._refl_thread = alive[0] if alive else None
+
+    def _reflection_loop(self) -> None:
+        """后台反思线程。**任何异常都不许逃出去**——同 _archive_loop 的理由。"""
+        while True:
+            try:
+                task_id = self._refl_q.get(timeout=0.5)
+            except queue.Empty:
+                if self._refl_stopped:
+                    return
+                continue
+            if task_id is None:                    # stop() 投的结束哨兵
+                return
+            try:
+                rec = reflection.generate(task_id)
+                log.info("任务 %s 的反思已生成（建议分类：%s）",
+                         task_id, rec.get("suggested") or "模型没给，等管理员定")
+            except Exception:                      # noqa: BLE001
+                # generate() 自己已经把失败写进记录了。这里再吞一遍，
+                # 是因为一条坏记录不该带走整条反思线程——下一条还得接着做。
+                log.exception("生成任务 %s 的反思失败", task_id)
+            finally:
+                with self._refl_lock:
+                    self._refl_inflight.discard(task_id)
+
+    def _reflection_stop(self) -> None:
+        """停机：投哨兵。**不等模型调用返回**——那是几十秒到几分钟的事，
+        而派生的进程是 daemon 的，不等也不会挂住进程。没做完的那条任务下次
+        启动时巡检会重新扫到（reflections 上还没有它的行）。"""
+        with self._refl_lock:
+            self._refl_stopped = True
+            n = len(self._refl_threads)
+        for _ in range(max(n, 1)):
+            self._refl_q.put(None)
 
     def _reap(self) -> None:
         for ap in list(self.running.values()):
@@ -1777,16 +1813,16 @@ class Dispatcher:
         env.setdefault("PROTFORGE_DATA", DEFAULT_PROTFORGE_DATA)
 
         # 模型配置跟着任务走：写在工作目录里，跟着任务建、跟着任务删。
-        agent_dir, have_key = materialize_model_config(work_dir)
+        agent_dir, have_key = llm.materialize_model_config(work_dir)
         env["PROTFORGE_AGENT_DIR"] = str(agent_dir)
         env["PROTFORGE_LLM_PROVIDER"] = LLM_PROVIDER_ID
-        env["PROTFORGE_LLM_MODEL"] = _llm_setting(LLM_MODEL_ENV)
+        env["PROTFORGE_LLM_MODEL"] = llm.model_id()
         if not have_key:
             # 不在这里就失败：agent 没有模型可用，但本地技能链也许还能干点别的，
             # 让它跑起来再由人看日志，比在调度器层硬拒更灵活。说清楚缺哪个变量。
-            env["PROTFORGE_LLM_KEY_ENV"] = _llm_setting(LLM_KEY_ENV_ENV)
+            env["PROTFORGE_LLM_KEY_ENV"] = llm.key_env()
             log.warning("任务 %s：环境变量 %s 没值，agent 大概率发不出模型请求",
-                        task_id, _llm_setting(LLM_KEY_ENV_ENV))
+                        task_id, llm.key_env())
 
         argv = [self.node_exe, str(self.agent_script)]
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1854,6 +1890,17 @@ class Dispatcher:
         if not text:
             text = "请阅读工作目录下的 brief.md，按里面的要求完成计算。"
 
+        # 经验块放在**需求前面**：它是背景条件，不是补充说明。放在后面的话，
+        # 长需求会把前面的内容挤出注意力——而这批经验正是为了在长需求里被想起。
+        # 一条都没有时**不加这段**：给模型一个「## 已沉淀的经验（暂无）」的空壳，
+        # 只会让它以为这里本来就没什么经验可参考，而实际上还没沉淀过。
+        lessons = reflection.lessons_block()
+        if lessons:
+            text = ("## 已沉淀的经验\n"
+                    "下面这些是过去任务复盘后由管理员归档下来的做法。**与本次需求冲突时"
+                    "以需求为准**，不冲突时优先照着做。\n\n"
+                    f"{lessons}\n\n---\n\n## 本次需求\n{text}")
+
         # 先换模型再派活。**必须换**：不换的话 pi 会用内置 catalog 里的默认模型
         # （本机是 minimax/MiniMax-M2.7，指向 api.minimaxi.com），拿本平台的
         # api.minimax.cn 密钥去打它必然 401，而界面上只看得见 step 停在
@@ -1863,7 +1910,7 @@ class Dispatcher:
             "id": uuid.uuid4().hex,
             "type": "set_model",
             "provider": LLM_PROVIDER_ID,
-            "modelId": _llm_setting(LLM_MODEL_ENV),
+            "modelId": llm.model_id(),
         }, {
             "id": uuid.uuid4().hex,
             "type": "prompt",

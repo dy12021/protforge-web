@@ -34,11 +34,16 @@ JS = UI / "app.js"
 BANNED_WORDS = ("AI", "助手", "大模型")
 
 # 值班台必须存在的能力。少一条就是少一块值班台该有的功能：
-# ① 运行中任务实时卡片 ② 干预输入框 ③ 审计日志表格 ④ 时间窗产物确认区 ⑤ 用户管理
-REQUIRED_PANES = ("live", "pending", "tasks", "audit", "users")
+# ① 运行中任务实时卡片 ② 干预输入框 ③ 审计日志表格 ④ 时间窗产物确认区
+# ⑤ 用户管理 ⑥ 反思（任务收工后的复盘待办）
+REQUIRED_PANES = ("live", "pending", "tasks", "audit", "reflections", "users")
 
 # 危险动作 → 必须两步确认（与用户端的删除同理，SPEC 20.5 / 20.9）
-DANGEROUS_ACTIONS = ("doAbort", "doStatus", "doRetry", "doDisable", "doVerify")
+# landBtn / applyBtn 也在内：写进全局经验文件 = 之后**每一个**任务开工都读它，
+# applyBtn = 直接改技能文件并提交。两者都比「停错一个账号」更难回退，
+# 而 applyBtn 那一步连按错了都看不出来（模型原话没进过你的眼）。
+DANGEROUS_ACTIONS = ("doAbort", "doStatus", "doRetry", "doDisable", "doVerify",
+                     "landBtn", "applyBtn")
 
 
 def _read(p: Path) -> str:
@@ -121,6 +126,8 @@ def test_hidden_attribute_is_forced_to_display_none():
         ".board-msg",     # 顶部横幅
         ".row-msg",       # 用户区提示条
         ".login-error",   # 登录失败提示
+        ".refl-panel",    # 反思正文（默认收起）
+        ".refl-raw",      # 模型原话（默认收起，解析失败时的兜底）
     ]
     # 收集所有以 display:none 收尾的规则体，按选择器逐个配对。
     # 先剥注释：否则 `/* … */` 会被当成选择器文本的一部分粘进 `sel_text`，
@@ -706,3 +713,206 @@ def test_touch_pointer_gets_44px_targets():
     assert re.search(r"min-height:\s*44px", coarse), "触控档没有 44px 最小可点区域"
     for sel in (".btn", ".tab", ".primary", ".secondary"):
         assert sel in coarse, f"{sel} 在触控设备上没有放大——手指点不准"
+
+
+# --- 6 · 反思（任务收工后的复盘待办）---------------------------------------
+#
+# 这一块的核心约束只有一条：**模型的分类只是建议，落地一定经过人的手。**
+# 下面的断言几乎全在钉"哪一步必须有人点一下"——一旦某一步省掉，
+# 症状不是报错，而是**错的经验进了全局经验文件，之后每个任务都读它**。
+
+
+def _branch(fn_src: str, marker: str) -> str:
+    """取函数体内某个 if 分支的源码（按**同缩进**收尾，与 `_fn` 同一套做法）。
+
+    不能用 `count("{")` 配平：JS 的字符串与模板字面量里都可能出现大括号，
+    数出来的配平是巧合而不是结构。按缩进找收尾才是结构。
+    """
+    assert marker in fn_src, f"这段代码里没有分支 {marker}"
+    i = fn_src.index(marker)
+    line_start = fn_src.rfind("\n", 0, i) + 1
+    indent = re.match(r"[ \t]*", fn_src[line_start:]).group(0)
+    tail = fn_src[line_start:]
+    end = re.search(r"\n" + re.escape(indent) + r"\}", tail)
+    assert end, f"分支 {marker} 没找到收尾大括号（分支可能没闭合）"
+    return tail[:end.end()]
+
+
+def test_reflections_pane_has_a_tab_a_badge_and_its_own_list():
+    """反思要是一块独立区域：有页签进得去、有角标、有一个自己的列表。"""
+    html, js = _read(HTML), _read(JS)
+    assert 'data-tab="reflections"' in html, "反思没有页签入口"
+    m = re.search(r'data-tab="reflections"[^>]*>(.{0,40})', html, re.S)
+    assert m and "反思" in m.group(1), "页签上没有写清这是反思"
+    assert 'id="badge-reflections"' in html, "反思页签没有角标（待办数量看不见）"
+    assert 'id="pane-reflections"' in html and 'data-pane="reflections"' in html, \
+        "反思没有独立面板"
+    # 角标挂在**页签按钮**里面，不在面板里：面板没打开的时候它也得能报数。
+    assert html.index('id="badge-reflections"') < html.index('data-pane="reflections"'), \
+        "角标长在面板内部，面板没打开时就看不到待办有多少条"
+    assert 'id="refl-list"' in html and 'id="refl-empty"' in html, \
+        "反思没有列表容器或空态"
+    assert 'getElementById("refl-list")' in js and 'getElementById("badge-reflections")' in js
+
+
+def test_reflections_load_even_while_you_are_on_another_tab():
+    """角标必须**不看当前页签**地刷新。
+
+    只在切进反思页签时才拉，那个角标会一直停在"你上次打开它那一刻"的数字上——
+    等于没有角标：管理员不会为了看数字专门切过去，等切过去时早就该判的都堆在那儿了。
+    """
+    js = _read(JS)
+    m = re.search(r"setInterval\(\(\)\s*=>\s*\{(.*?)\n\},\s*10000\);", js, re.S)
+    assert m, "找不到 10 秒兜底轮询的回调体"
+    body = m.group(1)
+    assert "loadReflections()" in body, \
+        "10 秒兜底轮询没有拉反思——不在反思页签时角标不会更新"
+    # 钉的是"没有页签闸门"这件事本身：把这一行改成
+    # `if (state.tab === "reflections") loadReflections()...` 也能拉到数据，
+    # 但角标在别的页签上从此不更新——所以这里直接断言闸门不存在。
+    assert 'state.tab === "reflections"' not in body, \
+        "反思的兜底拉取被页签闸住了：不在该页签时角标永远停在旧数"
+    # 切进页签时也要拉一次（而不是只在启动时拉）。
+    assert "loadReflections()" in _fn("showTab"), \
+        "切进反思页签没有触发拉取——刷新之后第一次打开是空的"
+
+
+def test_reflections_badge_counts_the_unfiltered_backlog_not_the_current_filter():
+    """角标数的是**全部待办**，不是当前筛选后列表的长度。
+
+    管理员经常把筛选停在「待分类」上；按列表长度算，判完一条之后切到别的
+    筛选，角标就变成 0——而实际上还有一堆待分类的。那等于角标在说谎。
+    """
+    body = _fn("loadReflections")
+    assert "state.reflCounts" in body, "角标没有用服务端给的各状态计数"
+    m = re.search(r"const todo\s*=\s*(.*?);", body, re.S)
+    assert m, "找不到待办条数的计算"
+    assert "reflCounts" in m.group(1), \
+        "待办条数是按当前列表长度算的：筛选一换角标就说谎了"
+    assert "reflections.length" not in m.group(1) and "rows.length" not in m.group(1), \
+        "待办条数用了当前列表的长度——筛选一换角标就说谎了"
+    assert re.search(r"badge\.hidden\s*=\s*todo\s*===\s*0", body), \
+        "待办清零之后角标没有藏起来——会一直挂着一个 0"
+
+
+def test_reflections_retry_timer_is_cancelled_before_it_is_armed_again():
+    """重新拉取前必须先 clearTimeout。
+
+    方案生成期间一次调用挂一条 4 秒定时器，10 秒兜底轮询又调一次 —— 两条路都会挂。
+    不撤销就是定时器越挂越多、越刷越快，而且页面早就关了还在跑。
+    """
+    body = _fn("loadReflections")
+    arm = body.find("state.reflTimer = setTimeout")
+    assert arm != -1, "方案生成中的那条没有自轮询：管理员盯着等，界面却一直不动"
+    clr = body.find("clearTimeout(state.reflTimer)")
+    assert clr != -1, "拉取前没有撤销上一次挂的定时器"
+    assert clr < arm, "撤销写在了挂定时器之后——顺序反了等于没撤"
+
+
+def test_reflections_body_starts_collapsed():
+    """正文默认收起：管理员进来第一眼要的是「有几条等我判」，不是一堵墙。"""
+    assert "panel.hidden = true" in _fn("reflCard"), \
+        "反思正文默认展开：长正文把整个列表埋掉了"
+
+
+def test_classify_and_land_are_two_separate_steps():
+    """分类与落地必须分成两步，中间留一次人的停顿。
+
+    一步到位（draft 就直接能「写进经验」）意味着管理员在**还没读过正文**的时候
+    就能把模型的话写进全局经验文件——而那之后每个任务开工都会读到它，
+    没人说得清那条奇怪的要求是从哪来的。
+    """
+    card = _fn("reflCard")
+    draft = _branch(card, 'if (r.status === "draft")')
+    assert "classifyBtn" in draft, "待分类的那条没有分类按钮"
+    assert "rejectBtn" in draft, "待分类的那条不能否决"
+    assert "landBtn" not in draft and "/land" not in draft, \
+        "待分类就能直接写进经验——分类与落地被并成一步了"
+    reviewed = _branch(card, 'if (r.status === "reviewed" && r.kind === "lesson")')
+    assert "landBtn" in reviewed, "判为经验之后没有落地入口"
+
+
+def test_tool_gap_cannot_be_landed_as_a_lesson():
+    """「工具不够用」不能一步写成经验。
+
+    这两件事的做法完全相反：经验是写进记忆文件、工具意见是要改技能文件。
+    混了以后管理员以为在改技能，实际把一条「这个工具太难用」写成了
+    「以后凡是这样就绕开它」——把该修的东西写成了绕过的东西。
+    """
+    card = _fn("reflCard")
+    gap = _branch(card, 'if (r.status === "reviewed" && r.kind === "tool_gap")')
+    assert "landBtn" not in gap and "/land" not in gap, \
+        "工具意见能被直接写成经验——该修的东西被写成了绕过的东西"
+    assert "proposeRow" in gap, "工具意见没有走「生成修改方案」这条路"
+
+
+def test_apply_proposal_shows_the_real_diff_before_touching_anything():
+    """应用方案必须**先把 diff 取回来给人看**，看不全就不许点。
+
+    断言的是顺序与守卫两件事：`GET /reflections/{id}` 要在 confirmBody 之前，
+    读不到 diff 要当场退出而不是"照样确认"，而 diff 本身要进确认表正文。
+    只查"函数体里出现过 detail.diff"的话，把渲染挪到确认之后也一样绿。
+    """
+    body = _fn("applyBtn")
+    get_at = body.find('api("GET", "/reflections/"')
+    confirm_at = body.find("confirmBody(")
+    assert get_at != -1, "应用前没有把方案取回来"
+    assert confirm_at != -1, "应用方案没有走两步确认"
+    assert get_at < confirm_at, "先把确认表弹出来再取 diff：弹窗里是空的"
+    guard = re.search(r"if\s*\(\s*!\s*detail\.diff\s*\)\s*\{(.*?)\n\s*\}", body, re.S)
+    assert guard, "读不到 diff 却没有当场退出——会拿着空方案确认"
+    assert "return" in guard.group(1), "读不到 diff 的分支没有 return，后面照样往下走"
+    assert guard.start() < confirm_at, "守卫写在确认之后，等于没有守卫"
+    assert re.search(r'el\("pre",\s*"refl-diff",\s*detail\.diff\)', body), \
+        "diff 没有进确认表正文——确认的是一句说明，不是改动本身"
+    assert "/apply" in body, "确认之后没有真的调应用端点"
+
+
+def test_reflections_render_the_models_guess_as_a_guess():
+    """界面上必须把「模型建议」和「谁定成了什么」分开说。
+
+    建议与结论长得一样（同一个词、同一个位置、同一种颜色）的时候，
+    人就会顺手点"同意"——这正是这一块要防的失败模式。
+    """
+    card = _fn("reflCard")
+    assert "模型建议：" in card, "建议行没有写明这是模型给的"
+    assert "REFL_KIND_LABEL[r.suggested]" in card, "建议没有走自己的标签表"
+    assert "decided_by" in card and "refl-by" in card, \
+        "谁定成了什么没有单独说：建议与结论读起来是同一件事"
+    assert "REFL_KIND_LABEL[r.kind]" in card
+
+
+def test_reflections_card_publishes_its_status_for_the_css():
+    """卡片必须把状态写进 data-status，竖条的颜色靠它。
+
+    JS 不写、CSS 只按 data-* 上色的话，这个功能表现为"所有卡片一个颜色"，
+    而且没有任何报错——待办与已办在页面上长得一模一样。
+    """
+    assert re.search(r"box\.dataset\.status\s*=\s*r\.status", _fn("reflCard")), \
+        "反思卡片没有把状态写进 data-status，左侧竖条会永远是同一个颜色"
+    css = _read(CSS)
+    for st in ("reviewed", "applied", "rejected", "failed"):
+        assert re.search(r"\.refl\[data-status=" + st + r"\]", css), \
+            f"data-status={st} 没有对应的样式，状态看不出来"
+
+
+def test_reflections_panel_keeps_the_skill_path_verbatim():
+    """要改的技能路径照原样显示、不截断。
+
+    路径写错一位，改到的是另一个文件——而这类"改错了地方"的错误不会报错，
+    技能照常加载，只是你修的那条问题还在。
+    """
+    assert re.search(r"\.refl-target\s*\{[^}]*\}", _read(CSS)), \
+        "技能路径输入框没有样式"
+    rule = re.search(r"\.refl-target\s*\{([^}]*)\}", _read(CSS)).group(1)
+    assert "text-overflow" not in rule and "ellipsis" not in rule, \
+        "技能路径被截断了：路径写错一位，改到的是另一个文件"
+
+
+def test_reflections_raw_text_is_kept_for_unparsable_output():
+    """模型原话要留着：解析不出结构时，人至少能看到它到底写了什么。"""
+    body = _fn("renderReflPanel")
+    assert re.search(r'el\("pre",\s*"refl-raw",\s*detail\.body', body), \
+        "没有留模型原话：解析失败就只剩一句「解析不出结构」"
+    assert re.search(r"raw\.hidden\s*=\s*true", body), "模型原话默认展开"
+    assert "parsed" in body and "refl-bad" in body, "解析失败没有明说"
