@@ -223,6 +223,86 @@ def test_parser_tolerates_numbering_and_code_fences_in_the_headings():
     assert parsed["suggested"] == "lesson"
 
 
+def test_generation_refuses_to_write_when_the_data_root_moves_mid_flight(
+        users, fake_llm, skills, tmp_path, monkeypatch):
+    """模型调用期间换了数据根 → 整条作废，不落盘。
+
+    这条是被真机抓出来的：跑一次**全量**测试之后，真实数据目录里的
+    `task-1.md` 被重写了一遍，而逐个测试文件跑又一条都不写。
+
+    机制是后台线程活过了用例：反思跑在 dispatch 的后台 worker 里，一次模型调用
+    几十秒；等它真正写盘时，pytest 已经把 `PROTFORGE_WEB_DATA_ROOT` 撤销了。
+    于是「查记录」看到的是临时库（这条没反思过），「写正文」写的是真实数据盘。
+
+    所以入口要钉一次数据根，写之前再核一次。核的动作放在**模型调用之后、
+    落盘之前**才有意义——早核的话那时候根还没变。
+    """
+    owner, _ = users
+    tid = _finished_task(owner["id"])
+    root = db.data_root()                       # 用例自己的临时根
+    moved = tmp_path / "别的地方"
+
+    def _swap_then_call(*a, **k):
+        fake_llm["calls"] += 1
+        monkeypatch.setenv("PROTFORGE_WEB_DATA_ROOT", str(moved))
+        return GOOD_REPLY
+
+    monkeypatch.setattr(llm, "chat_completion", _swap_then_call)
+
+    with pytest.raises(reflection.ReflectionError, match="数据根"):
+        reflection.generate(tid)
+
+    assert not (root / "reflections" / f"task-{tid}.md").exists(), \
+        "数据根换掉之后仍然落了盘：写到了别的地方"
+    assert not (moved / "reflections" / f"task-{tid}.md").exists(), \
+        "换过去的那个根里也不该出现正文：它压根不该被写"
+    # 但记录要留下，而且要标成 failed——否则界面上看着像「正在做」。
+    rec = store.get_reflection_by_task(tid)
+    assert rec is not None and rec["status"] == "failed", \
+        "作废的反思没留记录/没标 failed：界面上会永远显示「正在做」"
+
+
+def test_generation_is_idempotent_for_a_task_that_already_has_one(users, fake_llm, skills):
+    """已有记录就直接返回，**正文一个字节都不许改**。
+
+    幂等不只省一次模型调用：反思正文是管理员正在读的东西，
+    重写一遍等于把人家读到一半的内容换掉，而界面上看不出发生过。
+    """
+    owner, _ = users
+    tid = _finished_task(owner["id"])
+    first = reflection.generate(tid)
+    body = (db.data_root() / "reflections" / f"task-{tid}.md").read_bytes()
+
+    second = reflection.generate(tid)
+    assert second["id"] == first["id"], "第二次不该新建一条记录"
+    assert (db.data_root() / "reflections" / f"task-{tid}.md").read_bytes() == body, \
+        "已经有记录了还被重写了一遍"
+
+
+def test_parser_ignores_the_quoted_raw_output_at_the_end_of_the_file():
+    """落盘文件末尾那段「模型原始输出」是**引用**，不能再解析一遍。
+
+    这条是被真机抓出来的：界面上每一条经验、每一条工具意见都出现了两遍，
+    而落盘的 `task-N.md` 完全正确——重复是 GET 详情时把**渲染后的文件**
+    再解析一次造成的。那份文件末尾带着一段代码围栏包着的模型原话，
+    围栏里的小节标题被当成了真标题，于是内容被读了两遍。
+
+    光看落盘文件永远看不出来，所以这里直接拿「渲染后的文件」当输入验。
+    """
+    raw = ("## 这次实际做了什么\n跑了一遍\n\n## 经验\n"
+           "- [技能 protforge-demo] 先定标再批量\n\n## 建议分类\nlesson")
+    rendered = reflection.render_md(
+        {"id": 1, "title": "x", "status": "failed",
+         "done_at": "2026-10-17T11:33:01"}, reflection.parse_reflection(raw), raw)
+    assert "模型原始输出" in rendered, "渲染结果里没有原话附录：这条围栏失去意义"
+
+    parsed = reflection.parse_reflection(rendered)
+    texts = [i["text"] for i in parsed["lessons"]]
+    assert texts == ["先定标再批量"], f"经验被读了两遍：{texts}"
+    assert parsed["did"].count("跑了一遍") == 1, "「这次实际做了什么」被读了两遍"
+    assert parsed["suggested"] == "lesson"
+
+
 def test_parser_treats_wu_as_no_items_rather_than_one_empty_item():
     """「无」是**没有这一节内容**，不是一条内容为空的条目。
 

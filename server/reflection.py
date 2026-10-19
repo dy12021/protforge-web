@@ -189,7 +189,25 @@ def parse_reflection(text: str) -> dict:
     """
     sections: dict[str, list[str]] = {}
     current = None
-    for raw_line in (text or "").splitlines():
+    in_fence = False
+    # **先拆整体围栏，再跳中途围栏。** 两件事方向相反，别混成一条：
+    #
+    #   · 模型爱给整段回复套一个 ``` ——那种要剥开照常解析，
+    #     否则这次复盘白跑（模型的通病，不是内容问题）。
+    #   · 落盘文件末尾那段「模型原始输出」也是围栏，但它是**引用**：
+    #     渲染过的小节已经被读了一遍，再把围栏里的原话读一遍，
+    #     界面上每一条就都出现两次。而文件本身完全正确，
+    #     所以这个缺陷藏在「GET 详情时把渲染结果再解析一次」这一步里，
+    #     光看落盘文件永远看不出来。
+    #
+    # 所以顺序是：整体围栏先拆（strip_fence 只在整段被包住时才真的剥），
+    # 之后行走时才按围栏状态跳过**内层**的围栏。
+    for raw_line in strip_fence(text).splitlines():
+        if raw_line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         m = _HEAD_RE.match(raw_line)
         if m:
             head = m.group(1).strip()
@@ -362,6 +380,20 @@ def generate(task_id: int) -> dict:
         raise ReflectionError(
             f"任务还是「{task.get('status')}」，没到终态就复盘等于复盘半成品")
 
+    # 数据根在这里**钉死**，不是等到写的时候才现读。
+    #
+    # 一次模型调用要几十秒，而这条反思是跑在**后台线程**里的：几十秒里进程里的
+    # 环境变量完全可能被人换掉——pytest 的 monkeypatch 在用例结束时撤销就是
+    # 最典型的一种。那时候 `db_path()` 指向临时库（于是"这条还没反思过"），
+    # 而 `data_root()` 指向真实数据盘，于是正文被写进**线上目录**。
+    # 实测就是这样：跑一次全量测试，`data\reflections\task-1.md`
+    # 被重写了一遍，而逐个文件跑又一条都不写——因为要整个套件一起跑，
+    # 前一个用例起的后台线程才会活到后一个用例里去。
+    #
+    # 所以：入口钉一次，写之前再核一次。变了就当这条失败——
+    # 宁可少一条复盘，也不要写到一半换了地方。
+    root = db.data_root()
+
     p = body_path(task_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     # 先建记录再调模型：模型要跑几十秒，这段时间里这条任务已经被别的巡检
@@ -383,6 +415,17 @@ def generate(task_id: int) -> dict:
             log.warning("任务 %s 的反思正文都写不下去", task_id)
         store.mark_reflection_failed(rec["id"], str(exc))
         raise
+
+    # 见上：飞行途中换了数据根就整条作废，不落盘。
+    if db.data_root() != root:
+        msg = (f"生成期间数据根从 {root} 变成了 {db.data_root()}，"
+               "为免写到别处去，这条反思作废")
+        log.warning("任务 %s 的%s", task_id, msg)
+        try:
+            store.mark_reflection_failed(rec["id"], msg)
+        except Exception:                                  # noqa: BLE001
+            log.exception("把任务 %s 的反思标成 failed 失败", task_id)
+        raise ReflectionError(msg)
 
     try:
         p.write_text(render_md(task, parsed, raw), encoding="utf-8")

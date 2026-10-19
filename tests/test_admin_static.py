@@ -775,6 +775,10 @@ def test_reflections_load_even_while_you_are_on_another_tab():
     # 切进页签时也要拉一次（而不是只在启动时拉）。
     assert "loadReflections()" in _fn("showTab"), \
         "切进反思页签没有触发拉取——刷新之后第一次打开是空的"
+    # 开页时也要拉：只靠 10 秒轮询的话，刷新后那十秒里角标是空的，
+    # 值班的人会以为没有待办。
+    assert "loadReflections()" in _fn("boot"), \
+        "启动时没有拉反思——刷新后角标要空等一个轮询周期才出现"
 
 
 def test_reflections_badge_counts_the_unfiltered_backlog_not_the_current_filter():
@@ -810,9 +814,47 @@ def test_reflections_retry_timer_is_cancelled_before_it_is_armed_again():
 
 
 def test_reflections_body_starts_collapsed():
-    """正文默认收起：管理员进来第一眼要的是「有几条等我判」，不是一堵墙。"""
-    assert "panel.hidden = true" in _fn("reflCard"), \
-        "反思正文默认展开：长正文把整个列表埋掉了"
+    """正文默认收起：管理员进来第一眼要的是「有几条等我判」，不是一堵墙。
+
+    开合状态存在 `state.reflOpenId` 里，所以「默认收起」钉的是**它的初值是空**，
+    而不是钉某一行 `panel.hidden = true` ——后者会在为了让它扛住轮询重画
+    （见下一条）而改成按 state 恢复时被误判成缺陷。
+    """
+    js = _read(JS)
+    m = re.search(r"const state = \{(.*?)\n\};", js, re.S)
+    assert m, "找不到 state 字面量"
+    assert re.search(r"reflOpenId:\s*null", m.group(1)), \
+        "正文开合状态的初值不是空：新打开页面时所有反思都摊开了"
+
+
+def test_reflections_open_body_survives_the_poll_rebuild():
+    """展开的正文不许被 10 秒轮询收回去。
+
+    **这条是被真机抓出来的缺陷。** 角标要不走样，就得无条件轮询；而轮询走的是
+    `host.textContent = ""` 整块重画，于是卡片元素每次都是新的。展开状态要是
+    只存在卡片元素上（或者干脆 `panel.hidden = true` 写死），管理员刚点开的
+    正文十秒后自己收起来——读到一半的内容没了，界面上没有任何东西提示发生过。
+
+    所以开合状态必须在 `state` 里，重画时按 id 恢复。
+    """
+    card = _fn("reflCard")
+    assert "state.reflOpenId" in card, \
+        "正文开合状态没有存进 state：轮询一重画，正在读的反思就自己收起来了"
+    # 开合按钮必须**写**这个状态，否则重画后无从恢复。
+    assert re.search(r"state\.reflOpenId\s*=\s*open\s*\?\s*r\.id\s*:\s*null", card), \
+        "点开/收起没有更新 state.reflOpenId"
+    # 卡片建出来时按它决定开合，而不是写死收起。
+    assert re.search(r"panel\.hidden\s*=\s*state\.reflOpenId\s*!==\s*r\.id", card), \
+        "卡片重建时把正文写死收起了：轮询一轮就丢一次展开状态"
+    assert re.search(r'toggle\.textContent\s*=\s*panel\.hidden', card), \
+        "按钮文案没有跟着开合状态走：重画后写着「收起正文」却是收起的"
+    # **只恢复 hidden 是不够的**：新卡片的 panel 是空 div，恢复成不隐藏就得到
+    # 一个"开着、但什么都没有"的白框——那比收起来更像坏了。所以建卡片时就要
+    # 在「应当是展开的」这一支上把正文内容重画回来。
+    assert re.search(
+        r"if\s*\(\s*!\s*panel\.hidden\s*&&\s*state\.reflDetail\s*&&\s*"
+        r"state\.reflDetail\.id\s*===\s*r\.id\s*\)\s*\{\s*renderReflPanel\(", card), \
+        "重画后没有把正文内容补回来：面板开着但是空的"
 
 
 def test_classify_and_land_are_two_separate_steps():

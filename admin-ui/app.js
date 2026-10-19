@@ -73,6 +73,8 @@ const state = {
   reflections: [],         // 反思列表快照
   reflCounts: {},          // 各状态计数（角标与「待处理 N 条」都从这里来）
   reflDetail: null,        // 最近一次展开的正文详情（分类/落地按钮要读它的解析结果）
+  reflOpenId: null,        // 哪一条的正文是展开的。**存 state 而不是存卡片**：
+                           // 轮询会整块重画列表，存在元素上的开合状态活不过一轮
   reflTimer: null,         // 「方案正在生成」时的自轮询句柄
   tab: "live",
   me: null,
@@ -1321,12 +1323,21 @@ function reflCard(r) {
   const toggle = el("button", "btn", "看正文");
   toggle.type = "button";
   const panel = el("div", "refl-panel");
-  panel.hidden = true;
+  /* 开合状态存在 state 里，**不留在卡片元素上**。
+   *
+   * 这条是被真机抓出来的：10 秒兜底轮询（为了让角标不走样）会把 #refl-list
+   * 整块重画，卡片元素一换，"开着"就跟着没了——管理员刚点开的正文十秒后自己
+   * 收起来，读到一半的内容不见了，而界面上没有任何东西提示发生过这件事。 */
+  panel.hidden = state.reflOpenId !== r.id;
+  toggle.textContent = panel.hidden ? "看正文" : "收起正文";
   toggle.addEventListener("click", async () => {
-    panel.hidden = !panel.hidden;
-    if (panel.hidden) { panel.textContent = ""; toggle.textContent = "看正文"; return; }
-    toggle.textContent = "收起正文";
-    panel.textContent = "正在取…";
+    const open = panel.hidden;                     // 这次是「点开」还是「点收」
+    state.reflOpenId = open ? r.id : null;
+    panel.hidden = !open;
+    toggle.textContent = open ? "收起正文" : "看正文";
+    panel.textContent = "";                        // 收起时清干净，别留上次的内容
+    if (!open) return;
+    if (!state.reflDetail || state.reflDetail.id !== r.id) panel.textContent = "正在取…";
     try {
       await renderReflPanel(panel, r);
     } catch (e) {
@@ -1335,6 +1346,18 @@ function reflCard(r) {
     }
   });
   detail.append(toggle);
+
+  /* 轮询重画之后，如果这条仍是展开的，正文**内容**也要补回来。
+   *
+   * 只把 hidden 恢复成 false 是不够的——实测那正是半修的状态：新卡片里的
+   * panel 是个空 div，于是变成一个"开着、但什么都没有"的白框，比干脆收起来
+   * 更容易让人以为页面坏了。手里有缓存就直接重画，不再打接口。 */
+  if (!panel.hidden && state.reflDetail && state.reflDetail.id === r.id) {
+    renderReflPanel(panel, r).catch(e => {
+      panel.textContent = "";
+      panel.append(el("div", "refl-bad", e.message || "取正文失败"));
+    });
+  }
 
   const acts = el("div", "refl-acts");
   if (r.status === "draft") {
@@ -1602,6 +1625,7 @@ function signedOut(msg) {
   state.reflections = [];
   state.reflCounts = {};
   state.reflDetail = null;
+  state.reflOpenId = null;
   document.getElementById("who").textContent = "";
   showLogin(msg || "请登录");
 }
@@ -1759,6 +1783,10 @@ async function boot() {
       (state.me.username || "") + "（管理员）";
     await load();
     await loadUsers().catch(() => {});   // 用户列表失败不该挡住值班台本身
+    /* 角标要在**开页时就**有，而不是等第一次 10 秒轮询。
+     * 只靠轮询的话：刷新之后那十秒里「反思」页签上一个角标都没有，
+     * 值班的人会以为没有待办——而实际上有十三条。 */
+    await loadReflections().catch(() => {});
     startClock();
   } catch (e) {
     if (e && e.status === 401) {
