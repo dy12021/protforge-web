@@ -1,7 +1,7 @@
 """guards.py 的测试（L2 文件边界）。
 
 只依据 plan 的 Global Constraints 与 Task 4 两段。
-绝不碰真实的 data 与 ../protforge/data——两个根都由环境变量指到 tmp_path。
+绝不碰真实的 <数据盘根> 与 <ProtForge 数据区>——两个根都由环境变量指到 tmp_path。
 sys.path 自带 server 目录，不依赖（也不去创建）别人可能正在写的 tests/conftest.py。
 """
 
@@ -214,15 +214,21 @@ def test_regions_follow_env(monkeypatch, tmp_path):
     assert r["uploads"] == tmp_path / "elsewhere" / "uploads" / "7"
 
 
-def test_default_roots_match_plan(monkeypatch):
-    """plan Global Constraints 里的字面值，一个字都不能改。"""
+def test_default_roots_are_portable(monkeypatch):
+    """**默认路径必须跟着仓库走**，不能写死某台机器的盘符。
+
+    写死的话，公开出去的仓库就带着作者本机的磁盘布局；而换台机器 clone 下来
+    还会把数据写到一个莫名其妙的位置。真实部署用环境变量指过去
+    （本机的写法在仓库里的 .env，那份不入版本库）。
+    """
     monkeypatch.delenv("PROTFORGE_WEB_DATA_ROOT", raising=False)
     monkeypatch.delenv("PROTFORGE_DATA", raising=False)
     r = guards.regions(1)
-    assert r["work"] == Path(r"data\work\1")
-    assert r["uploads"] == Path(r"data\uploads\1")
-    assert r["outputs"] == Path(r"../protforge/data\outputs")
-    assert r["inputs"] == Path(r"../protforge/data\inputs")
+    repo = Path(guards.__file__).resolve().parent.parent
+    assert r["work"] == repo / "data" / "work" / "1"
+    assert r["uploads"] == repo / "data" / "uploads" / "1"
+    assert r["outputs"] == repo.parent / "protforge" / "data" / "outputs"
+    assert r["inputs"] == repo.parent / "protforge" / "data" / "inputs"
 
 
 def test_violation_is_an_exception():

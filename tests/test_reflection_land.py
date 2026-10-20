@@ -23,7 +23,7 @@
 
 **技能目录必须隔离。** ``conftest.py`` 只把数据库指向 tmp_path，没有动
 ``PROTFORGE_WEB_SKILLS_DIR``——用默认值的话，跑一次测试就在真实的
-``../protforge\\protforge-plugin`` 里留下 ``references/lessons.md``。
+``<技能仓>`` 里留下 ``references/lessons.md``。
 """
 from __future__ import annotations
 

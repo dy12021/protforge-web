@@ -19,7 +19,13 @@ import { readFile } from 'node:fs/promises';
 
 import { createGuardedBashOperations } from './guards.mjs';
 
-const WORK_DIR = 'data\\work\\task-1';
+// 守卫的「ProtForge 自己的地盘」允许根是从 PROTFORGE_DATA 推出来的
+// （服务端注给 agent 的那个，指向 <ProtForge 根>\data）。
+// 这里显式给一份：用例里的路径都落在它下面。
+process.env.PROTFORGE_DATA = 'E:\\protforge\\data';
+
+
+const WORK_DIR = 'E:\\testbed\\data\\work\\task-1';
 
 /** 收集审计行的假回传器。 */
 function recorder() {

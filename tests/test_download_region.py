@@ -169,7 +169,7 @@ def test_package_path_in_any_other_region_is_rejected(client, zone, tmp_path,
     headers = login(client)
     task = done_task(client, headers)
 
-    # outputs/inputs 在 ../protforge/data 下（生产真实路径），测试绝不能往那儿写东西，
+    # outputs/inputs 在 <ProtForge 数据区> 下（生产真实路径），测试绝不能往那儿写东西，
     # 所以把 PROTORGE_DATA 指到 tmp_path。
     pf = tmp_path / "oih"
     pf.mkdir(parents=True, exist_ok=True)

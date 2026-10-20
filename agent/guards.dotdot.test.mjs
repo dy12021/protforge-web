@@ -4,8 +4,8 @@
  * 为什么单独一个文件
  * ------------------
  * 守卫的路径规范化原先只做分隔符替换与盘符映射，**不消解 `..`**。于是
- * `../protforge\..\..\Users\<user>\.ssh\id_rsa` 规范化后是
- * `/mnt/e/oih/../../users/...`，`startsWith('/mnt/e/oih/')` 为真 -> 放行。
+ * `<ProtForge 根>\..\..\Users\<user>\.ssh\id_rsa` 规范化后是
+ * `/mnt/e/protforge/../../users/...`，`startsWith('/mnt/e/protforge/')` 为真 -> 放行。
  *
  * Python 侧的 `guards.py` 用 `Path.resolve()` 做了同一件事，两边行为不一致——
  * 同一个路径在一个进程里被拦、在另一个里放行，比单边有洞更难查。
@@ -30,7 +30,13 @@ import assert from 'node:assert/strict';
 
 import { checkCommand, canonPath, createGuardedReadOperations } from './guards.mjs';
 
-const WORK_DIR = 'data\\work\\task-1';
+// 守卫的「ProtForge 自己的地盘」允许根是从 PROTFORGE_DATA 推出来的
+// （服务端注给 agent 的那个，指向 <ProtForge 根>\data）。
+// 这里显式给一份：用例里的路径都落在它下面。
+process.env.PROTFORGE_DATA = 'E:\\protforge\\data';
+
+
+const WORK_DIR = 'E:\\testbed\\data\\work\\task-1';
 const OPTS = { workDir: WORK_DIR };
 
 const deny = (cmd, why) => {
@@ -46,14 +52,14 @@ const allow = (cmd) => {
 };
 
 /** 起点落在允许根里，`..` 爬出去之后落在允许集合之外——这才是真的绕过形态。 */
-const FROM_ALLOWED_ROOT = '../protforge\\..\\..\\Users\\someone\\.ssh\\id_rsa';
+const FROM_ALLOWED_ROOT = 'E:\\protforge\\..\\..\\Users\\someone\\.ssh\\id_rsa';
 /** 起点是工作目录本身，三级上跳出数据根。 */
-const FROM_WORKDIR = 'data\\work\\task-1\\..\\..\\..\\web.db';
+const FROM_WORKDIR = 'E:\\testbed\\data\\work\\task-1\\..\\..\\..\\web.db';
 
 // ------------------------------------------------- 1. 删除/移动类命令的操作数
 
 test('rm 的操作数用 .. 从只读区爬出去被拒', () => {
-  deny(`rm ${FROM_ALLOWED_ROOT}`, '借允许根 ../protforge 起跳');
+  deny(`rm ${FROM_ALLOWED_ROOT}`, '借允许根 E:\\protforge 起跳');
 });
 
 test('rm 的操作数用 .. 从工作目录爬出去被拒', () => {
@@ -62,22 +68,22 @@ test('rm 的操作数用 .. 从工作目录爬出去被拒', () => {
 
 test('cp 的目标用 .. 上跳同样被拒（源在允许根内也一样）', () => {
   // cp/mv 只判目标不判源，所以逃逸路径必须放在最后——这正是容易写错的位置。
-  deny('cp E:/oih/data/inputs/1ubq.pdb data/work/task-1/../../../Windows/System32/x',
+  deny('cp E:/protforge/data/inputs/1ubq.pdb E:/testbed/data/work/task-1/../../../Windows/System32/x',
     '目标是上跳出去的工作区外路径');
 });
 
 test('正斜杠写法与反斜杠写法一致被拒', () => {
-  deny('rm E:/oih/../../Users/someone/.ssh/id_rsa', 'WSL 风格的正斜杠路径');
+  deny('rm E:/protforge/../../Users/someone/.ssh/id_rsa', 'WSL 风格的正斜杠路径');
 });
 
 test('/e/... 的 git 风格写法同样被消解', () => {
-  deny('rm /e/oih/../../Users/someone/.ssh/id_rsa', '映射前的 /e/ 写法');
+  deny('rm /e/protforge/../../Users/someone/.ssh/id_rsa', '映射前的 /e/ 写法');
 });
 
 // ------------------------------------------------------- 2. 重定向的目标位置
 
 test('重定向目标用 .. 上跳被拒', () => {
-  deny('cat brief.md > E:/oih/../../Windows/Temp/pwned', '写在允许根之外');
+  deny('cat brief.md > E:/protforge/../../Windows/Temp/pwned', '写在允许根之外');
 });
 
 // --------------------------------------------------- 3. 被执行脚本的文件路径
@@ -88,9 +94,9 @@ test('被执行的脚本路径用 .. 上跳被拒', () => {
 
 // --------------------------------------------------------- 4. docker 挂载宿主
 
-test('docker -v 挂载用 .. 上跳出 ../protforge 被拒', () => {
-  deny('docker run --rm -v E:/oih/../../etc:/x oih/img:esmfold2',
-    'dockerRoots 只允许 ../protforge，上跳后落在盘外');
+test('docker -v 挂载用 .. 上跳出 E:\\protforge 被拒', () => {
+  deny('docker run --rm -v E:/protforge/../../etc:/x oih/img:esmfold2',
+    'dockerRoots 只允许 E:\\protforge，上跳后落在盘外');
 });
 
 // ------------------------------------------- 5. 文件工具 confine（read/write）
@@ -126,45 +132,45 @@ test('read 工具在工作目录内的路径放行（confine 不能误杀）', a
 
 test('消解后仍落在工作目录内的路径放行', () => {
   // 消解 `..` 不能把合法路径一起毙掉：task-1/sub/../brief.md 解析后就在工作目录里。
-  allow('cp E:/oih/data/inputs/1ubq.pdb data/work/task-1/sub/../brief.md');
+  allow('cp E:/protforge/data/inputs/1ubq.pdb E:/testbed/data/work/task-1/sub/../brief.md');
 });
 
 test('消解后仍落在只读区内的路径放行', () => {
-  allow('rm E:/oih/data/inputs/../inputs/1ubq.pdb');
+  allow('rm E:/protforge/data/inputs/../inputs/1ubq.pdb');
 });
 
 test('消解后仍落在 dockerRoots 内的挂载放行', () => {
-  allow('docker run --rm -v E:/oih/data/../data/inputs:/in oih/img:esmfold2');
+  allow('docker run --rm -v E:/protforge/data/../data/inputs:/in oih/img:esmfold2');
 });
 
 // ------------------------------------------------------ 规范化结果本身（根因）
 
 test('canonPath 真的把 .. 消解掉了', () => {
-  assert.equal(canonPath('../protforge\\..\\..\\Users'), '/mnt/users');
-  assert.equal(canonPath('E:/oih/../../Users'), '/mnt/users');
-  assert.equal(canonPath('/e/oih/../../Users'), '/mnt/users');
-  assert.equal(canonPath('data\\work\\task-1\\..\\..\\..\\web.db'),
-    '/mnt/e/protforge-web/web.db');
+  assert.equal(canonPath('E:\\protforge\\..\\..\\Users'), '/mnt/users');
+  assert.equal(canonPath('E:/protforge/../../Users'), '/mnt/users');
+  assert.equal(canonPath('/e/protforge/../../Users'), '/mnt/users');
+  assert.equal(canonPath('E:\\testbed\\data\\work\\task-1\\..\\..\\..\\web.db'),
+    '/mnt/e/testbed/web.db');
 });
 
 test('canonPath 消解后不得再含任何 .. 段', () => {
-  // 回归证据：不做消解时 `/mnt/e/oih/../../users` 仍然 startsWith('/mnt/e/oih/')，
+  // 回归证据：不做消解时 `/mnt/e/protforge/../../users` 仍然 startsWith('/mnt/e/protforge/')，
   // 这正是当初绕过成立的原因。任何残留的 `..` 段都意味着消解又退化了。
   for (const p of [
-    '../protforge\\..\\..\\Users',
-    'E:/oih/../../Users',
-    '/e/oih/../../Users',
-    '../protforge/data\\..\\..\\..',
-    '../protforge\\.\\data\\..\\inputs',
+    'E:\\protforge\\..\\..\\Users',
+    'E:/protforge/../../Users',
+    '/e/protforge/../../Users',
+    'E:\\protforge\\data\\..\\..\\..',
+    'E:\\protforge\\.\\data\\..\\inputs',
   ]) {
     assert.ok(!canonPath(p).split('/').includes('..'), `残留 .. 段：${p}`);
   }
 });
 
 test('消解在盘符映射之后发生（顺序不能反）', () => {
-  // 映射前消解：`../protforge\..` -> `E:\` -> `/mnt/e`，看着对，但 `../protforge\..\oih\x`
-  // 这类路径会先被砍成 `/mnt/e/oih/x` 而掩盖真实的重复段。
+  // 映射前消解：`<ProtForge 根>\..` -> `E:\` -> `/mnt/e`，看着对，但 `<ProtForge 根>\..\oih\x`
+  // 这类路径会先被砍成 `/mnt/e/protforge/x` 而掩盖真实的重复段。
   // 断言的是「映射后再消解」的结果本身，别靠直觉判断。
-  assert.equal(canonPath('../protforge\\oih\\..\\data'), '/mnt/e/oih/data');
-  assert.equal(canonPath('../protforge\\..'), '/mnt/e');
+  assert.equal(canonPath('E:\\protforge\\oih\\..\\data'), '/mnt/e/protforge/data');
+  assert.equal(canonPath('E:\\protforge\\..'), '/mnt/e');
 });

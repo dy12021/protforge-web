@@ -184,12 +184,20 @@ END;
 
 
 def data_root() -> Path:
-    """数据盘根。代码在 .，数据一律落在 data。
+    """数据盘根。
 
-    测试用 PROTFORGE_WEB_DATA_ROOT 指到 tmp_path，所以**每次调用都现读环境变量**，
+    **默认落在仓库旁边的 ``data/``**（跟着代码走）：换个机器 clone 下来就能跑，
+    不用先想清楚「数据该放哪」。要把它挪到别的盘（数据与代码不同盘的老规矩），
+    用 ``PROTFORGE_WEB_DATA_ROOT`` 指过去——本机的写法放在仓库里的 ``.env``
+    （那份不入版本库）。
+
+    测试用同一个变量指到 tmp_path，所以**每次调用都现读环境变量**，
     不要 import 时算一次存成模块常量。
     """
-    return Path(os.environ.get("PROTFORGE_WEB_DATA_ROOT") or r"data")
+    env = os.environ.get("PROTFORGE_WEB_DATA_ROOT")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parent.parent / "data"
 
 
 def db_path() -> Path:

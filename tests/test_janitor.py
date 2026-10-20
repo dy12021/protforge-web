@@ -6,7 +6,7 @@
 2. **不该删的一个都不删** —— 数据根之外的路径、非 `<数字>` 开头的目录名、
    磁盘不紧张时的产物包，都必须原样留下。
 
-数据根由 conftest 的 autouse 夹具指到 tmp_path，绝不碰真实的 data。
+数据根由 conftest 的 autouse 夹具指到 tmp_path，绝不碰真实的 <数据盘根>。
 """
 
 from __future__ import annotations

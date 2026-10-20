@@ -70,7 +70,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_INTERNAL_BASE = "http://127.0.0.1:8475"     # 内部 API 端口（plan Global Constraints）
 DEFAULT_AGENT_SCRIPT = Path(__file__).resolve().parent.parent / "agent" / "run.mjs"
-DEFAULT_PROTFORGE_DATA = r"../protforge/data"            # 与 guards.DEFAULT_PROTFORGE_ROOT 同源
+DEFAULT_PROTFORGE_DATA = guards.DEFAULT_PROTFORGE_ROOT   # 与守卫同一个来源，不另抄一份
 
 #: 探测不到 GPU 时的兜底并发数。**有下限不是默认值**：宁可一次只跑一个，也不要
 #: 因为 nvidia-smi 不在 PATH 就把平台判死。

@@ -3,7 +3,7 @@
 职责：
 1. 把 `server/` 加进 sys.path，让测试能 `import db, store, skills_index`。
 2. autouse 把数据库指向 tmp_path + 初始化 schema——测试**绝不碰**真实的
-   `data\\web.db`（计划 Global Constraints）。
+   `<数据盘根>\\web.db`（计划 Global Constraints）。
 
 `db` 的 import 放在 fixture 内部而不是模块顶层，这样某个正在改的模块
 导入失败时，不会连带让不依赖它的测试无法收集。

@@ -4,8 +4,8 @@
 
     data\\work\\<task_id>\\      读写
     data\\uploads\\<task_id>\\   只读（原始上传不可篡改）
-    ../protforge/data\\outputs\\     只读（仅对 agent 的文件工具）
-    ../protforge/data\\inputs\\      只读
+    <ProtForge 数据区>\\outputs\\     只读（仅对 agent 的文件工具）
+    <ProtForge 数据区>\\inputs\\      只读
 
 **结果包（data\\packages\\task_<id>.zip）不在其中**，它是 `resolve_package()` 单独
 管的一条：那一区是用户的交付物，不是 agent 的工作面。理由见那个函数的 docstring。
@@ -24,9 +24,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# plan Global Constraints 的字面值，环境变量只是覆盖，不是改默认。
-DEFAULT_DATA_ROOT = r"data"
-DEFAULT_PROTFORGE_ROOT = r"../protforge/data"
+# 默认值都是**跟着仓库走的相对位置**，不是某台机器的盘符：
+# 数据盘根 = 仓库旁的 data/；ProtForge 自己的地盘 = 旁边那个技能仓的 data/。
+# 真实部署用 PROTFORGE_WEB_DATA_ROOT / PROTFORGE_DATA 指过去（写在 .env 里）。
+# 环境变量只是覆盖，不是改默认。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_ROOT = str(_REPO_ROOT / "data")
+DEFAULT_PROTFORGE_ROOT = str(_REPO_ROOT.parent / "protforge" / "data")
 
 WORK = "work"
 READ_ONLY_REGIONS = ("uploads", "outputs", "inputs")

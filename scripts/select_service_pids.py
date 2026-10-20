@@ -68,7 +68,7 @@ def _tokens(cmdline: str) -> list[str]:
 def _is_entry(token: str, entry: str) -> bool:
     """这个参数是不是**就是**入口（逐段对上）。
 
-    ``server\\app.py`` ✓；``.\\server\\app.py`` ✓；
+    ``server\\app.py`` ✓；``<仓库>\\server\\app.py`` ✓；
     ``myserver\\app.py`` ✗；``server\\app.py.bak`` ✗。
     """
     t = token.replace("/", "\\").lower()

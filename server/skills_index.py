@@ -28,7 +28,11 @@ from pathlib import Path
 
 import yaml
 
-PROTFORGE_SKILLS_DIR = r"../protforge/skills"
+#: 技能目录。**默认指到旁边那个技能仓的 skills/**（``../protforge/skills``）：
+#: 技能仓是另一个仓库（github.com/dy12021/protforge），clone 在旁边就能用。
+#: 指到别处用 ``PROTFORGE_WEB_SKILLS_DIR`` 覆盖（本机的写法放在 ``.env`` 里）。
+PROTFORGE_SKILLS_DIR = str(
+    Path(__file__).resolve().parent.parent.parent / "protforge" / "skills")
 
 # 计划给出的超时表（秒）。档位越短越容易被腰斩，越长挂死任务收口越晚。
 DEFAULT_TIMEOUT_S = 14400          # 4h

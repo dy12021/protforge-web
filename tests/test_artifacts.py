@@ -8,7 +8,7 @@
 他人产物，所以「先显示、再确认」比「自动采纳」安全。
 
 ``outputs`` 根用 ``PROTFORGE_DATA`` 指向 tmp_path，**测试绝不读真实的
-``../protforge/data\\outputs``**（那里有用户既有的计算结果）。
+``<ProtForge 数据区>\\outputs``**（那里有用户既有的计算结果）。
 """
 from __future__ import annotations
 

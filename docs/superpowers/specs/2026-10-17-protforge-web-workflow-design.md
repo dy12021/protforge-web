@@ -113,7 +113,7 @@ ALTER TABLE tasks ADD COLUMN workflow_archived INTEGER NOT NULL DEFAULT 0;
 
 ### 4.3 ⚠ schema 迁移：必须显式写，不能靠 `init_db()`
 
-`server/db.py:136` 的 `init_db()` 注释明写「**不做版本化迁移**」，实现全是 `CREATE TABLE IF NOT EXISTS`。**这对已存在的表是空操作**——线上库 `data\web.db` 早已建好，直接改 `SCHEMA` 常量里的 `tasks` 定义，新列**永远不会出现**，而所有代码都照常跑，只是那一列永远是 NULL。这正是这个项目历史上「测试全绿、线上静默失效」的典型形状。
+`server/db.py:136` 的 `init_db()` 注释明写「**不做版本化迁移**」，实现全是 `CREATE TABLE IF NOT EXISTS`。**这对已存在的表是空操作**——线上库 `<数据盘根>\web.db` 早已建好，直接改 `SCHEMA` 常量里的 `tasks` 定义，新列**永远不会出现**，而所有代码都照常跑，只是那一列永远是 NULL。这正是这个项目历史上「测试全绿、线上静默失效」的典型形状。
 
 所以 `init_db()` 里必须加一段幂等的列补齐：
 

@@ -32,8 +32,8 @@
 `scripts\` 下有两个 PowerShell 脚本，**无窗口**，适合登录自启：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-services.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop-services.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File <仓库>\scripts\start-services.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File <仓库>\scripts\stop-services.ps1
 ```
 
 `start-services.ps1` **按监听端口幂等**：已经在听就直接跳过，不会起第二套占端口失败、
@@ -130,28 +130,30 @@ location / {
 
 ## 数据在哪、怎么备份
 
-**代码在 D 盘，数据在 E 盘**（用户明确要求；ProtForge 自己的产物本来也在 E 盘，跑任务不跨卷拷贝）。
+**数据默认落在仓库旁边的 `data\`**（跟着代码走，换台机器 clone 下来就能跑）。
+要把它挪到别的盘（数据与代码不同盘的老规矩），用 `PROTFORGE_WEB_DATA_ROOT` 指过去——
+本机的写法写在仓库根目录的 `.env` 里（**那份不入版本库**）。
 
 | 内容 | 位置 | 保留 |
 | --- | --- | --- |
-| 代码 | `.\` | git 仓库 |
-| 数据库 | `data\web.db` | 审计日志留 30 天 |
-| 上传原件 | `data\uploads\<id>\` | 7 天（只读） |
-| agent 工作区 | `data\work\<id>\` | 7 天 |
-| 产物包 zip | `data\packages\` | 30 天，磁盘紧张按最旧优先提前回收 |
-| 日志 | `data\logs\` | 14 天，单文件上限 64 MB |
+| 代码 | `<仓库>\` | git 仓库 |
+| 数据库 | `<数据盘根>\web.db` | 审计日志留 30 天 |
+| 上传原件 | `<数据盘根>\uploads\<id>\` | 7 天（只读） |
+| agent 工作区 | `<数据盘根>\work\<id>\` | 7 天 |
+| 产物包 zip | `<数据盘根>\packages\` | 30 天，磁盘紧张按最旧优先提前回收 |
+| 日志 | `<数据盘根>\logs\` | 14 天，单文件上限 64 MB |
 
-- **ProtForge 的产物留在 `../protforge/data\outputs\`，本项目只引用不搬动。**
+- **ProtForge 的产物留在 `<ProtForge 数据区>\outputs\`，本项目只引用不搬动。**
 - 上传原件进工作区时用 **hardlink**（同一卷不占额外数据块），跨卷或不支持才退回复制。
 - 单任务磁盘上限 20 GB（产物 + zip 合计），数据盘剩余不足 50 GB 时拒绝新任务。
 
 **备份就是把整个数据盘拷走**：
 
 ```bat
-xcopy data D:\backup\protforge-web-data\ /E /I
+xcopy <数据盘根> <备份目录>\ /E /I
 ```
 
-恢复：拷回 `data\` 覆盖，再重启 `start.bat`。
+恢复：拷回 `<数据盘根>\` 覆盖，再重启 `start.bat`。
 `data\` 不入版本库。
 
 ---
@@ -164,12 +166,12 @@ xcopy data D:\backup\protforge-web-data\ /E /I
 
 | 变量 | 作用 | 默认 |
 | --- | --- | --- |
-| `PROTFORGE_WEB_DATA_ROOT` | 数据盘根 | `data` |
+| `PROTFORGE_WEB_DATA_ROOT` | 数据盘根 | `<数据盘根>` |
 | `PROTFORGE_WEB_DB` | 数据库路径 | `<数据盘根>\web.db` |
 | `PROTFORGE_WEB_INTERNAL` | 内部 API 基址，**不含 `/api`** | `http://127.0.0.1:8475` |
-| `PROTFORGE_WEB_SKILLS_DIR` | 服务端读的技能目录 | `../protforge/skills` |
-| `PROTFORGE_SKILLS_DIR` | agent 读的技能目录（同一个） | `../protforge/skills` |
-| `PROTFORGE_DATA` | ProtForge 只读数据区 | `../protforge/data` |
+| `PROTFORGE_WEB_SKILLS_DIR` | 服务端读的技能目录 | `<技能仓>\skills` |
+| `PROTFORGE_SKILLS_DIR` | agent 读的技能目录（同一个） | `<技能仓>\skills` |
+| `PROTFORGE_DATA` | ProtForge 只读数据区 | `<ProtForge 数据区>` |
 | `PROTFORGE_WEB_NODE` | node 可执行文件 | `node` |
 | `PROTFORGE_WEB_AGENT_SCRIPT` | agent 入口脚本 | `<代码目录>\agent\run.mjs` |
 | `PROTFORGE_WEB_MAX_CONCURRENCY` | 并发上限 | 按 GPU 数推断，默认 1 |
@@ -191,7 +193,7 @@ xcopy data D:\backup\protforge-web-data\ /E /I
 使用者是本公司授权人员（需登录），防御目标**不是蓄意攻击者**。agent 需要完整的 shell
 才能自己写脚本调 ProtForge（WSL、venv、Docker 命令），这就必然意味着
 **「有 shell 就没有真正的沙箱」**。后台那层命令守卫（`agent/guards.mjs` 的 AST 解析）
-是**尽力而为**：它挡手滑、挡误删 `../protforge`，**挡不住刻意绕过**。
+是**尽力而为**：它挡手滑、挡误删 `<ProtForge 根>`，**挡不住刻意绕过**。
 
 所以它是一层**防误操作**的护栏，不是安全边界。真要对外开放，必须换成真沙箱
 （容器 / 独立账号 / 资源限制），而不是继续加白名单。
@@ -200,8 +202,8 @@ xcopy data D:\backup\protforge-web-data\ /E /I
 命令的操作数、重定向的目标、被执行脚本的路径、docker 挂载的宿主路径、
 以及 read/write 工具。`cat` / `head` / `grep` 这类**只读**命令的操作数不判——
 agent 需要读允许根之外的输入文件，这是刻意留的口子。路径判定前会先消解
-`.` 与 `..`（且必须在盘符映射**之后**），否则 `../protforge\..\..\Users\x` 规范化后
-仍以 `/mnt/e/oih/` 开头，会被直接放行——这条 16 个用例在 `agent/guards.dotdot.test.mjs`。
+`.` 与 `..`（且必须在盘符映射**之后**），否则 `<ProtForge 根>\..\..\Users\x` 规范化后
+仍以 `/mnt/<ProtForge 根>/` 开头，会被直接放行——这条 16 个用例在 `agent/guards.dotdot.test.mjs`。
 
 ---
 
@@ -227,13 +229,13 @@ agent 需要读允许根之外的输入文件，这是刻意留的口子。路�
   另有一条命名漂移哨兵，生产者一改名字就会在 `errors` 里报出来。
 - **agent 端**：AST 命令守卫 + pi RPC 模式 + 步骤回传可用，有单测。
 
-### 端到端实测（2026-10-16，本机，真实数据盘 `data`）
+### 端到端实测（2026-10-16，本机，真实数据盘 `<数据盘根>`）
 
 真实 freesasa 计算走完全程，**61 秒**：
 
 ```
 提交 → queued → running → 拉起 agent → 换模型 → 读 SKILL.md
-     → 定位 /e/oih/data/inputs/1ubq.pdb → 找到 venv → 跑 protforge-freesasa.sh
+     → 定位 <ProtForge 数据区>/inputs/1ubq.pdb → 找到 venv → 跑 protforge-freesasa.sh
      → 76 残基 / 602 原子，总 SASA 4804.06 Å²（与 Result.totalArea() 交叉校验一致）
      → 按原子类型统计 → finish(summary, artifacts) → done
 ```
@@ -299,7 +301,7 @@ agent 需要读允许根之外的输入文件，这是刻意留的口子。路�
 
 ### 真机验证记录（2026-10-16）
 
-对着真实数据盘 `data` 起内部 app，验证重启恢复：
+对着真实数据盘 `<数据盘根>` 起内部 app，验证重启恢复：
 
 - 库里有 4 条卡了一整天的 `running`（本该被上一版代码根治却没根治的），
   启动后全部被收尾成 `failed`，reason 如实写着「服务重启前未留下运行记录，
@@ -373,7 +375,7 @@ Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 8473,8474,8
 1. 任务状态是不是终态——非终态下载接口会返回 409「任务还没结束」。
 2. 任务记录里 `package_path` 是不是空的——空就是 409「这个任务没有产物包」。
    产物是 agent 跑完 + 发现 + 确认三步才落到 `data\packages\` 的。
-3. `data\packages\` 里有没有那个 zip，以及有没有被清理器回收（保留 30 天）。
+3. `<数据盘根>\packages\` 里有没有那个 zip，以及有没有被清理器回收（保留 30 天）。
 4. 路径是否越界——`package_path` 必须是 `<数据盘>\packages\task_<本任务号>.zip` 这一个文件，
    任何别的位置（work/uploads/outputs/inputs 区的文件、别的任务的包、子目录里的同名文件）
    都会被守卫挡掉，同样返回 409。
@@ -388,13 +390,13 @@ Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 8473,8474,8
 ## 开发
 
 ```bat
-cd /d .
+cd /d <仓库>
 "C:\ProgramData\anaconda3\python.exe" -m pytest tests -q
 cd agent
 node guards.test.mjs
 ```
 
-测试一律走真实 HTTP（临时端口 + 临时库），不会碰 `data\web.db`。
+测试一律走真实 HTTP（临时端口 + 临时库），不会碰 `<数据盘根>\web.db`。
 前端三个文件零 CDN、零构建，改完只能用真浏览器看一眼，没有自动化测试。
 
 | 是什么 | 在哪 |

@@ -10,15 +10,15 @@
 
 ## Global Constraints
 
-- **仓库** `.`，**数据盘** `data`
+- **仓库** `<仓库>`，**数据盘** `<数据盘根>`
 - **测试命令**（每个 bash 调用是全新 shell，命令自带 `Set-Location`）：
   ```powershell
   chcp 65001 | Out-Null; $env:PYTHONIOENCODING='utf-8'
-  Set-Location '.'
+  Set-Location '<仓库>'
   & 'C:\ProgramData\anaconda3\python.exe' -m pytest tests -q --no-header -p no:cacheprovider
   ```
-- **agent 测试**：`Set-Location '.\agent'; node --test guards.test.mjs`
-- **前端冒烟**：`Set-Location '.'; node tests\frontend_smoke.mjs web\app.js`
+- **agent 测试**：`Set-Location '<仓库>\agent'; node --test guards.test.mjs`
+- **前端冒烟**：`Set-Location '<仓库>'; node tests\frontend_smoke.mjs web\app.js`
 - `tests/conftest.py` **冻结，不得改**。它 autouse 把库指向 `tmp_path` 并调 `db.init_db()`，测试**绝不碰真实数据盘**
 - **界面禁用词**：`AI`、`助手`、`大模型`。统一称「自动化计算平台」「计算任务」「计算进程」。`AI` 必须大小写敏感（小写词满地都是）
 - **中文写入禁走 PowerShell 内联**（cp936 静默乱码）→ 用编辑工具，或 `pathlib.write_text(encoding="utf-8")`
@@ -59,7 +59,7 @@
 ```python
 """三张新表 + tasks 三列的迁移（规格 4.1/4.2/4.3）。
 
-只测新库等于没测——线上那个 data\\web.db 早在本次改动之前
+只测新库等于没测——线上那个 <数据盘根>\\web.db 早在本次改动之前
 就建好了，`CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作。所以这里手写一份
 **旧 schema** 的库来跑迁移，不用字符串手术去改 SCHEMA（那种写法在 SCHEMA 一变
 就悄悄失配）。
@@ -379,10 +379,10 @@ Expected: 全绿，条数 = 改动前 + 8
 
 - [ ] **Step 7: 提交**
 
-把 commit message 写进 `.\.git\MSG_t1.txt`（含中文与引号，**不要**直接 `git commit -m`），然后：
+把 commit message 写进 `<仓库>\.git\MSG_t1.txt`（含中文与引号，**不要**直接 `git commit -m`），然后：
 
 ```powershell
-Set-Location '.'
+Set-Location '<仓库>'
 git add server/db.py tests/test_workflow_schema.py
 git -c user.name=mavis -c user.email=mavis@local commit -F .git\MSG_t1.txt
 ```
@@ -3241,7 +3241,7 @@ import assert from 'node:assert/strict';
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `Set-Location '.\agent'; node --test guards.audit.test.mjs`
+Run: `Set-Location '<仓库>\agent'; node --test guards.audit.test.mjs`
 Expected: FAIL —— 断言「提示词里没提工作流」
 
 - [ ] **Step 3: 改 `PLATFORM_RULES`**
@@ -3258,7 +3258,7 @@ Expected: FAIL —— 断言「提示词里没提工作流」
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `Set-Location '.\agent'; node --test guards.audit.test.mjs guards.test.mjs guards.dotdot.test.mjs`
+Run: `Set-Location '<仓库>\agent'; node --test guards.audit.test.mjs guards.test.mjs guards.dotdot.test.mjs`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -3647,7 +3647,7 @@ Expected: PASS
 
 Run:
 ```powershell
-Add-Content -Path '.\web\workflow.js' -Value "`n// AI 助手"
+Add-Content -Path '<仓库>\web\workflow.js' -Value "`n// AI 助手"
 pytest tests/test_web_static.py -q --no-header -p no:cacheprovider -k banned
 ```
 Expected: FAIL —— 断言里出现 `AI`
@@ -3663,7 +3663,7 @@ Expected: FAIL —— 断言里出现 `AI`
 作为第二个参数传进去就行，顶层抛错就非零退出。
 
 ```powershell
-Set-Location '.'
+Set-Location '<仓库>'
 node tests\frontend_smoke.mjs web\app.js web\workflow.js
 ```
 
@@ -3675,7 +3675,7 @@ node tests\frontend_smoke.mjs web\app.js web\workflow.js
 - [ ] **Step 10: 跑全部前端检查**
 
 ```powershell
-Set-Location '.'
+Set-Location '<仓库>'
 pytest tests/test_web_static.py tests/test_frontend_url_contract.py -q --no-header -p no:cacheprovider
 node tests\frontend_smoke.mjs web\app.js web\workflow.js
 ```
@@ -3757,15 +3757,15 @@ test_web_static.py 的首页引用白名单显式加 workflow.html，没有放�
 
 ```powershell
 chcp 65001 | Out-Null; $env:PYTHONIOENCODING='utf-8'
-Set-Location '.'
+Set-Location '<仓库>'
 
 # 1. 全量测试
 & 'C:\ProgramData\anaconda3\python.exe' -m pytest tests -q --no-header -p no:cacheprovider
 
 # 2. agent 测试
-Set-Location '.\agent'
+Set-Location '<仓库>\agent'
 node --test guards.test.mjs guards.dotdot.test.mjs guards.audit.test.mjs
-Set-Location '.'
+Set-Location '<仓库>'
 
 # 3. 前端冒烟
 node tests\frontend_smoke.mjs web\app.js web\workflow.js

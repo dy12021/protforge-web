@@ -11,22 +11,59 @@ test_unresolvable_skill_degrades_to_host_and_default_timeout 守住。
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 import skills_index
 from skills_index import SkillIndexError, scan, timeout_for
 
 
+def _real_skills_dir() -> Path:
+    """找到**真机上的技能目录**。
+
+    顺序：环境变量 → 仓库里的 ``.env``（本机写的，那份不入版本库）→
+    代码里的默认。
+
+    技能仓是**另一个仓库**（github.com/dy12021/protforge），不在这个仓里，
+    所以路径不能写死——写死了公开出去的仓库就带着作者本机的布局，
+    而换台机器 clone 下来也指着一个不存在的目录。
+    """
+    env = os.environ.get("PROTFORGE_WEB_SKILLS_DIR")
+    if env:
+        return Path(env)
+    envfile = Path(__file__).resolve().parent.parent / ".env"
+    if envfile.is_file():
+        for line in envfile.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("PROTFORGE_WEB_SKILLS_DIR="):
+                return Path(line.split("=", 1)[1].strip().strip('"'))
+    return Path(skills_index.PROTFORGE_SKILLS_DIR)
+
+
+def _scan_real() -> dict:
+    """扫真机上的技能目录；**目录不在就跳过**，不是红。
+
+    这组用例测的是「扫到的技能对不对」——没有技能仓可扫时它无从谈起，
+    而把「没装技能仓」报成「代码坏了」会把排查引到错的方向。
+    """
+    d = _real_skills_dir()
+    if not d.is_dir():
+        pytest.skip(f"技能目录不在：{d}（装上技能仓，或设 PROTFORGE_WEB_SKILLS_DIR）")
+    return scan(str(d))
+
+
 @pytest.fixture(scope="module")
 def idx():
-    return scan()
+    return _scan_real()
 
 
 # --- 扫描覆盖面 ---------------------------------------------------------
 
 
 def test_scan_finds_all_23_skills():
-    idx = scan()
+    idx = _scan_real()
     assert len(idx) >= 23
     assert "protforge-freesasa" in idx
 
@@ -185,10 +222,18 @@ def test_reads_workspace_flag(idx):
     assert idx["protforge-overview"].has_runner is False
 
 
-def test_skills_dir_default_points_at_protforge():
-    assert skills_index.PROTFORGE_SKILLS_DIR == r"../protforge/skills"
+def test_skills_dir_default_is_portable():
+    """默认技能目录**跟着仓库走**（旁边那个技能仓的 skills/），不写死盘符。
+
+    写死作者本机的路径，公开出去的仓库就带着他的磁盘布局；换台机器 clone
+    下来也指着一个不存在的目录。真实位置用 PROTFORGE_WEB_SKILLS_DIR 指
+    （本机的写法在仓库里的 .env，那份不入版本库）。
+    """
+    default = Path(skills_index.PROTFORGE_SKILLS_DIR)
+    repo = Path(skills_index.__file__).resolve().parent.parent
+    assert default == repo.parent / "protforge" / "skills"
 
 
 def test_scan_is_repeatable(idx):
     """同一目录扫两次结果一致（幂等），便于上层缓存。"""
-    assert scan().keys() == idx.keys()
+    assert _scan_real().keys() == idx.keys()

@@ -21,8 +21,8 @@
    - `reglyco` 宿主进程，`overview` 是路由
 2. **`PROTFORGE_STATUS:` 只在那 17 个 bash runner 里有意义**，
    不能当全局强制契约，缺失时不能直接判失败。
-3. **数据根 `../protforge`**，venv `../protforge\venvs\oih\python.exe`，
-   compose `../protforge\oih-platform\`（全走 legacy 旧名，靠 `_common.sh` 的 fallback 生效）。
+3. **数据根 `<ProtForge 根>`**，venv `<ProtForge 根>\venvs\oih\python.exe`，
+   compose `<ProtForge 根>\oih-platform\`（全走 legacy 旧名，靠 `_common.sh` 的 fallback 生效）。
    已实测跑通 `protforge-freesasa.sh 1ubq.pdb _websmoke` → `PROTFORGE_STATUS: OK`。
 
 **因此：不设计统一的 `run_skill` 封装层**——没有统一契约可封装。
@@ -126,7 +126,7 @@ protforge-web 是**计算任务平台**。合并会让 ai_portal 变成什么都
 
 ### 3.0.3 虚拟环境不得混装
 
-ai_portal 用自己的 `backend\.venv`；ProtForge 用 `../protforge\venvs\oih\python.exe`，
+ai_portal 用自己的 `backend\.venv`；ProtForge 用 `<ProtForge 根>\venvs\oih\python.exe`，
 其中挂着 Docker 工具链与 CUDA 相关依赖。**两者不得混装**，否则会破坏
 ProtForge 的运行环境（历史上已在 OIH 项目踩过同类坑）。
 
@@ -144,20 +144,20 @@ ProtForge 的运行环境（历史上已在 OIH 项目踩过同类坑）。
 
 ## 3.05 数据盘布局（E 盘，用户 2026-10-16 明确要求）
 
-**代码在 D 盘，数据在 E 盘。** ProtForge 的数据根本来就在 `../protforge`，
+**代码在 D 盘，数据在 E 盘。** ProtForge 的数据根本来就在 `<ProtForge 根>`，
 放同一块盘有两个好处：读代码时的路径短、跑任务时不跨卷拷贝。
 
 | 内容 | 位置 | 说明 |
 |---|---|---|
-| 代码 | `.\` | git 仓库 |
-| **数据库** | `data\web.db` | |
-| **上传原件** | `data\uploads\<task_id>\` | 只读 |
-| **agent 工作区** | `data\work\<task_id>\` | agent 的沙箱 |
-| **产物包** | `data\packages\` | zip |
-| **日志** | `data\logs\` | |
+| 代码 | `<仓库>\` | git 仓库 |
+| **数据库** | `<数据盘根>\web.db` | |
+| **上传原件** | `<数据盘根>\uploads\<task_id>\` | 只读 |
+| **agent 工作区** | `<数据盘根>\work\<task_id>\` | agent 的沙箱 |
+| **产物包** | `<数据盘根>\packages\` | zip |
+| **日志** | `<数据盘根>\logs\` | |
 | 挂载点由 | `PROTFORGE_WEB_DATA_ROOT` | 可覆盖，默认上述 |
 
-`../protforge/data\outputs\` 由 ProtForge 自己管，本项目**只引用不迁移**——
+`<ProtForge 数据区>\outputs\` 由 ProtForge 自己管，本项目**只引用不迁移**——
 产物留在原地，zip 时按 `artifacts` 清单收拢，不搬动。
 
 ### 3.05.1 不做重复存储
@@ -281,7 +281,7 @@ agent 的 bash 工具需要同时覆盖两条通道：
 
 ### 6.2 文件权限与 bash 权限是**两套**，必须分开
 
-这是评审 #3 指出的直接矛盾，v2 把 `../protforge/data\outputs\` 设为只读，
+这是评审 #3 指出的直接矛盾，v2 把 `<ProtForge 数据区>\outputs\` 设为只读，
 但那些技能就是要往那儿写产物。
 
 | 通道 | 守卫 | 权限 |
@@ -289,7 +289,7 @@ agent 的 bash 工具需要同时覆盖两条通道：
 | **agent 的文件工具**（read/write/edit/ls） | 替换 `ReadOperations`/`WriteOperations`/… 的 `operations` | 工作区读写；`outputs`/`inputs`/插件目录**只读** |
 | **bash 子进程** | 替换 `BashOperations.exec` 的**命令**校验 | **不套用文件只读限制**——它的工作就是写 outputs |
 
-即：`../protforge/data\outputs\` 对 **agent 的 read/write 工具**只读，
+即：`<ProtForge 数据区>\outputs\` 对 **agent 的 read/write 工具**只读，
 对 **ProtForge 的 bash 进程**可写。两者是不同主体，不该用同一套规则。
 
 **为什么不直接用 `spawnHook`**：签名 `(ctx) => ctx`，只能改写 command/cwd/env，
@@ -326,7 +326,7 @@ agent 的 bash 工具需要同时覆盖两条通道：
 绝不「解析不了就放行」。
 
 `docker` 额外禁 `-v` 挂载宿主根（如 `-v /:/host`）、禁 `--privileged`、
-禁 `-v` 挂载 `../protforge` 之外的任意盘符。
+禁 `-v` 挂载 `<ProtForge 根>` 之外的任意盘符。
 
 ### 6.4 WSL 通道：明说边界
 
@@ -347,8 +347,8 @@ v4 的做法：**在 Windows 侧解析并递归内层命令**（§6.3 的 `wsl.e
 |---|---|
 | `data\work\<task_id>\` | 读写 |
 | `data\uploads\<task_id>\` | 只读（原始上传不可篡改） |
-| `../protforge/data\outputs\` | 只读（**仅对文件工具**） |
-| `../protforge/data\inputs\`、插件目录 | 只读 |
+| `<ProtForge 数据区>\outputs\` | 只读（**仅对文件工具**） |
+| `<ProtForge 数据区>\inputs\`、插件目录 | 只读 |
 
 实现：先 `Path.resolve()` 再判定，只读区走同一逻辑但只给读许可。
 **明说这是尽力而为，不是强安全边界**——评审建议的「用 Windows API 取最终路径」

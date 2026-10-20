@@ -13,7 +13,7 @@
    路由不存在（404）、方法不对（405）。
 
 测试走真实 HTTP：临时端口 + uvicorn 后台线程 + httpx，库指向 conftest 的
-tmp_path，绝不碰 data\\web.db。
+tmp_path，绝不碰 <数据盘根>\\web.db。
 """
 from __future__ import annotations
 

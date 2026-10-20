@@ -79,7 +79,7 @@ def test_a_path_mentioned_inside_a_script_is_left_alone():
 def test_an_absolute_path_to_the_entry_point_is_recognised():
     """用绝对路径起的也要认——认不出来等于留了孤儿。"""
     rows = [{"pid": 10, "name": "python.exe",
-             "cmdline": f'{PY} ".\\server\\app.py" public'}]
+             "cmdline": f'{PY} "<仓库>\\server\\app.py" public'}]
     assert sel.select_service_pids(rows) == [10]
 
 

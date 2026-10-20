@@ -11,8 +11,14 @@ import assert from 'node:assert/strict';
 
 import { checkCommand } from './guards.mjs';
 
+// 守卫的「ProtForge 自己的地盘」允许根是从 PROTFORGE_DATA 推出来的
+// （服务端注给 agent 的那个，指向 <ProtForge 根>\data）。
+// 这里显式给一份：用例里的路径都落在它下面。
+process.env.PROTFORGE_DATA = 'E:\\protforge\\data';
+
+
 // 与 run.mjs 保持一致的工作目录假设（数据盘 + 其 WSL 视图）。
-const WORK_DIR = 'data\\work\\task-1';
+const WORK_DIR = 'E:\\testbed\\data\\work\\task-1';
 const OPTS = { workDir: WORK_DIR };
 
 const allow = (cmd) => {
@@ -69,7 +75,7 @@ test('allows loops with variable expansion in argument position', () => {
 });
 
 test('allows the real ProtForge skill invocation forms', () => {
-  // 取自 ../protforge/skills 的实际 SKILL.md 示例
+  // 取自 E:\\protforge\\protforge-plugin\\skills 的实际 SKILL.md 示例
   allow('python "${PLUGIN_DIR}/skills/protforge-alphafold-db/scripts/afdb.py" P69905 --out "$PROTFORGE_DATA/outputs/P69905_afdb"');
   allow('wsl.exe -d AF3Native -- bash -c "mkdir -p /esmfold2/bin && cp \'/w/fold.py\' /esmfold2/bin/fold.py"');
   allow('wsl.exe -d AF3Native -- bash /esmfold2/bin/design_scFv.py /esmfold2/jobs/job.json');
@@ -80,13 +86,13 @@ test('allows the real ProtForge skill invocation forms', () => {
 
 test('allows writes inside the declared write set', () => {
   allow('echo hi > out.log');
-  allow('cat a.txt > data\\work\\task-1\\out.txt');
+  allow('cat a.txt > E:\\testbed\\data\\work\\task-1\\out.txt');
   allow('cp script.py /esmfold2/bin/script.py');
 });
 
-test('allows docker mounts inside ../protforge', () => {
-  allow('docker run -v ../protforge\\models:/models img');
-  allow('docker run --rm -v /mnt/e/oih/models:/models -w /models img python run.py');
+test('allows docker mounts inside E:\\protforge', () => {
+  allow('docker run -v E:\\protforge\\models:/models img');
+  allow('docker run --rm -v /mnt/e/protforge/models:/models -w /models img python run.py');
 });
 
 test('python -c content is a documented gap and is allowed', () => {
@@ -184,7 +190,7 @@ test('the null-device exemption is exact, not a prefix match', () => {
 test('rejects docker privileged and dangerous mounts', () => {
   deny('docker run --privileged img');
   deny('docker run -v /:/host img');
-  deny('docker run -v C:\\Users\\<user>:/mnt img');
+  deny('docker run -v C:\\Users\\someone\\:/mnt img');
   deny('docker run --privileged -v /:/host alpine sh');
 });
 
@@ -242,7 +248,7 @@ test('guard is not a blanket rejecter', () => {
     'python run.py',
     'wsl.exe -d AF3Native -- bash /esmfold2/bin/fold.py job.json',
     'docker ps',
-    'docker run -v ../protforge\\models:/models img python run.py',
+    'docker run -v E:\\protforge\\models:/models img python run.py',
   ];
   const denied = harmless.filter((c) => !checkCommand(c, OPTS).allowed);
   assert.deepEqual(denied, [], `这些无害命令被误拒：${denied.join(' | ')}`);

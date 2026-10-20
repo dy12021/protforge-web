@@ -12,15 +12,15 @@
 
 以下约束对**每个 task 都生效**，不再重复：
 
-- **数据盘 = `E:\protforge-web\`**，由 `PROTFORGE_WEB_DATA_ROOT` 覆盖。代码在 `.\`。子目录固定：`data/web.db`、`data/uploads/<task_id>/`、`data/work/<task_id>/`、`data/packages/`、`data/logs/`
+- **数据盘 = `<仓库>\`**，由 `PROTFORGE_WEB_DATA_ROOT` 覆盖。代码在 `<仓库>\`。子目录固定：`data/web.db`、`data/uploads/<task_id>/`、`data/work/<task_id>/`、`data/packages/`、`data/logs/`
 - **端口**：用户 API `8473`（`0.0.0.0`）、管理员 `8474`（`127.0.0.1`）、内部 API `8475`（`127.0.0.1`）
-- **ProtForge 零改动**，只调用 `../protforge\protforge-plugin` 下的技能
-- **Python 用 `C:\ProgramData\anaconda3\python.exe`**，禁止装进 `../protforge\venvs\oih\`（那是 ProtForge 的环境，混装会破坏 Docker 工具链）
+- **ProtForge 零改动**，只调用 `<技能仓>` 下的技能
+- **Python 用 `C:\ProgramData\anaconda3\python.exe`**，禁止装进 `<ProtForge 根>\venvs\oih\`（那是 ProtForge 的环境，混装会破坏 Docker 工具链）
 - **所有 API 的 `detail` 恒为中文字符串**，含 pydantic 框架层错误。数组透出去会让前端拿到 `"[object Object]"`
 - **鉴权用 `Authorization: Bearer`，不用 Cookie**（天然免 CSRF）。内部 agent 通道用一次性 `agent_token`，**与 task_id 绑定**
 - **界面不出现"AI""助手""大模型"字样**，统一称「自动化计算平台」「计算进程」
 - 每个 SQLite 连接都要设 `PRAGMA busy_timeout=10000` 与 `PRAGMA recursive_triggers=OFF`（多进程写入 + updated_at 触发器）
-- 测试**绝不碰真实 `data\web.db`**，一律用 `tmp_path` + 环境变量指临时库
+- 测试**绝不碰真实 `<数据盘根>\web.db`**，一律用 `tmp_path` + 环境变量指临时库
 - 提交前用 `-F <文件>` 传 commit message（PowerShell 会把内联 `-m "..."` 里的引号当参数分隔符拆开）
 - 每个 task 结束提交一次 git
 
@@ -58,7 +58,7 @@ sys.path.insert(0, str(ROOT / "server"))
 
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
-    """每个测试用独立临时库 + 临时数据根，绝不碰 E:\\protforge-web。"""
+    """每个测试用独立临时库 + 临时数据根，绝不碰 <仓库>。"""
     monkeypatch.setenv("PROTFORGE_WEB_DB", str(tmp_path / "t.db"))
     monkeypatch.setenv("PROTFORGE_WEB_DATA_ROOT", str(tmp_path / "data"))
     import db, store
@@ -180,7 +180,7 @@ END;
 """
 ```
 
-`connect()` 必须设四条 PRAGMA：`foreign_keys=ON`、`recursive_triggers=OFF`、`journal_mode=WAL`、**`busy_timeout=10000`**。加 `data_root()` 返回 `Path(os.environ.get("PROTFORGE_WEB_DATA_ROOT") or r"data")`。
+`connect()` 必须设四条 PRAGMA：`foreign_keys=ON`、`recursive_triggers=OFF`、`journal_mode=WAL`、**`busy_timeout=10000`**。加 `data_root()` 返回 `Path(os.environ.get("PROTFORGE_WEB_DATA_ROOT") or r"<数据盘根>")`。
 
 - [ ] **Step 5: 实现 store.py**
 
@@ -290,7 +290,7 @@ def verify_password(password, hash_hex, salt_hex) -> bool:
 **Produces:**
 - `skills_index.scan() -> dict[name, SkillInfo]`，`SkillInfo = {name, description, has_runner, runner_path, shell_kind, timeout_s, reads_workspace}`
 - `skills_index.timeout_for(name) -> int`
-- `skills_index.PROTFORGE_SKILLS_DIR`（默认 `../protforge/skills`）
+- `skills_index.PROTFORGE_SKILLS_DIR`（默认 `<技能仓>\skills`）
 
 **关键实测事实（不要重新猜）：**
 
@@ -522,7 +522,7 @@ def test_process_exit_without_finished_marked_failed(): ...
 
 **两条路径都跑**（v3 的「前缀命中就不走时间窗」是 `or` 不是双保险，
 在「第一个工具守规矩、第二个没守规矩」时会丢产物）：
-- 前缀 `../protforge/data\outputs\t{task_id}_*` → `source='prefix'`, `verified=1`
+- 前缀 `<ProtForge 数据区>\outputs\t{task_id}_*` → `source='prefix'`, `verified=1`
 - 时间窗（mtime 落在任务起止区间）→ `source='timewindow'`, `verified=0`，**可见但不可下载**
 
 - [ ] **Step 1: 写失败测试**

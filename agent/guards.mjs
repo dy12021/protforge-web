@@ -123,14 +123,32 @@ const REDIR_WRITE = new Set([54, 55, 57, 60, 64, 65]); // > >> <> >| &> &>>
 const REDIR_READ = new Set([56, 59, 61, 63]);          // < 1>&2 << <<<
 
 /**
+ * ProtForge 自己的地盘（技能脚本、它的产物）——**从环境变量推出来，不写死盘符**。
+ *
+ * 服务端把 `PROTFORGE_DATA`（指向 <ProtForge 根>/data）注给 agent，
+ * 这里取它的上一级当根。写死某个盘符的话，换台机器这套守卫会把技能目录
+ * 整个挡在外面——而症状是「agent 什么也写不了」，很难一眼看出是路径不对。
+ *
+ * 取不到就退回到空（不放行任何宿主盘符）：宁可拦住，也不乱放。
+ *
+ * **每次调用现读**，不是模块加载时算一次：测试在运行中设这个变量，
+ * 加载时算的话那些用例会看到空允许根而全红。
+ */
+function protforgeRoot() {
+  const data = (process.env.PROTFORGE_DATA || '').trim();
+  if (!data) return '';
+  const i = Math.max(data.lastIndexOf('\\'), data.lastIndexOf('/'));
+  return i > 0 ? data.slice(0, i) : '';
+}
+
+/**
  * 文件操作允许写入的绝对路径根。
- * 前两条由平台固定：数据盘的工作目录，以及 ProtForge 自己的地盘
- * （技能脚本在 `../protforge` 下，WSL 侧对应 `/mnt/e/oih`）。
+ * 第一条是数据盘的工作目录，ProtForge 自己的地盘紧随其后。
  * 其余是 AF3Native WSL 里 ProtForge 技能真实使用的目录——
  * 这些路径出现在 SKILL.md 的官方示例里（`/esmfold2/bin/fold.py` 等），
  * 收紧它们会让 agent 无法完成任何计算，所以必须显式声明而不是一刀切。
  */
-const DEFAULT_FILE_ROOTS = [
+const STATIC_FILE_ROOTS = [
   '/tmp',
   '/esmfold2',
   '/opendde_venv',
@@ -140,11 +158,19 @@ const DEFAULT_FILE_ROOTS = [
   '/db',
   '/hmmer',
   '/msashared',
-  '../protforge',
 ];
 
-/** docker `-v` 允许挂载的宿主路径（规格要求：../protforge 之外的盘符禁止）。 */
-const DEFAULT_DOCKER_ROOTS = ['../protforge'];
+/** 文件工具的允许根（静态的那些 + ProtForge 自己的地盘）。 */
+function allowedFileRoots() {
+  const root = protforgeRoot();
+  return root ? [...STATIC_FILE_ROOTS, root] : [...STATIC_FILE_ROOTS];
+}
+
+/** docker `-v` 允许挂载的宿主路径（规格要求：ProtForge 根之外的盘符禁止）。 */
+function dockerRoots() {
+  const root = protforgeRoot();
+  return root ? [root] : [];
+}
 
 // ------------------------------------------------------------------ 结果
 
@@ -156,13 +182,13 @@ const bad = (reason) => Object.freeze({ allowed: false, reason });
 /**
  * 消解 `.` 与 `..`，把路径压成**没有上跳**的形式。
  *
- * 这一步不是可有可无的洁癖：不做的话 `../protforge\..\..\Users\<user>\.ssh\id_rsa`
- * 规范化后是 `/mnt/e/oih/../../users/...`，`startsWith('/mnt/e/oih/')` 为真 ->
+ * 这一步不是可有可无的洁癖：不做的话 `<允许根>\..\..\Users\<user>\.ssh\id_rsa`
+ * 规范化后是 `/mnt/<盘>/<允许根>/../../users/...`，`startsWith('/mnt/<盘>/<允许根>/')` 为真 ->
  * 直接放行，L1 守卫形同虚设。Python 侧的 `guards.py` 用 `Path.resolve()` 做了同一件事，
  * 两边行为**必须一致**，否则同一个路径在一个进程里被拦、在另一个进程里放行。
  *
  * 用手写消解而不是 node:path.posix.normalize：这里已经统一成 `/mnt/x/...` 的
- * POSIX 形式，`path.posix.normalize` 会把 `/mnt/e/oih/../../x` 正确压成 `/mnt/x`，
+ * POSIX 形式，`path.posix.normalize` 会把 `/mnt/<盘>/<允许根>/../../x` 正确压成 `/mnt/x`，
  * 但对 `//server/share` 这类 UNC 归一后的路径会额外动刀，行为不如显式可控。
  */
 function normalizeDots(p) {
@@ -195,7 +221,7 @@ export function canonPath(p) {
   if (drive) s = `/mnt/${drive[1].toLowerCase()}/${s.slice(3)}`;
   const gitStyle = /^\/([A-Za-z])\//.exec(s);
   if (gitStyle) s = `/mnt/${gitStyle[1].toLowerCase()}/${s.slice(3)}`;
-  // 消解必须在盘符映射**之后**：映射前的 `../protforge\..\..` 消解结果和映射后不一样。
+  // 消解必须在盘符映射**之后**：映射前的 `<允许根>\..\..` 消解结果和映射后不一样。
   s = normalizeDots(s);
   return s.toLowerCase();
 }
@@ -277,10 +303,10 @@ function baseName(words) {
 // ------------------------------------------------------------------ 上下文
 
 function makeContext(opts) {
-  const fileRoots = [...DEFAULT_FILE_ROOTS, ...(opts.fileRoots || [])];
+  const fileRoots = [...allowedFileRoots(), ...(opts.fileRoots || [])];
   // 工作目录本身就是允许写入的范围，redirect/删除判定都要算上它。
   if (opts.workDir) fileRoots.push(opts.workDir);
-  return { fileRoots, dockerRoots: [...DEFAULT_DOCKER_ROOTS], workDir: opts.workDir };
+  return { fileRoots, dockerRoots: dockerRoots(), workDir: opts.workDir };
 }
 
 // ------------------------------------------------------------------ 遍历
@@ -594,7 +620,7 @@ function checkDestructive(base, words, ctx) {
   return OK;
 }
 
-/** docker 额外禁令：特权容器、挂宿主根、挂 ../protforge 之外的盘。 */
+/** docker 额外禁令：特权容器、挂宿主根、挂 ProtForge 根之外的盘。 */
 function checkDocker(words, ctx) {
   for (let i = 1; i < words.length; i++) {
     const { value, dynamic } = wordToString(words[i]);
@@ -629,13 +655,13 @@ function checkDocker(words, ctx) {
     // 相对挂载由 docker 按 cwd 解析，cwd 就是工作目录。
     if (!isAbsoluteLike(src)) continue;
     if (!isUnderAny(src, ctx.dockerRoots)) {
-      return bad(`docker 挂载了允许范围之外的宿主路径（仅允许 ../protforge）：${src}`);
+      return bad(`docker 挂载了允许范围之外的宿主路径（仅允许 ${ctx.dockerRoots.join('、') || '（未配置）'}）：${src}`);
     }
   }
   return OK;
 }
 
-/** `../protforge\models:/models` 的分隔符在盘符后面，不能按第一个冒号切。 */
+/** `<盘符>\路径:/容器路径` 的分隔符在盘符后面，不能按第一个冒号切。 */
 function splitVolumeSpec(spec) {
   const start = /^[A-Za-z]:/.test(spec) ? 2 : 0;
   const idx = spec.indexOf(':', start);
@@ -754,7 +780,7 @@ export function createGuardedBashOperations(opts, base = null) {
 
 /** 文件工具的路径限制：只允许读工作目录与声明的根。 */
 function confine(absolutePath, opts, what) {
-  const allowed = [...DEFAULT_FILE_ROOTS];
+  const allowed = allowedFileRoots();
   if (opts.workDir) allowed.push(opts.workDir);
   if (!isUnderAny(absolutePath, [...allowed, ...(opts.fileRoots || [])])) {
     throw new Error(`${what} 被安全守卫拒绝：${absolutePath} 不在工作目录或允许的根内`);

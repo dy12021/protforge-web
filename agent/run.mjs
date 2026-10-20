@@ -13,7 +13,8 @@
  *   PROTFORGE_WORK_DIR      本任务的工作目录，所有产物落在这里
  *
  * 可选：
- *   PROTFORGE_SKILLS_DIR    技能目录，默认 ../protforge/skills
+ *   PROTFORGE_SKILLS_DIR    技能目录（也认 PROTFORGE_WEB_SKILLS_DIR；
+ *                          默认指到旁边那个技能仓的 skills/）
  *   MINIMAX_API_KEY / MINIMAX_API_HOST   联网检索能力；缺失时降级但仍能跑
  *   PROTORGE_AGENT_DIR     pi 的模型配置目录，由调度器在任务工作目录里物化。
  *                          不设就退回 getAgentDir()（用户全局），而本机那份是
@@ -24,6 +25,7 @@
 
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   createAgentSessionRuntime,
@@ -48,7 +50,10 @@ import {
 } from './guards.mjs';
 import { createReporter, createReporterTools } from './tools.mjs';
 
-const DEFAULT_SKILLS_DIR = '../protforge/skills';
+/** 技能目录的默认位置：旁边那个技能仓的 skills/（clone 在旁边就能用）。
+ *  指到别处用 PROTFORGE_SKILLS_DIR 或 PROTFORGE_WEB_SKILLS_DIR 覆盖。 */
+const DEFAULT_SKILLS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'protforge', 'skills');
 const MCP_SERVER_NAME = 'minimax-coding-plan';
 
 // ---------------------------------------------------------------- 环境
@@ -66,7 +71,9 @@ const INTERNAL = required('PROTFORGE_WEB_INTERNAL');
 const TASK_ID = required('PROTFORGE_TASK_ID');
 const TOKEN = required('PROTFORGE_AGENT_TOKEN');
 const WORK_DIR = path.resolve(required('PROTFORGE_WORK_DIR'));
-const SKILLS_DIR = process.env.PROTFORGE_SKILLS_DIR || DEFAULT_SKILLS_DIR;
+const SKILLS_DIR = process.env.PROTFORGE_SKILLS_DIR
+  || process.env.PROTFORGE_WEB_SKILLS_DIR
+  || DEFAULT_SKILLS_DIR;
 
 // ---------------------------------------------------------------- 日志
 
@@ -89,8 +96,8 @@ const PLATFORM_RULES = `
 - 宿主机的计算环境在 WSL 发行版 AF3Native 里，通过 \`wsl.exe -d AF3Native -- bash <脚本> <参数>\` 调用。
   不要把复合命令内联进 wsl.exe（引号会在 powershell → wsl.exe → bash 之间层层丢失），
   写成 .sh 脚本文件再按路径调用。
-- 命令会被安全守卫校验：解析不出来的、含 eval/source/.、以及作用在工作目录与 ../protforge
-  之外路径上的删除/写入/挂载，一律拒绝并把理由返回给你。被拒就换写法，不要反复重试同一条。
+- 命令会被安全守卫校验：解析不出来的、含 eval/source/.、以及作用在工作目录与 ProtForge
+  自己的地盘之外路径上的删除/写入/挂载，一律拒绝并把理由返回给你。被拒就换写法，不要反复重试同一条。
 - \`report_step\` 回传的是**给用户看的一句话进度**，它显示在任务卡片最显眼的位置。
   - 写**用户视角的动宾短语**，像进度播报：正在搜寻蛋白质序列 / 正在用 RFdiffusion 生成结构 /
     正在计算表面面积 / 正在比对候选表位。
@@ -271,7 +278,7 @@ async function main() {
 /* 刻意**没有**「把命令原文播报成当前步骤」的钩子。
 
 早先这里有个 spawnHook，每条命令执行前把命令塞进 step，心跳再重复它。于是网页上
-最显眼的那一行显示的是「正在执行：cd data/work/13 && python
+最显眼的那一行显示的是「正在执行：cd <数据盘根>/work/13 && python
 analyze_bdnf.py 2>&1 | tail」——被截断到 70 字符，经常断在半截路径上。
 
 命令原文本来就逐条落在 audit_log 里（带退出码和耗时），要看随时查得到，不必再占着

@@ -6,7 +6,7 @@
 
 **技能目录必须隔离。** ``conftest.py`` 只把数据库指向 tmp_path，没有动
 ``PROTFORGE_WEB_SKILLS_DIR``——而落地经验与应用方案都写那个目录。用默认值的话，
-跑一次测试就在真实的 ``../protforge\\protforge-plugin`` 里留下 ``references/lessons.md``，
+跑一次测试就在真实的 ``<技能仓>`` 里留下 ``references/lessons.md``，
 技能文件也可能被改掉。所以下面 ``_skills`` 夹具先建一个临时技能仓库再指过去。
 
 规则本身是断言，行为本身是事实。改 ``server/reflection.py`` 请连这个文件一起读。
