@@ -50,19 +50,25 @@ function makeStub(label = 'stub') {
  * 用万能 Proxy 不行——board-msg 的错误文案是 append 进子节点的，Proxy 不存值，
  * 于是 boot() 自己 catch 住的那句错误就永远读不出来。
  */
-function makeEl(tag, id) {
+function makeEl(tag, id, doc) {
   let text = '';
   const node = {
     _on: {},
     tagName: tag, id: id || '', children: [], value: '',
     className: '', hidden: false, disabled: false, open: false, rows: 0,
     placeholder: '', title: '', type: '', href: '',
+    // 父子关系与焦点：**焦点找回这条围栏断的就是它们**。
+    // 少了 parent，closest() 永远找不到祖先；少了 ownerDocument，
+    // focus() 就不知道该把焦点记到哪个文档上。
+    parent: null, ownerDocument: doc || null,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     dataset: {},
     style: { setProperty() {}, removeProperty() {}, getPropertyValue() { return ''; } },
     options: [],
-    append(...a) { node.children.push(...a); },
-    appendChild(c) { node.children.push(c); return c; },
+    append(...a) {
+      for (const c of a) { if (c) c.parent = node; node.children.push(c); }
+    },
+    appendChild(c) { if (c) c.parent = node; node.children.push(c); return c; },
     remove() {},
     // 监听器要**存住**，光 addEventListener 空实现的话，下面重放「登录」那一步
     // 就触发不了任何东西——而那一步恰恰是本文件最要紧的复现入口。
@@ -83,8 +89,21 @@ function makeEl(tag, id) {
       return node._q[sel];
     },
     querySelectorAll() { return []; },
-    closest() { return null; },
-    focus() {}, click() {}, reset() {}, scrollIntoView() {},
+    // closest()：只认 .class（真 DOM 还认标签与属性，这里用不到那些）。
+    // 原来这里恒回 null，于是「重画之后把焦点还给正在编辑的输入框」那条
+    // 路径在桩里**根本走不到**——测了等于没测。
+    closest(sel) {
+      const want = String(sel).replace(/^\./, '');
+      let n = node;
+      while (n) {
+        if (String(n.className || '').split(/\s+/).indexOf(want) >= 0) return n;
+        n = n.parent;
+      }
+      return null;
+    },
+    // 焦点要真的被记下来：document.activeElement 是这条围栏的判据。
+    focus() { if (node.ownerDocument) node.ownerDocument.activeElement = node; },
+    click() {}, reset() {}, scrollIntoView() {},
     // 流转轨的滑动动画量的是真实尺寸。桩里给一组零值，
     // 于是走"量不到就不滑"那条分支——动画本来就该在这种环境里跳过。
     getBoundingClientRect() {
@@ -94,9 +113,28 @@ function makeEl(tag, id) {
     insertAdjacentHTML() {},
   };
   // 跟 DOM 一致：写 textContent 会把子节点清掉。
+  //
+  // **而且被摘掉的元素会把焦点带走**（真 DOM 里焦点掉到 body 上）。
+  // 桩里不模拟这一条，「重画之后不还焦点」那条变异就咬不住：
+  // activeElement 一直指着那个已经被摘掉的旧元素，看起来像焦点还在。
+  const holds = (root, target) => {
+    if (!root || !target) return false;
+    if (root === target) return true;
+    return (root.children || []).some((c) => holds(c, target));
+  };
   Object.defineProperty(node, 'textContent', {
     get() { return text; },
-    set(v) { text = String(v); if (v === '') node.children = []; },
+    set(v) {
+      text = String(v);
+      if (v === '') {
+        const removed = node.children;
+        node.children = [];
+        if (node.ownerDocument && node.ownerDocument.activeElement
+            && removed.some((c) => holds(c, node.ownerDocument.activeElement))) {
+          node.ownerDocument.activeElement = null;
+        }
+      }
+    },
     enumerable: true,
   });
   // 真 DOM 里 childNodes 也在。少了它，`ul.childNodes.length` 那类写法在桩里
@@ -112,10 +150,13 @@ function makeEl(tag, id) {
 function makeDom(byId) {
   const doc = {
     visibilityState: 'visible',
-    createElement: (tag) => makeEl(tag),
+    // 焦点挂在谁身上：重画之后要找回来的就是它。
+    activeElement: null,
+    createElement: (tag) => makeEl(tag, '', doc),
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
     getElementById(id) {
-      if (!byId.has(id)) byId.set(id, makeEl('div', id));
+      // ownerDocument 要挂上：焦点被摘掉时要记到文档上（见 textContent 的定义）。
+      if (!byId.has(id)) byId.set(id, makeEl('div', id, doc));
       return byId.get(id);
     },
     // **#id 选择器与 getElementById 返回同一个节点**（真 DOM 就是同一个）。
@@ -610,6 +651,81 @@ async function checkProposalFailureNotice(r) {
   return errs;
 }
 
+/**
+ * 「生成修改方案」的目标路径不能被 10 秒兜底轮询抹掉。
+ *
+ * 这条是被真机抓出来的：填完目标路径再点「生成修改方案」，界面只回一句
+ * 「先填要改哪个文件」——因为兜底轮询每 10 秒无条件重画整个反思列表，
+ * 输入框被换掉，管理员刚敲进去的路径就没了。
+ *
+ * 人敲 34 个字符的路径要好几秒，**必然**跨过一次轮询，所以这不是偶发竞态，
+ * 是这条路在界面上根本走不通。
+ *
+ * 这里模拟的就是那次轮询：渲染一条工具意见 → 在目标框里敲字 → 重画列表 →
+ * 断三件事：字还在不在、还是不是同一个框、焦点回没回来。
+ * 断的是**重画之后的结果**，不是源码里有没有某个词。
+ */
+async function checkProposeTargetDraft(r) {
+  const errs = [];
+  const sb = r.sandbox;
+  const doc = sb.document;
+  const host = doc.getElementById('refl-list');
+  /** 在整棵树里找目标路径输入框（桩的 querySelector 只认 id，按树走）。 */
+  const findTarget = () => {
+    const stack = [host];
+    while (stack.length) {
+      const n = stack.shift();
+      if (!n || !n.children) continue;
+      for (const c of n.children) {
+        if (c && c.tagName === 'input' && c.className === 'refl-target') return c;
+        stack.push(c);
+      }
+    }
+    return null;
+  };
+
+  const keep = sb.state.reflections;
+  try {
+    sb.state.reflections = [{
+      id: 701, task_id: 701, status: 'reviewed', kind: 'tool_gap',
+      suggested: 'tool_gap', task_title: '（围栏用）', created_at: '2026-10-20T10:00:00',
+    }];
+    sb.renderReflections();
+    const input = findTarget();
+    if (!input) {
+      errs.push('工具意见那条没有渲染出目标路径输入框');
+      return errs;
+    }
+    const typed = 'skills/protforge-demo/SKILL.md';
+    input.value = typed;
+    input.focus();                     // 用户点了这个框
+    // 兜底轮询：10 秒后重画整个列表
+    sb.renderReflections();
+    const again = findTarget();
+    if (!again) {
+      errs.push('重画之后目标路径输入框不见了');
+      return errs;
+    }
+    if (again.value !== typed) {
+      errs.push(`重画之后目标路径被抹成「${again.value}」：`
+        + '管理员敲的路径没了，点「生成修改方案」只会得到「先填要改哪个文件」');
+    }
+    if (again !== input) {
+      errs.push('重画之后目标输入框被换成了另一个元素：'
+        + '值、光标位置、输入法状态全都得重新来一遍');
+    }
+    if (doc.activeElement !== again) {
+      errs.push('重画之后焦点没回到目标输入框：'
+        + '管理员正打一半的路径会继续吃按键、字却打不进去，看起来像键盘坏了');
+    }
+  } catch (e) {
+    errs.push(`目标路径草稿那条路径抛了：${e && e.message}`);
+  } finally {
+    sb.state.reflections = keep;
+  }
+  return errs;
+}
+
 async function checkReflectionConfirms(r) {
   const errs = [];
   const sb = r.sandbox;
@@ -798,6 +914,7 @@ for (const f of files) {
     if (/admin-ui[\\/]app\.js$/.test(f)) {
       for (const m of await checkReflectionConfirms(r)) errs.push(new Error(m));
       for (const m of await checkProposalFailureNotice(r)) errs.push(new Error(m));
+      for (const m of await checkProposeTargetDraft(r)) errs.push(new Error(m));
     }
   } catch (e) {
     errs.push(e);

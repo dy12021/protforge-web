@@ -75,6 +75,9 @@ const state = {
   reflDetail: null,        // 最近一次展开的正文详情（分类/落地按钮要读它的解析结果）
   reflOpenId: null,        // 哪一条的正文是展开的。**存 state 而不是存卡片**：
                            // 轮询会整块重画列表，存在元素上的开合状态活不过一轮
+  reflTargetInputs: new Map(),  // 反思 id -> 「生成修改方案」的目标输入框（**复用元素**）。
+                                // 轮询会整块重画列表：每次都新建输入框，管理员刚敲的
+                                // 路径就被换掉，点按钮只剩「先填要改哪个文件」
   reflTimer: null,         // 「方案正在生成」时的自轮询句柄
   tab: "live",
   me: null,
@@ -1282,6 +1285,13 @@ function renderReflections() {
   const host = document.getElementById("refl-list");
   const empty = document.getElementById("refl-empty");
   const note = document.getElementById("refl-note");
+  /* 重画之前先记住「谁正在被编辑」。
+   *
+   * 整块重画会把输入框从 DOM 里摘下来，管理员正打到一半的路径会继续吃按键、
+   * 字却打不进去——看起来像键盘坏了。目标输入框是**同一个元素**（见
+   * state.reflTargetInputs），所以重画之后把它重新聚焦即可。 */
+  const active = document.activeElement;
+  const editing = active && active.closest ? active.closest(".refl") : null;
   host.textContent = "";
   const rows = state.reflections || [];
   empty.hidden = rows.length > 0;
@@ -1294,6 +1304,15 @@ function renderReflections() {
     : "";
 
   rows.forEach(r => host.append(reflCard(r)));
+  /* 焦点还回去，光标停在末尾。 */
+  if (editing && active && active.focus) {
+    active.focus();
+    if (active.setSelectionRange && typeof active.value === "string") {
+      try {
+        active.setSelectionRange(active.value.length, active.value.length);
+      } catch (e) { /* 某些输入类型不支持选区，忽略 */ }
+    }
+  }
 }
 
 function reflCard(r) {
@@ -1529,12 +1548,26 @@ function landBtn(r) {
 
 function proposeRow(r) {
   const wrap = el("div", "refl-propose");
-  const input = el("input", null, "");
+  /* 目标输入框**复用同一个元素**。
+   *
+   * 这条是被真机抓出来的：填完目标路径再点按钮，界面只回一句「先填要改哪个文件」。
+   * 因为兜底轮询每 10 秒无条件重画整个列表，输入框被换掉，管理员敲的字没了。
+   * 人敲 34 个字符的路径要好几秒，**必然**跨过一次轮询——不是偶发竞态。
+   *
+   * 复用元素而不是「存草稿再回填」：元素上带着的不只是值，还有光标位置、
+   * 选区、输入法状态，全都不用重建（同一个套路，任务卡片那边是 state.cards）。 */
+  let input = state.reflTargetInputs.get(r.id);
+  const fresh = !input;
+  if (fresh) {
+    input = el("input", null, "");
+    state.reflTargetInputs.set(r.id, input);
+  }
   input.type = "text";
   input.placeholder = "要改的技能文件，例如 skills/protforge-xxx/SKILL.md";
   input.className = "refl-target";
   input.setAttribute("list", "refl-skill-list");
-  input.value = r.proposal_target || "";
+  /* 复用来的元素**不再覆写值**：那正是管理员正在敲的东西。 */
+  if (fresh) input.value = r.proposal_target || "";
   const go = el("button", "btn", r.proposal ? "重新生成方案" : "生成修改方案");
   go.type = "button";
   go.addEventListener("click", async () => {
