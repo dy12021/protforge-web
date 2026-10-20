@@ -1022,6 +1022,12 @@ def create_public_app() -> FastAPI:
         wf = store.get_workflow(workflow_id, owner_id=user["id"])    # 越权 → 404
         _abort_live_rows(workflow_id)
         _settle_abort_signal(dispatcher.POLL_INTERVAL * 3)
+        # **行任务是被外键级联删掉的**（tasks.workflow_id ON DELETE CASCADE），
+        # 不走 _delete_task_row —— 所以那些行的反思正文得在这里清：
+        # 级联只管数据库，管不到文件，而正文留在盘上就成了没人认领的残留
+        # （实测：删一个跑过的工作流，六行的 task-N.md 全留在 reflections/ 里）。
+        for row in store.list_workflow_rows(workflow_id):
+            _purge_reflection_files(int(row["id"]))
         # 归属参数必须传：store 层默认拒绝（owner_id=None → NotFound）。
         # 刻意**不传** is_admin——管理员对别人的工作流只读，删不了（§9.3）。
         # 上面那行 get_workflow 不能省：它挡在 _abort_live_rows 之前，store 层

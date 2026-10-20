@@ -36,6 +36,7 @@ from openpyxl import Workbook
 import app as svc
 import auth
 import db
+import reflection
 import store
 import workflow as wfmod
 
@@ -756,6 +757,28 @@ def test_delete_workflow_keeps_other_workflows_files(client, auth_headers, one_w
     assert client.delete(f"/api/workflows/{wid}",
                          headers=auth_headers).status_code == 200
     assert other_src.exists(), "删一个工作流把别人的源表也删了"
+
+
+def test_delete_workflow_removes_its_rows_reflection_bodies(client, auth_headers,
+                                                            one_workflow):
+    """**删工作流要把那些行的反思正文一起删掉。**
+
+    行任务是被**外键级联**删掉的（tasks.workflow_id ON DELETE CASCADE），
+    不走「删任务」那条路——所以它们的正文得由删工作流这条路径自己清。
+    级联只管数据库，管不到文件：正文留在盘上就成了没人认领的残留
+    （实测：删一个跑过的工作流，六行的 task-N.md 全留在 reflections/ 里）。
+    """
+    wid, row = one_workflow["id"], one_workflow["row_id"]
+    body = reflection.body_path(row)
+    body.parent.mkdir(parents=True, exist_ok=True)
+    body.write_text("# 反思 · 演示\n", encoding="utf-8")
+    store.create_reflection(row, str(body))
+    assert body.exists(), "夹具本身没把正文写出来"
+
+    r = client.delete(f"/api/workflows/{wid}", headers=auth_headers)
+    assert r.status_code == 200
+    assert not body.exists(), (
+        "行任务的反思正文留在盘上了：级联只清数据库，正文成了没人认领的残留")
 
 
 def test_delete_aborts_live_row_before_dropping_record(client, auth_headers,
