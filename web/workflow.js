@@ -128,6 +128,8 @@ function isFailedRow(row, skips) {
 
 let wfId = null;
 let wfSheet = "";
+/** 工作流名字：批量下载时用它拼下载文件名（「产物包_研发失败项目汇总表.zip」）。 */
+let wfName = "";
 /* 详情页最近一次拿到的整份数据。「只看失败行」切的是**重绘**，所以得留一份，
    否则点一下筛选就得重新打一次接口——而筛选本身不该产生任何副作用。 */
 let lastDetail = null;
@@ -335,6 +337,7 @@ async function openDetail(id) {
   $("#wf-detail").hidden = false;
   const wf = d.workflow;
   wfSheet = wf.sheet || "";
+  wfName = wf.name || "";
   lastDetail = d;
   picked = -1;
   $("#wf-name").textContent = wf.name;
@@ -368,6 +371,12 @@ async function openDetail(id) {
   // 规格 7.1 要的是「随时能下载**当前进度**」——有一份就够下。
   $("#wf-download").hidden = !wf.result_ready;
   $("#wf-download").href = `/api/workflows/${id}/result.xlsx`;
+  // 批量产物包：件数与总大小由服务端算，**没有包就不给入口**（点下去必然 404）。
+  const pk = $("#wf-packages");
+  pk.hidden = !d.packages_count;
+  pk.textContent = d.packages_count
+    ? `下载全部产物包（${d.packages_count} 个 · ${fmtBytes(d.packages_bytes)}）`
+    : "下载全部产物包";
 
   // 动作按状态开关：跑完了再点开始没有意义，422/静默空转都不好看。
   // 「继续」只在 paused 可点——它在别的状态下要么 422 要么是空转，
@@ -630,9 +639,67 @@ async function downloadResult() {
   URL.revokeObjectURL(url);
 }
 
+/** 体积显示：字节 → 人看得懂的样子。 */
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1048576) return `${(v / 1024).toFixed(0)} KB`;
+  if (v < 1073741824) return `${(v / 1048576).toFixed(1)} MB`;
+  return `${(v / 1073741824).toFixed(2)} GB`;
+}
+
+/**
+ * 批量下载这一批所有行的产物包（服务端打成一个 zip，每行一个子文件）。
+ *
+ * **大文件不能走 blob()**：blob 会把整个包读进浏览器内存，61 行的产物包
+ * 加起来几个 GB，浏览器会直接崩（而且崩在下载开始之前，什么都没下下来）。
+ * 所以优先用 File System Access 直接流式写盘——http://127.0.0.1 属于安全
+ * 上下文，Edge/Chrome 都支持 showSaveFilePicker。
+ *
+ * **保存位置必须在发请求之前问**：showSaveFilePicker 需要用户手势，而
+ * await 一次请求（服务端要打包几十 GB）会把手势耗掉，那时再弹就是
+ * SecurityError。所以顺序是：先选位置，再请求，再写盘。
+ * 拿不到这个 API（老浏览器）就退回 fetch+blob——小批量时完全够用。
+ */
+async function downloadPackages() {
+  const name = `产物包_${wfName || "工作流"}.zip`;
+  let handle = null;
+  if (window.showSaveFilePicker) {
+    try {
+      handle = await window.showSaveFilePicker({ suggestedName: name });
+    } catch (e) {
+      return;                       // 用户取消，不是错误
+    }
+  }
+  const r = await fetch(apiBase() + `/api/workflows/${wfId}/packages`,
+                        { headers: authHeaders() });
+  if (!r.ok) throw await errFrom(r);
+  if (handle) {
+    const w = await handle.createWritable();
+    await r.body.pipeTo(w);
+    say("已开始下载 " + name);
+    return;
+  }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 20000);
+  say("已开始下载 " + name);
+}
+
 $("#wf-download").addEventListener("click", (e) => {
   e.preventDefault();
   guard("下载结果表", downloadResult);
+});
+
+$("#wf-packages").addEventListener("click", (e) => {
+  e.preventDefault();
+  guard("下载全部产物包", downloadPackages);
 });
 
 /* 角色选择器里的五颗按钮在页面加载时就建好：它们不依赖任何一份行数据，

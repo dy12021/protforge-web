@@ -144,3 +144,53 @@ def test_other_tasks_work_dir_is_never_scanned(owner, work_outputs):
 
     assert "only_b.txt" in names_b
     assert "only_a.txt" not in names_b, "串任务了"
+
+
+def test_virtualenv_is_not_an_artifact(owner, work_outputs):
+    """agent 为了算这一行自己装的 venv **不是交付物**。
+
+    真机事故（2026-10-20）：一行算完打包出来 94 MB，里面九成是
+    ``venv_calc/Lib/site-packages`` 里的 wheel（3489 个文件、260 MB）。
+    一批 61 行按这个打法的包加起来是几个 GB 的重复环境——用户下完还得自己删。
+
+    判据用**结构标记**（``pyvenv.cfg``），不用目录名：名字可以随便起，
+    有 pyvenv.cfg 的才是虚拟环境。
+    """
+    _root, work = work_outputs
+    tid = _task(owner)
+    d = work / str(tid)
+    site = d / "venv_calc" / "Lib" / "site-packages" / "numpy"
+    site.mkdir(parents=True, exist_ok=True)
+    (d / "venv_calc" / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+    (site / "__init__.py").write_text("# numpy\n", encoding="utf-8")
+    (site / "core.py").write_text("# core\n", encoding="utf-8")
+    _write_work_file(work, tid, "deliverables.txt", "真结果\n")
+
+    found = {r["name"] for r in artifacts.discover(tid)}
+
+    assert "deliverables.txt" in found, found
+    assert "__init__.py" not in found, "虚拟环境里的文件被当成产物了"
+    assert "core.py" not in found, found
+    assert not any("numpy" in n for n in found), found
+
+    # 打包出来的 zip 里也不能有
+    out = artifacts.package(tid)
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+    assert "deliverables.txt" in names, names
+    assert not any(n.startswith("venv_calc/") for n in names), names
+
+
+def test_pycache_is_not_an_artifact(owner, work_outputs):
+    """编译出来的字节码不是交付物。"""
+    _root, work = work_outputs
+    tid = _task(owner)
+    d = work / str(tid) / "scripts" / "__pycache__"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "fold.cpython-313.pyc").write_bytes(b"\x00\x01")
+    _write_work_file(work, tid, "fold.py", "print(1)\n")
+
+    found = {r["name"] for r in artifacts.discover(tid)}
+
+    assert "fold.py" in found, found
+    assert "fold.cpython-313.pyc" not in found, found

@@ -162,6 +162,23 @@ def _window(task: dict, started_at, ended_at) -> tuple[float, float]:
     return lo, hi
 
 
+def _under_venv(work: Path, rel: Path) -> bool:
+    """这个文件是不是落在某个虚拟环境里（那个目录里有 pyvenv.cfg）。
+
+    **用结构标记而不是目录名**：目录可以叫 venv_calc、env、.venv、py3，
+    但只有带 ``pyvenv.cfg`` 的才是 Python 虚拟环境——判据落在事实上，
+    不落在命名习惯上。
+    """
+    for i in range(1, len(rel.parts)):
+        d = work.joinpath(*rel.parts[:i])
+        try:
+            if (d / "pyvenv.cfg").is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def discover(task_id: int, started_at=None, ended_at=None) -> list[dict]:
     """扫 outputs 找产物，登记进 artifacts 表，返回**本次发现**的行。
 
@@ -247,6 +264,17 @@ def discover(task_id: int, started_at=None, ended_at=None) -> list[dict]:
             if rel.parts and rel.parts[0] == ".pi-agent":
                 continue
             if f.name in ("brief.md", "pack_spec.json"):
+                continue
+            # **虚拟环境不是交付物**：agent 为了算这一行自己装了一个 venv
+            # （实测 venv_calc/ 260 MB、3489 个文件），它整棵进包的话，一个包
+            # 九成体积是 site-packages 里的 wheel——一批 61 行打包下来是几个 GB
+            # 的重复环境，用户拿到手还得自己删。
+            # 判据用**结构标记**而不是目录名：名字可以随便起，目录里有
+            # pyvenv.cfg 的才是虚拟环境。
+            if _under_venv(work, rel):
+                continue
+            # 编译出来的字节码同理：不是交付物，还会白占体积。
+            if "__pycache__" in rel.parts:
                 continue
             # 显示名用文件名本身：store.artifacts.add 禁止 name 里带分隔符
             # （它会变成 zip 的 arcname，放行等于开路径穿越）。目录结构由

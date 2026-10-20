@@ -25,8 +25,11 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Literal
 
@@ -35,6 +38,7 @@ from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import artifacts
@@ -354,6 +358,44 @@ def _wf_view(wf: dict, stats: dict | None = None) -> dict:
         out["current_row"] = stats["current_row"]
         out["current_status"] = stats["current_status"]
     return out
+
+
+def _row_packages(workflow_id: int) -> list[tuple[dict, Path]]:
+    """这一批里**现在就能下载**的行产物包：行任务 + 包文件路径。
+
+    判据三条，都跟单任务下载端点同源：
+    ① 行任务有 package_path（没打包完的行没有）；
+    ② 路径过 guards.resolve_package（只认本任务自己的那一个包，
+       别人任务的文件、packages 目录下的别的文件都进不来）；
+    ③ 文件真的在。
+
+    为什么单独一个函数：详情端点要报**件数与总大小**（前端据此显示
+    「N 个 · X MB」并决定要不要给入口），下载端点要报**清单**。
+    两处判据必须一致，所以只能有一份实现。
+    """
+    out: list[tuple[dict, Path]] = []
+    for row in store.list_workflow_rows(workflow_id):
+        raw = (row.get("package_path") or "").strip()
+        if not raw:
+            continue
+        try:
+            real = guards.resolve_package(int(row["id"]), raw)
+        except guards.Violation:
+            continue
+        if real.is_file():
+            out.append((row, real))
+    return out
+
+
+def _zip_entry_name(text: str) -> str:
+    """把源表里的值变成能当 zip 条目名的片段。
+
+    zip 条目名里带 ``/`` 会被当成子目录，带 ``\\`` 和控制字符更糟。
+    所以只保留「非路径分隔符、非控制字符」的那些，其余换成下划线。
+    """
+    cleaned = "".join(c if (c.isprintable() and c not in '/\\:*?"<>|') else "_"
+                      for c in str(text or ""))
+    return cleaned.strip().strip(".")[:60] or "未命名"
 
 
 # 行任务里「还没收工」的那些状态。**从 db 里推，不另抄一份词表**：抄一份的话，
@@ -899,10 +941,15 @@ def create_public_app() -> FastAPI:
         is_admin = user["role"] == "admin"
         wf = store.get_workflow(workflow_id, owner_id=user["id"],
                                 is_admin=is_admin)
+        pkgs = _row_packages(workflow_id)
         return {"workflow": _wf_view(wf),
                 "columns": store.list_workflow_columns(workflow_id),
                 "skips": sorted(store.list_workflow_skips(workflow_id)),
-                "rows": store.list_workflow_rows(workflow_id)}
+                "rows": store.list_workflow_rows(workflow_id),
+                # **产物包件数与总大小**：前端据此显示「N 个 · X MB」并决定
+                # 要不要给下载入口。少了它，用户只能先点进去才知道有没有东西可下。
+                "packages_count": len(pkgs),
+                "packages_bytes": sum(p.stat().st_size for _, p in pkgs)}
 
     @app.get("/api/workflows/{workflow_id}/preview")
     def preview_workflow(workflow_id: int,
@@ -1008,6 +1055,71 @@ def create_public_app() -> FastAPI:
         return FileResponse(path, filename=path.name,
                             media_type=("application/vnd.openxmlformats-"
                                         "officedocument.spreadsheetml.sheet"))
+
+    @app.get("/api/workflows/{workflow_id}/packages")
+    def download_workflow_packages(workflow_id: int,
+                                    user=Depends(auth.current_user)):
+        """把这一批所有行的**产物包**打成一个 zip 下载（每行一个子文件）。
+
+        为什么要有这个：结果表（result.xlsx）只是**状态与摘要**，真正的交付物
+        在每行各自的产物包里（结构、序列、脚本、报告）。一批 61 行就是一个
+        一个下——其中一行就 90 MB，下到什么时候是个问题；而且逐个下很容易
+        漏掉几行，漏掉的那些行在表上看着像「跑过了」。
+
+        **压缩方式用 ZIP_STORED**：里面装的本来就是 zip，再压一遍只烧 CPU
+        （几百 MB 的文件反复 deflate）而几乎不省空间——实测省不到 3%。
+        """
+        wf = store.get_workflow(workflow_id, owner_id=user["id"],
+                                is_admin=user["role"] == "admin")
+        items = _row_packages(workflow_id)
+        if not items:
+            raise PreciseHTTPException(404, "这一批还没有可下载的产物包")
+        total = sum(p.stat().st_size for _, p in items)
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="wf-pkgs-"))
+        free = shutil.disk_usage(tmpdir).free
+        if total > free:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise PreciseHTTPException(
+                507, f"临时磁盘装不下这一批的产物包（需要 {total // 1048576} MB，"
+                     f"只剩 {free // 1048576} MB）。可以先只下几行的，或把临时目录挪到数据盘。")
+        out_zip = tmpdir / f"{_zip_entry_name(wf['name'])}-产物包.zip"
+        # 每行的文件名：第 N 行 + 源表里的关键列值（编号），免得下载完
+        # 一堆「第1行.zip」「第2行.zip」还得自己对着表认。
+        import workflow as wfmod
+        source = Path(wf["source_path"])
+        view = wfmod.read_source(source, header_row=int(wf["header_row"]))
+        key_col = int(wf["key_col"] or 0)
+        # 文件名里的标识信息：关键列的值 + **这一行各 slot 的值**。
+        # slot 就是用户在表里填的那几列（种属、靶标名那些）——只给「第3行_17」
+        # 的话，61 个包下完用户还得自己对着表认；带上 slot 值就能一眼看出
+        # 哪个包是哪个靶标。
+        slot_cols = sorted(
+            (c for c in store.list_workflow_columns(workflow_id)
+             if c["role"] in ("input", "context") and c.get("slot")),
+            key=lambda c: int(c["col_index"]))
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_STORED,
+                             allowZip64=True) as zf:
+            for row, path in items:
+                idx = int(row.get("workflow_row") or 0)
+                values: dict = {}
+                try:
+                    values = wfmod.row_values(source, view, idx)
+                except Exception:       # noqa: BLE001 - 读不到就只用行号
+                    values = {}
+                key = str(values.get(key_col, "") or "").strip()
+                name = f"第{idx + 1}行"
+                if key:
+                    name += "_" + _zip_entry_name(key)
+                for c in slot_cols:
+                    v = str(values.get(int(c["col_index"]), "") or "").strip()
+                    if v:
+                        name += "_" + _zip_entry_name(v)
+                zf.write(path, arcname=name[:80] + ".zip")
+        # 传完就删：临时目录留着就是垃圾（几十 GB 的包放在那里没人会知道）。
+        return FileResponse(out_zip, filename=out_zip.name,
+                            media_type="application/zip",
+                            background=BackgroundTask(shutil.rmtree, tmpdir, True))
 
     @app.delete("/api/workflows/{workflow_id}")
     def delete_workflow(workflow_id: int, user=Depends(auth.current_user)):
