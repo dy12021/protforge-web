@@ -435,6 +435,32 @@ def test_archive_marks_every_row_individually(disp, tmp_path):
     assert _archived(r1["id"]) == 1
 
 
+def test_archive_job_does_not_archive_a_row_that_is_no_longer_terminal(disp, tmp_path):
+    """重跑中的行不能被**在途的**归档 job 归档。
+
+    归档 job 是**入队后异步执行**的：入队时这一行是终态，可它真正执行的
+    那一刻，管理员可能已经把它「重跑」放回 queued（status 变了、
+    workflow_archived 被清成 0）。这时候再归档就会把**上一轮的结果**写回
+    结果表并把 archived 置 1 —— 于是这一轮的新结果永远不写回表，
+    而平台上看起来一切正常（规格 6.5 那一族）。
+
+    真机踩过：2026-10-20 管理员重投第 1 行时，上一轮入队的归档 job 正好
+    在途，把这一行又归档了一次，result.xlsx 里留着上一轮的 failed，
+    而这一轮跑完的新结果再也写不回去。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=1)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    # 终态且未归档 → 归档 job 会认领它
+    store.update_task(r0["id"], status="failed", workflow_archived=0)
+    # 管理员「重跑」：状态回到 queued，archived 被清成 0
+    store.update_task(r0["id"], status="queued", workflow_archived=0)
+    disp._archive_job(wf["id"], r0["id"])
+    assert _archived(r0["id"]) == 0, \
+        "重跑中的行被归档了：这一轮的新结果永远写不回表，而界面上看不出来"
+
+
 def test_locked_result_file_leaves_row_retryable(disp, tmp_path, monkeypatch):
     """文件被 Excel 占住 → **不置位**、留待重试。
 

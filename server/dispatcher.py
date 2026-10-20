@@ -1655,6 +1655,15 @@ class Dispatcher:
                 return
             if int(row.get("workflow_archived") or 0):
                 return
+            # **状态也必须重读校验**：入队时这一行是终态，可入队到真正执行之间
+            # 它可能���管理员「重跑」放回 queued（status 变了、workflow_archived
+            # 被清成 0）。这时候再归档，就会把**上一轮的结果**写回结果表并把
+            # archived 置 1 —— 于是这一轮的新结果永远不写回表，而平台上看起来
+            # 一切正常（规格 6.5 那一族）。
+            # 真机踩过：2026-10-20 管理员重投第 1 行时，上一轮入队的归档 job
+            # 正好在途，把这一行又归档了一次，result.xlsx 里留着上一轮的 failed。
+            if row.get("status") not in db.TERMINAL_STATUSES:
+                return
             self._archive_one(wf, row)
             try:
                 # writeback_pending 的语义就是「还有没有终态没归档的行」。写成功一
