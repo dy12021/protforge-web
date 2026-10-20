@@ -408,3 +408,13 @@ node guards.test.mjs
 
 设计规格在 `docs/superpowers/specs/2026-10-16-protforge-web-design.md`，
 实施计划在 `docs/superpowers/plans/2026-10-16-protforge-web.md`，代码注释大量引用它们的章节号。
+
+## 许可证
+
+平台本身的代码以 **MIT** 发布（见 [`LICENSE`](LICENSE)）。
+
+它**不**替第三方工具授权：平台调用的是
+[dy12021/protforge](https://github.com/dy12021/protforge) 里的技能脚本，
+那些脚本包装的第三方工具各自遵循其原始许可（ESMFold2 / ESMC 为 MIT、
+OpenDDE 为 Apache-2.0 等），逐项清单见该仓的「许可与出处」一节与
+`skills/protforge-sandwich-antibody/references/license-registry.md`。
