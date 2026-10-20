@@ -31,6 +31,7 @@ import uvicorn
 import auth
 import artifacts
 import db
+import reflection
 import store
 import app as svc
 
@@ -555,6 +556,50 @@ def test_delete_keeps_task_on_disk(public):
     r = public.delete("/api/tasks/%d" % task["id"], headers=bearer(tok))
     assert r.status_code == 200
     assert path.exists(), "delete 不该碰磁盘，磁盘残留交给 janitor"
+
+
+def test_delete_task_removes_its_reflection_body(public):
+    """**删任务要把反思正文一起删掉。**
+
+    删任务会级联删掉 reflections 里那一条，但正文是**文件**——级联管不到它。
+    于是库里那条没了，盘上的 task-N.md 还在：没人再找得到它，也没人会清它
+    （janitor 只扫 work/uploads/logs/packages）。
+
+    留着不只是浪费盘：同一条任务**重跑**时新正文会写同一个路径，旧正文
+    混在里面时谁也说不清哪份是哪份。
+    """
+    make_user()
+    tok = login(public)
+    task = create_task(public, tok)
+    body = reflection.body_path(task["id"])
+    body.parent.mkdir(parents=True, exist_ok=True)
+    body.write_text("# 反思 · 任务 #%d\n" % task["id"], encoding="utf-8")
+    store.create_reflection(task["id"], str(body))
+    assert body.exists(), "夹具本身没把正文写出来"
+
+    r = public.delete("/api/tasks/%d" % task["id"], headers=bearer(tok))
+    assert r.status_code == 200
+    assert not body.exists(), (
+        "反思正文留在盘上了：库里那条已经没了，正文成了没人认领的残留")
+
+
+def test_delete_task_keeps_another_tasks_reflection_body(public):
+    """**只删自己那一条的正文。** 别的任务的正文一个字都不许动。"""
+    make_user()
+    tok = login(public)
+    task = create_task(public, tok)
+    keep = create_task(public, tok)
+    body = reflection.body_path(task["id"])
+    keep_body = reflection.body_path(keep["id"])
+    for p in (body, keep_body):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# 反思\n", encoding="utf-8")
+    store.create_reflection(task["id"], str(body))
+    store.create_reflection(keep["id"], str(keep_body))
+
+    r = public.delete("/api/tasks/%d" % task["id"], headers=bearer(tok))
+    assert r.status_code == 200
+    assert keep_body.exists(), "删一条任务把别人的反思正文也删了"
 
 
 def test_delete_other_owner_is_404(public):

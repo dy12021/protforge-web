@@ -246,3 +246,113 @@ def test_the_admin_api_hands_the_reason_to_the_panel(llm_box, skills):
     row_ = next(r for r in listing.json()["reflections"] if r["id"] == rec["id"])
     assert "截断" in row_.get("proposal_error", ""), \
         f"列表端点没带原因（界面上那行读的就是它）：{row_}"
+
+
+# --- 纯折行：模型顺手重排没提到的段落 -----------------------------------------
+#
+# 模型要输出的是**完整新文件**，它于是把没提到的段落也重新排了一遍：把三行
+# 折成两行、把 ``*not*`` 写成 ``**not**``。那些改动与这次反馈毫无关系，
+# 却会整段出现在 diff 里——而「看 diff 再决定」这条写路径的**全部前提**就是
+# diff 里只有这次反馈真正要的改动。
+#
+# 真机上量过：一份真方案 3 个 hunk，只有 1 个是反馈要的，另外 2 个是纯折行。
+
+ORIGINAL_SKILL = (
+    "---\nname: protforge-demo\ndescription: 演示技能\n---\n\n"
+    "## 用法\n"
+    "第一行文字在这里。第二行文字也在这里。第三行文字还在这里。\n\n"
+    "## 别的\n"
+    "这一段也在这里。\n"
+)
+
+
+def _write_skill(skills: Path, text: str) -> Path:
+    p = skills / "skills" / SKILL / "SKILL.md"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _proposal_files(rid: int) -> tuple[pathlib.Path, pathlib.Path]:
+    patch = pathlib.Path(store.get_reflection(rid)["proposal"])
+    return patch, patch.with_suffix(".new")
+
+
+def test_a_reflowed_paragraph_is_put_back_the_way_it_was(llm_box, skills):
+    """**没提到的段落被重新折行 → 还原回原文。**
+
+    折行本身不是错，但它跟这次反馈无关：管理员在 diff 里看到它，得自己
+    判断「这条能不能放行」——而看 diff 的前提是 diff 只含该有的改动。
+    """
+    _write_skill(skills, ORIGINAL_SKILL)
+    llm_box["text"] = (
+        "---\nname: protforge-demo\ndescription: 演示技能\n---\n\n"
+        "## 用法\n"
+        "第一行文字在这里。第二行文字也在这里。\n"
+        "第三行文字还在这里。\n\n"
+        "## 别的\n"
+        "这一段也在这里。\n\n"
+        "## 调用记录\n"
+        "每次调用都留记录。\n")
+    rec = _tool_gap_reflection()
+    reflection.build_proposal(rec["id"], TARGET)
+
+    patch, new_path = _proposal_files(rec["id"])
+    got = new_path.read_text(encoding="utf-8")
+    assert "第一行文字在这里。第二行文字也在这里。第三行文字还在这里。\n" in got, \
+        f"没提到的段落被模型重新折了行：{got!r}"
+    assert "## 调用记录" in got, "真改动被当成噪声抹掉了"
+    diff = patch.read_text(encoding="utf-8")
+    assert "第二行文字也在这里。" not in diff or \
+        "第一行文字在这里。第二行文字也在这里。第三行文字还在这里。" in got, \
+        f"diff 里混进了与反馈无关的折行：{diff!r}"
+    assert "## 调用记录" in diff, f"diff 里没有真改动：{diff!r}"
+
+
+def test_a_changed_emphasis_is_treated_as_a_reflow_not_a_change(llm_box, skills):
+    """**`*not*` 写成 `**not**` 算折行，不算改动。**
+
+    说的是同一件事，只是换了一种强调写法。留着它，diff 里就会多出一段
+    管理员根本没要求过的改动。
+    """
+    original = ("---\nname: protforge-demo\n---\n\n## 别的\n"
+                "`rm` 在 ext4 里*不会*告诉 VHDX 后端，所以条目还在。\n")
+    _write_skill(skills, original)
+    llm_box["text"] = ("---\nname: protforge-demo\n---\n\n## 别的\n"
+                        "`rm` 在 ext4 里**不会**告诉 VHDX 后端，所以条目还在。\n\n"
+                        "## 新增\n加一段。\n")
+    rec = _tool_gap_reflection()
+    reflection.build_proposal(rec["id"], TARGET)
+
+    patch, new_path = _proposal_files(rec["id"])
+    got = new_path.read_text(encoding="utf-8")
+    assert "*不会*告诉" in got, \
+        f"只改了强调写法的段落没被还原：{got!r}"
+    assert "## 新增" in got, "真改动被当成噪声抹掉了"
+
+
+def test_a_proposal_with_only_reflow_says_it_needs_a_human(llm_box, skills):
+    """**「只做了纯排版」与「模型说不用改」要分开说。**
+
+    前者是「自动落地不了，得人工来」，后者是「这条根本不是工具意见，
+    该否决」。混成一句话，管理员连下一步该做什么都不知道。
+    """
+    _write_skill(skills, ORIGINAL_SKILL)
+    llm_box["text"] = (
+        "---\nname: protforge-demo\ndescription: 演示技能\n---\n\n"
+        "## 用法\n"
+        "第一行文字在这里。第二行文字也在这里。\n"
+        "第三行文字还在这里。\n\n"
+        "## 别的\n"
+        "这一段也在这里。\n")
+    rec = _tool_gap_reflection()
+
+    with pytest.raises(reflection.ReflectionError):
+        reflection.build_proposal(rec["id"], TARGET)
+
+    got = store.get_reflection(rec["id"])
+    assert got["proposal_state"] == "failed", got
+    assert "折了行" in got["proposal_error"], \
+        f"没区分「只做了纯排版」与「模型说不用改」：{got!r}"
+    assert "否决" not in got["proposal_error"], \
+        f"只做了纯排版却被说成「该否决」：{got!r}"
+

@@ -503,6 +503,9 @@ class AgentProc:
     seq: int = 0                             # 事件自增序号（stream 的游标）
     dropped: int = 0                         # 事件缓冲溢出丢弃数
     last_rpc_id: str | None = None
+    #: 模型最后一段纯文本回复。agent 自己结束而没调 finish 时，**它就是
+    #: 唯一的结论**——不拿它当摘要，这条任务就只剩一句「没报收口」。
+    last_reply: str = ""
 
     events: collections.deque = field(default_factory=collections.deque, repr=False)
     responses: dict = field(default_factory=dict, repr=False)
@@ -1968,12 +1971,86 @@ class Dispatcher:
                     self._deliver_response(ap, obj)
                 else:
                     self._push_event(ap, obj)
+                self._note_agent_output(ap, obj)
         except (OSError, ValueError) as e:
             log.warning("读取 %s 的 stdout 结束：%s", ap.task_id, e)
         finally:
             with ap.cond:
                 ap.eof = True
                 ap.cond.notify_all()
+
+    def _note_agent_output(self, ap: AgentProc, obj: dict) -> None:
+        """从 stdout 事件里记住两件事：**模型说了什么**、**它自己结束了**。
+
+        ① 模型最后一段纯文本：agent 自己结束而没调 finish 时，这就是唯一的
+        结论（见 :meth:`_on_agent_settled`）。只取纯文本段落：工具调用参数
+        里的 JSON 不是给人看的话。
+
+        ② ``agent_settled``：这一轮模型**自己结束**了。正常收口时 agent 会先
+        调 finish（那时 finished 标记已经落库），所以只有在「没有收口标记」
+        的情况下它才意味着「模型答完就停了」。
+        """
+        etype = obj.get("type")
+        if etype == "message_end":
+            msg = obj.get("message")
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                parts = msg.get("content")
+                text = "".join(
+                    str(part.get("text") or "")
+                    for part in (parts if isinstance(parts, list) else [])
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ).strip()
+                if text:
+                    ap.last_reply = text
+        elif etype == "agent_settled":
+            self._on_agent_settled(ap)
+
+    def _on_agent_settled(self, ap: AgentProc) -> None:
+        """agent 自己把这一轮**结束**了，却没报收口。
+
+        这是真机上抓到的一条卡死：模型答完话就停在那里，不调 ``finish``
+        （实测 stdout：只回了一句 "2"，一个工具调用都没有），于是：
+
+        * 进程还挂在 ``runRpcMode`` 上等 stdin → 任务永远停在「计算中」，
+          直到技能超时（4 小时）才被了结；
+        * 管理员这时候**干预不了**：steer / follow_up 只是进了队列——那一轮
+          已经结束，pi 不会再发起下一次模型调用，队列里的消息没人取
+          （实测：只有 abort 有用）。
+
+        也就是说「模型忘了调 finish」这一件事，会把一个任务变成一个既跑不完
+        又管不了的僵尸。收口这件事不能整个押在模型记不记得调工具上。
+
+        做法：看见 ``agent_settled`` 而任务**没有** finished 标记时，平台自己
+        按「已收口」处理（记标记 + 收进程），让它走正常的收尾分流——有产物
+        就交给打包（打包器对「靠时间窗兜底发现」的产物本来就不自动放行），
+        没产物就得到一句「计算结束了，但没有找到任何产物」。
+
+        **已经报过收口的（正常路径）什么都不做**：那条路已经收口了。
+        **中止过的也不动**：中止的结局由中止那条路决定。
+        """
+        if ap.settled or ap.aborted:
+            return
+        task_id = ap.task_id
+        try:
+            if store.has_finished(task_id):
+                return                          # 正常收口：finish 那条路已经处理了
+            reply = (ap.last_reply or "").strip()
+            store.add_event(
+                task_id, "note", "system",
+                "计算进程自己结束了，没有报收口（没调 finish）："
+                "平台按已收口处理，接着打包产物"
+                + (f"；模型最后的回复：{reply[:200]}" if reply else ""))
+            if reply:
+                # 摘要是给人看的一句话：模型答了什么，这里就写什么。
+                # 不写的话这条任务只剩一句「没报收口」，用户连它答了什么
+                # 都不知道——而那可能正是他要的答案。
+                store.update_task(task_id, summary=reply[:2000])
+            store.record_finished(task_id, actor="system")
+        except Exception:                     # noqa: BLE001
+            log.exception("处理 %s 的自行收口时出错", task_id)
+            return
+        # 收进程：关 stdin → agent 看到 EOF 退出 → 走正常的收尾分流。
+        self.wind_down(task_id)
 
     def _deliver_response(self, ap: AgentProc, obj: dict) -> None:
         with ap.cond:
@@ -2232,26 +2309,45 @@ class Dispatcher:
         already_terminal = task.get("status") in db.TERMINAL_STATUSES
         has_finished = store.has_finished(ap.task_id)
 
+        # **任务可能在收尾这一刻被删掉**（用户删任务，收尾线程还在写）。
+        # 那时抛出来的 NotFound 会变成一条**没人处理的线程异常**：报出来的是
+        # 「任务不存在」，跟真正的原因（任务确实被删了）不相干，而收尾线程
+        # 就此死掉，后面该做的事全落空。所以每条写库的路都自己兜住。
         if has_finished and not already_terminal:
-            store.set_status(ap.task_id, "packaging", actor="agent",
-                             message="计算进程已收口，开始打包产物")
-            store.add_event(ap.task_id, "step", "system",
-                            f"计算进程正常退出（退出码 {code}）")
+            try:
+                store.set_status(ap.task_id, "packaging", actor="agent",
+                                 message="计算进程已收口，开始打包产物")
+                store.add_event(ap.task_id, "step", "system",
+                                f"计算进程正常退出（退出码 {code}）")
+            except store.NotFound:
+                return code                        # 任务没了，没什么可收尾的
+            except Exception:                     # noqa: BLE001
+                log.exception("把任务 %s 推进 packaging 失败", ap.task_id)
             _notify()
         elif ap.aborted:
             # 进程确实被杀过，这是事实，跟收口标记没关系，照实记。
             self._mark_failed(ap.task_id, ap.abort_reason or "已由管理员中止")
-            store.add_event(ap.task_id, "log", "admin",
-                            f"中止：已杀掉进程树 pid={ap.pid}，stderr 见 {ap.stderr_path.name}")
+            try:
+                store.add_event(ap.task_id, "log", "admin",
+                                f"中止：已杀掉进程树 pid={ap.pid}，stderr 见 {ap.stderr_path.name}")
+            except store.NotFound:
+                return code
+            except Exception:                     # noqa: BLE001
+                log.exception("记录任务 %s 的中止事件失败", ap.task_id)
             _notify()
         elif already_terminal:
             # 没有中止也没有崩，任务却已是终态（管理员判失败之类）。
             # 只如实记一句，**不要替没发生过的事编一个原因**，也不动 error 字段。
             log.info("任务 %s 收尾时已是终态（%s）且已收口，不改写", ap.task_id,
                      task.get("status"))
-            store.add_event(ap.task_id, "log", "system",
-                            f"计算进程已收口，但任务此前已进入终态"
-                            f"（{task.get('status')}），保持不变")
+            try:
+                store.add_event(ap.task_id, "log", "system",
+                                f"计算进程已收口，但任务此前已进入终态"
+                                f"（{task.get('status')}），保持不变")
+            except store.NotFound:
+                return code
+            except Exception:                     # noqa: BLE001
+                log.exception("记录任务 %s 的收尾事件失败", ap.task_id)
             _notify()
         else:
             self._mark_failed(

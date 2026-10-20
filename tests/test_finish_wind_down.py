@@ -49,7 +49,15 @@ def emit(obj):
 emit({"type": "event", "event": "hello",
       "task_id": os.environ.get("PROTFORGE_TASK_ID", "")})
 
-if MODE == "stubborn":
+if MODE == "settled":
+    # **模型答完话就自己结束，没有调 finish。** 真机上最常见的一种收口缺失：
+    # stdout 里只有一段 assistant 文本 + agent_settled，一个工具调用都没有。
+    # 然后它像真 agent 一样挂在 runRpcMode 上等 stdin，永远不退出。
+    emit({"type": "message_end", "message": {"role": "assistant",
+          "content": [{"type": "text", "text": "算完了：1+1=2"}]}})
+    emit({"type": "agent_settled"})
+
+if MODE == "stubborn" or MODE == "settled":
     # 报完收口也不退：把 stdin 读干净，然后永远挂着。
     while True:
         line = sys.stdin.readline()
@@ -318,6 +326,110 @@ def test_the_wind_down_grace_is_short_enough_to_be_useful():
     assert 0 < dispatcher.WIND_DOWN_GRACE <= 30.0, (
         f"宽限期 {dispatcher.WIND_DOWN_GRACE}s 不合理："
         "太长则任务在收口后长时间停在「计算中」，太短会砍掉 agent 写最后一段的机会")
+
+
+# --- agent 自己结束、却没调 finish -------------------------------------------------------
+#
+# 这是真机上抓到的第二条卡死：模型答完话就停（stdout 里只有一段 assistant
+# 文本 + agent_settled，一个工具调用都没有），于是
+#
+#   * 进程还挂在 runRpcMode 上等 stdin → 任务永远停在「计算中」（技能超时 4 小时）；
+#   * 管理员干预不了：steer / follow_up 只进队列——那一轮已经结束，pi 不会再
+#     发起下一次模型调用，队列里的消息没人取（只有 abort 有用）。
+#
+# 也就是说「模型忘了调 finish」会把一个任务变成既跑不完又管不了的僵尸。
+
+
+def _settled_task(disp, owner_id, monkeypatch) -> tuple[dict, object]:
+    """起一个**真的**在跑、而且已经自己结束（没调 finish）的任务。"""
+    monkeypatch.setenv("FAKE_AGENT_MODE", "settled")
+    t = store.create_task("自行收口", "模型答完就停了", owner_id)
+    disp.tick()
+    ap = disp.running[t["id"]]
+    assert ap.proc.poll() is None, "假 agent 没起来"
+    store.set_status(t["id"], "running", actor="system", message="计算进程已启动")
+    return t, ap
+
+
+def test_an_agent_that_settles_without_finish_still_closes_the_task(
+        disp, owner_id, monkeypatch):
+    """**没调 finish 也必须收口**，而且要收成「已收口」而不是「卡住」。
+
+    平台不能把收口整件事押在模型记不记得调工具上：模型忘了调，任务就不该
+    永远停在「计算中」，更不该到 4 小时后才被了结。
+    """
+    monkeypatch.setattr(dispatcher, "WIND_DOWN_GRACE", 0.5)
+    t, ap = _settled_task(disp, owner_id, monkeypatch)
+
+    assert wait_for(lambda: store.has_finished(t["id"])), (
+        "agent 自己结束了却没人收口：任务会永远停在「计算中」")
+    assert wait_for(lambda: ap.proc.poll() is not None), (
+        "收口之后进程还活着")
+    assert wait_for(lambda: store.get_task(t["id"])["status"] == "packaging"), (
+        f"状态没进 packaging，实际 {store.get_task(t['id'])['status']}")
+
+
+def test_the_models_own_words_become_the_summary_when_it_never_called_finish(
+        disp, owner_id, monkeypatch):
+    """**模型答的那句话要留下来。**
+
+    没调 finish 时，模型的回复就是这一轮唯一的结论。不把它当摘要，这条任务
+    就只剩一句「没报收口」——用户连它到底答了什么都不知道，而那可能正是
+    他要的东西。
+    """
+    monkeypatch.setattr(dispatcher, "WIND_DOWN_GRACE", 0.5)
+    t, _ap = _settled_task(disp, owner_id, monkeypatch)
+
+    assert wait_for(lambda: store.has_finished(t["id"]))
+    summary = (store.get_task(t["id"]).get("summary") or "").strip()
+    assert summary == "算完了：1+1=2", f"模型自己说的话没被留下：{summary!r}"
+
+    events = [(e["kind"], e["message"]) for e in store.list_events(t["id"])]
+    assert any(k == "note" and "没有报收口" in m for k, m in events), \
+        f"时间线上没说清它是怎么结束的：{events}"
+
+
+def test_a_task_that_already_finished_is_not_touched_by_the_settle(
+        disp, owner_id, monkeypatch):
+    """**已经报过收口的（正常路径）什么都不做。**
+
+    正常收口时 agent 调 finish、标记落库，之后进程退出也会带来 agent_settled。
+    那时候平台再收一次，就是把一次正常收口说成「模型自己结束的」。
+    """
+    monkeypatch.setattr(dispatcher, "WIND_DOWN_GRACE", 0.5)
+    t = store.create_task("正常收口", "先 finish 再 settled", owner_id)
+    disp.tick()
+    ap = disp.running[t["id"]]
+    store.set_status(t["id"], "running", actor="system", message="计算进程已启动")
+    store.update_task(t["id"], summary="agent 自己报的收口")
+    store.record_finished(t["id"], actor="agent")
+
+    # 让它也发出 agent_settled：真实路径里 finish 之后进程退出前就是这一串。
+    disp._note_agent_output(ap, {"type": "agent_settled"})
+
+    assert (store.get_task(t["id"]).get("summary") or "") == "agent 自己报的收口", \
+        "正常收口的摘要被 agent_settled 那条路改掉了"
+    kinds = [e["kind"] for e in store.list_events(t["id"])]
+    assert kinds.count("finished") == 1, kinds
+    assert not any(e["kind"] == "note" and "没有报收口" in e["message"]
+                   for e in store.list_events(t["id"])), \
+        "正常收口被说成「模型自己结束的」"
+
+
+def test_an_aborted_task_is_not_closed_by_the_settle(disp, owner_id, monkeypatch):
+    """**中止过的任务不归这条路径管。**
+
+    中止的结局由中止那条路决定；这里再收一次，就是把「用户中止了任务」
+    改写成「平台按已收口处理」。
+    """
+    monkeypatch.setattr(dispatcher, "WIND_DOWN_GRACE", 0.5)
+    t, ap = _settled_task(disp, owner_id, monkeypatch)
+    ap.aborted = True
+    ap.abort_reason = "用户中止了任务"
+
+    time.sleep(0.5)
+    assert not store.has_finished(t["id"]), \
+        "被中止的任务被这条路径收成了「已收口」"
 
 
 if os.name != "nt":

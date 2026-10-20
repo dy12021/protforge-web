@@ -43,6 +43,7 @@ import db
 import dispatcher
 import guards
 import janitor
+import reflection
 import skills_index
 import sse
 import store
@@ -209,13 +210,99 @@ def _delete_task_row(task_id: int) -> None:
     **只删数据库**：work/<id>/、uploads/<id>/、packages/ 一律不动，磁盘清理由
     janitor.py 负责（7/14/30 天保留）。数据库里查不到的东西仍然可以回收，
     反过来则不然。
+
+    **但反思正文不在这个约定里**：它不是「工作区的产物」，而是那条反思记录
+    自己的正文——记录被级联删掉，正文就成了没人认领的残留（见
+    :func:`_purge_reflection_files`）。所以删任务时顺手把它清掉。
     """
+    _purge_reflection_files(task_id)
     c = db.connect()
     try:
         with c:
             c.execute("DELETE FROM tasks WHERE id = ?", (int(task_id),))
     finally:
         c.close()
+
+
+# --- 删干净：磁盘上的残留 --------------------------------------------------------------
+#
+# 两条删除路径原来都只删数据库，于是盘上留下了没人认领的文件：
+#   * 删工作流 → 源表与结果表还在 data/workflows/<id>/；
+#   * 删任务 → 反思正文还在 data/reflections/task-N.md。
+#
+# janitor 也不管这两块（它只扫 work/uploads/logs/packages），所以不自己清，
+# 就再没有人清。留着不只是浪费盘：工作流的结果表里还有上一批的结果，
+# 而反思正文留着，下一次同一条任务重跑时新旧正文会混在同一个路径上。
+
+
+def _unlink_under(base: Path, path: Path) -> bool:
+    """删一个文件，但**只在它真的落在 base 底下时才删**。
+
+    位置闸不是形式主义：路径来自数据库，而数据库里的路径只说明「是哪个文件」，
+    不说明「可以删哪儿」。janitor 也是这么判的（它直接复用 guards._within）。
+    """
+    try:
+        real = Path(guards._resolve(path))
+        root = Path(guards._resolve(base))
+    except (guards.Violation, OSError, ValueError, RuntimeError):
+        return False
+    if real == root or not guards._within(real, root):
+        log.warning("路径 %s 不在 %s 底下，不删", real, root)
+        return False
+    try:
+        real.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        log.warning("删不掉 %s：%s", real, e)
+        return False
+
+
+def _purge_workflow_files(wf: dict) -> None:
+    """把工作流留在盘上的东西删掉：源表、结果表，以及它们所在的目录。
+
+    目录**空了才删**：里面还有别的东西时留着（不猜、不递归删）。
+    """
+    base = _workflow_root()
+    for key in ("source_path", "result_path"):
+        raw = (wf.get(key) or "").strip()
+        if raw:
+            _unlink_under(base, Path(raw))
+    try:
+        d = base / str(int(wf["id"]))
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+
+def _purge_reflection_files(task_id: int) -> None:
+    """把一条任务留下的反思正文删掉。
+
+    删任务会级联删掉 reflections 里那一条（外键 ON DELETE CASCADE），但**正文
+    是文件**——级联管不到它。于是库里那条没了，盘上的 task-N.md 还在：没人再
+    找得到它，也没人会清它。
+
+    方案文件（refl-<id>.patch / .new）跟那条反思一起走：它们是那条反思的
+    派生物，同样没人认领。
+    """
+    try:
+        rec = store.get_reflection_by_task(task_id)
+    except Exception:                                 # noqa: BLE001
+        rec = None
+    if not rec:
+        return
+    body = (rec.get("path") or "").strip()
+    if body:
+        _unlink_under(reflection.reflections_dir(), Path(body))
+    try:
+        rid = int(rec.get("id"))
+    except (TypeError, ValueError):
+        return
+    for name in (f"refl-{rid}.patch", f"refl-{rid}.new"):
+        _unlink_under(reflection.proposals_dir(),
+                      reflection.proposals_dir() / name)
 
 
 # ---------------------------------------------------------------- 工作流
@@ -932,7 +1019,7 @@ def create_public_app() -> FastAPI:
         `_db_status` 返回 ""、`_abort_signal` 因 "" not in TERMINAL_STATUSES 直接
         返回 None，调度器不会去杀它——所以顺序反了还会留下一个烧到自然结束的僵尸。
         """
-        store.get_workflow(workflow_id, owner_id=user["id"])    # 越权 → 404
+        wf = store.get_workflow(workflow_id, owner_id=user["id"])    # 越权 → 404
         _abort_live_rows(workflow_id)
         _settle_abort_signal(dispatcher.POLL_INTERVAL * 3)
         # 归属参数必须传：store 层默认拒绝（owner_id=None → NotFound）。
@@ -940,6 +1027,9 @@ def create_public_app() -> FastAPI:
         # 上面那行 get_workflow 不能省：它挡在 _abort_live_rows 之前，store 层
         # 的闸门在删除那一刻才生效，那时别人的计算已经被杀过了。
         store.delete_workflow(workflow_id, owner_id=user["id"])
+        # 盘上的源表与结果表一起清：只删数据库的话它们会永远留在
+        # data/workflows/<id>/，用户以为删干净了，实际上那些表还在。
+        _purge_workflow_files(wf)
         sse.notify()
         return {"ok": True}
 

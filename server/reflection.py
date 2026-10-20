@@ -550,7 +550,10 @@ PROPOSE_SYSTEM = """\
 1. 只输出修改后的**完整文件内容**，不要输出任何解释、不要用 ``` 包裹、
    不要只给片段。输出会被拿去和原文逐行 diff。
 2. 改动只针对反馈里说的那一点，不要顺手重构、不要改格式、不要加别的功能。
-3. 不确定的地方保持原样。宁可少改，不要把一个能用的技能改坏。
+3. **没提到的段落必须逐字逐行原样保留**：不要重新折行、不要改强调符号
+   （*text* 与 **text** 算改动）、不要动标点。重新排版会整段出现在 diff 里，
+   而管理员看 diff 的前提是「diff 里只有这次反馈真正要的改动」。
+4. 不确定的地方保持原样。宁可少改，不要把一个能用的技能改坏。
 """
 
 _PROPOSE_FENCE = re.compile(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", re.S)
@@ -583,6 +586,69 @@ def diff_for(target: str, before: str, after: str) -> str:
     return "".join(difflib.unified_diff(
         before.splitlines(keepends=True), after.splitlines(keepends=True),
         fromfile=f"a/{target}", tofile=f"b/{target}", n=3))
+
+
+def _squash(text: str) -> str:
+    """归一化一段文字：去掉强调标记、去掉所有空白。
+
+    去掉 ``*`` 是因为 ``*not*`` 与 ``**not**`` 说的是同一件事，模型顺手换一种
+    写法不该算改动。**不去掉下划线**：``num_diffusion_samples`` 这种标识符里
+    的下划线是有意义的，去掉它会把「改了变量名」也当成「只是排版」。
+    """
+    return re.sub(r"\s+", "", text.replace("*", ""))
+
+
+_BLOCK_SPLIT = re.compile(r"(\n[ \t]*\n+)")
+
+
+def _split_blocks(text: str) -> tuple[list[str], list[str]]:
+    """把文本切成**空行分隔的块**，并记住每块前面的分隔符。
+
+    返回 (分隔符列表, 块内容列表)，下标一一对应：第 i 块前面是分隔符 i。
+    分隔符原样留着——还原的时候要把原文的折行与空行一起还回去。
+    """
+    parts = _BLOCK_SPLIT.split(text)
+    contents = parts[0::2]
+    seps = [""] + parts[1::2]
+    return seps, contents
+
+
+def repair_reflow(before: str, after: str) -> str:
+    """把「只重新折了行、没真改」的块还原回原文。
+
+    **为什么需要这一步**：模型要输出的是**完整新文件**，它于是顺手把没提到的
+    段落也重新排了一遍——把三行折成两行、把 ``*not*`` 写成 ``**not**``。
+    那些改动与这次反馈毫无关系，却会整段出现在 diff 里。而「看 diff 再决定」
+    这条写路径存在的**全部前提**就是：diff 里只有这次反馈真正要的改动。
+    实测过一份真方案：3 个 hunk 里只有 1 个是反馈要的，另外 2 个是纯折行。
+
+    **按块对齐，不按行对齐**：折行会把一行变成两行，按行 diff 的话模型新加
+    的小节会和它旁边那段被折行的文字**粘成同一个块**——于是整块都当成
+    「模型改过的」，折行就留下了。按空行分块之后，块与块是对齐的：
+    折过行的那块归一化后与原文一样 → 还原；新加的小节是独立的一块 → 留下。
+
+    判据：归一化掉空白与强调标记之后与原文**完全一样** → 纯排版，还原；
+    只要有一处不同，就整体保留模型的写法（宁可留噪声，也不要把真改动
+    当成噪声抹掉）。
+    """
+    a_seps, a_blocks = _split_blocks(before)
+    b_seps, b_blocks = _split_blocks(after)
+    a_keys = [_squash(b) for b in a_blocks]
+    b_keys = [_squash(b) for b in b_blocks]
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            None, a_keys, b_keys, autojunk=False).get_opcodes():
+        if tag == "equal":
+            # 原文的块：连同原文的折行与空行一起还回去
+            for k in range(i1, i2):
+                out.append(a_seps[k])
+                out.append(a_blocks[k])
+        elif tag in ("replace", "insert"):
+            for k in range(j1, j2):
+                out.append(b_seps[k])
+                out.append(b_blocks[k])
+        # delete：模型真的删了块，那是实质改动，保留（不还原）。
+    return "".join(out)
 
 
 def build_proposal(reflection_id: int, target: str) -> dict:
@@ -638,6 +704,11 @@ def build_proposal(reflection_id: int, target: str) -> dict:
     if not after.strip():
         store.set_proposal_state(reflection_id, "failed", "模型回了空的修改后内容")
         raise ReflectionError("模型回了空的修改后内容")
+    # **纯折行的片段还原回原文**（见 repair_reflow）。模型要输出完整新文件，
+    # 于是顺手把没提到的段落也重新排了一遍——那些改动与这次反馈无关，却会
+    # 整段出现在 diff 里，而管理员看 diff 的前提是「diff 里只有这次反馈
+    # 真正要的改动」。
+    after = repair_reflow(before, after)
     # **末尾换行跟着原文走。** 模型吐出来的正文常常没有结尾换行，而原文有。
     # 直接落盘就把文件末尾的换行弄丢了：git 会把最后一行报成改动
     # （"\ No newline at end of file"），而那条改动跟反馈**毫无关系**——
@@ -646,10 +717,13 @@ def build_proposal(reflection_id: int, target: str) -> dict:
     if before.endswith("\n") and not after.endswith("\n"):
         after += "\n"
     if after == before:
-        store.set_proposal_state(
-            reflection_id, "failed",
-            "模型说不用改——那这条就不是「工具不够用」，该否决")
-        raise ReflectionError("模型说不用改——那这条就不是「工具不够用」，该否决")
+        # 两种「没改动」要分开说：模型真的说不用改，和模型只做了纯排版。
+        # 后者不是「该否决」，是「自动落地不了，得人工来」。
+        reason = ("模型只把没提到的段落重新折了行，没有实质改动——这条反馈得人工改"
+                  if strip_fence(raw) != before else
+                  "模型说不用改——那这条就不是「工具不够用」，该否决")
+        store.set_proposal_state(reflection_id, "failed", reason)
+        raise ReflectionError(reason)
 
     patch = diff_for(rel, before, after)
     try:

@@ -727,13 +727,35 @@ def test_result_xlsx_downloads_when_writeback_is_on(client, auth_headers,
 
 def test_delete_removes_workflow_and_cascades(client, auth_headers, one_workflow):
     wid, row = one_workflow["id"], one_workflow["row_id"]
+    src = Path(store.get_workflow(wid)["source_path"])
+    assert src.is_file(), "夹具本身没把源表写出来"
     r = client.delete(f"/api/workflows/{wid}", headers=auth_headers)
     assert r.status_code == 200 and r.json() == {"ok": True}
     with pytest.raises(store.NotFound):
         store.get_workflow(wid)
     with pytest.raises(store.NotFound):
         store.get_task(row)
-    assert list(Path(db.data_root() / "workflows" / str(wid)).glob("*")) != []
+    # **盘上的源表与结果表也一起清掉。**
+    #
+    # 只删数据库的话它们会**永远**留在 data/workflows/<id>/：用户以为删干净了，
+    # 实际上那些表还在（上一批的结果也在里面），而 janitor 也不扫这一块——
+    # 所以这条删除路径不自己清，就再没有人清。
+    assert not src.exists(), "工作流删了，源表还留在盘上"
+    assert not Path(db.data_root() / "workflows" / str(wid)).exists(), \
+        "工作流删了，它的目录还留在盘上"
+
+
+def test_delete_workflow_keeps_other_workflows_files(client, auth_headers, one_workflow):
+    """**只删自己那一份。** 别人的源表一个字都不许动。"""
+    wid = one_workflow["id"]
+    other = _upload(client, auth_headers, name="别人的表.xlsx")
+    other_wid = other.json()["workflow"]["id"]
+    other_src = Path(store.get_workflow(other_wid)["source_path"])
+    assert other_src.is_file(), "夹具本身没把源表写出来"
+
+    assert client.delete(f"/api/workflows/{wid}",
+                         headers=auth_headers).status_code == 200
+    assert other_src.exists(), "删一个工作流把别人的源表也删了"
 
 
 def test_delete_aborts_live_row_before_dropping_record(client, auth_headers,
