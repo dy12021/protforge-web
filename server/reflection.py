@@ -638,6 +638,13 @@ def build_proposal(reflection_id: int, target: str) -> dict:
     if not after.strip():
         store.set_proposal_state(reflection_id, "failed", "模型回了空的修改后内容")
         raise ReflectionError("模型回了空的修改后内容")
+    # **末尾换行跟着原文走。** 模型吐出来的正文常常没有结尾换行，而原文有。
+    # 直接落盘就把文件末尾的换行弄丢了：git 会把最后一行报成改动
+    # （"\ No newline at end of file"），而那条改动跟反馈**毫无关系**——
+    # 管理员看着 diff 里多出来的一行要猜这是不是模型想改什么。
+    # 补上之后，diff 里剩下的就全是这次反馈真正要的改动。
+    if before.endswith("\n") and not after.endswith("\n"):
+        after += "\n"
     if after == before:
         store.set_proposal_state(
             reflection_id, "failed",

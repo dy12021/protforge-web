@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import pathlib
 import sys
 from pathlib import Path
 
@@ -196,6 +197,28 @@ def test_hanging_a_new_proposal_clears_the_previous_reason(llm_box, skills):
     assert got["proposal_state"] == "ready", got
     assert got["proposal_error"] == "", \
         f"方案挂上了，旧原因还留着：{got!r}"
+
+
+def test_the_proposal_keeps_the_originals_trailing_newline(llm_box, skills):
+    """**末尾换行跟着原文走。**
+
+    模型吐出来的正文常常没有结尾换行，而原文有。直接落盘就把文件末尾的
+    换行弄丢了：git 会把最后一行报成改动（"\\ No newline at end of file"），
+    而那条改动跟反馈**毫无关系**——管理员看着 diff 里多出来的一行要猜
+    这是不是模型想改什么。
+
+    补上之后，diff 里剩下的就全是这次反馈真正要的改动。
+    """
+    target = skills / "skills" / SKILL / "SKILL.md"
+    assert target.read_bytes().endswith(b"\n"), "夹具本身要有结尾换行"
+    # 模型的正文：内容改了，但**没有**结尾换行。
+    llm_box["text"] = "---\nname: protforge-demo\n---\n\n## 用法\n跑一下。\n\n改了。"
+    rec = _tool_gap_reflection()
+    reflection.build_proposal(rec["id"], TARGET)
+
+    new_path = pathlib.Path(store.get_reflection(rec["id"])["proposal"]).with_suffix(".new")
+    assert new_path.read_text(encoding="utf-8").endswith("\n"), \
+        "方案丢了结尾换行：落盘后文件末尾会少一个换行，git 会多报一行改动"
 
 
 def test_the_admin_api_hands_the_reason_to_the_panel(llm_box, skills):
