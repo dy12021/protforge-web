@@ -253,3 +253,45 @@ test('guard is not a blanket rejecter', () => {
   const denied = harmless.filter((c) => !checkCommand(c, OPTS).allowed);
   assert.deepEqual(denied, [], `这些无害命令被误拒：${denied.join(' | ')}`);
 });
+
+// ---------------------------------------------------------------- 杀进程
+
+test('refuses to kill processes by name', () => {
+  // 2026-10-20 真机事故：agent 跑 `taskkill //F //IM python.exe //T`，
+  // 把平台自己的三个服务连同 agent 进程一起杀了（工作流当场断掉，
+  // 日志里连一行崩溃栈都没有，因为是被强杀不是崩）。
+  // 平台服务与 agent 的计算进程**同名**，按名字杀没有「只杀我自己的」这种写法。
+  deny('taskkill //F //IM python.exe //T');
+  deny('taskkill /F /IM python.exe');
+  deny('taskkill /IM python.exe');
+  deny('taskkill /im python.exe');
+  deny('pkill -f python');
+  deny('killall python');
+  deny('pskill python');
+});
+
+test('refuses to kill a process group or everything', () => {
+  deny('kill -9 -1');
+  deny('kill -- -1');
+  deny('kill -1');
+});
+
+test('still allows killing a specific pid', () => {
+  // agent 必须能掐掉自己起的失控计算进程——不挡的话它只能等超时。
+  allow('taskkill /PID 12345 /F');
+  allow('kill -9 12345');
+  allow('kill 12345');
+});
+
+test('refuses kill by name inside inline interpreter code', () => {
+  // 【缺口 1】说内联解释器的内容整体无法检查，但「按名字杀进程」这一类
+  // 在代码里必然出现固定命令词，可以窄化堵掉。
+  deny('python -c "import os; os.system(\'taskkill /F /IM python.exe\')"');
+  deny('powershell -Command "Stop-Process -Name python -Force"');
+  deny('powershell -EncodedCommand dGFza2tpbGw=');
+});
+
+test('inline interpreter without kill tokens still works', () => {
+  allow('python -c "print(1+1)"');
+  allow('python -c "import json; print(json.dumps({}))"');
+});

@@ -53,6 +53,16 @@
  *   `bash launcher.sh`、`python run.py` 只检查**路径**，不检查文件内容。
  *   兜底是写工具的路径限制：agent 自己写出来的脚本只能落在工作目录里，
  *   这和它直接用 `python -c` 写任意代码是同一档风险，不算额外放开。
+ *
+ * 【缺口 7｜按 PID 定向杀仍可能打到平台自己的进程】
+ *   守卫拦得住「按名字杀」（`taskkill /IM python.exe`、`pkill`、`killall`、
+ *   `kill -1`）：那是无差别的整机操作。2026-10-20 真机就是这么把平台三个
+ *   服务连同 agent 进程一起杀掉的（工作流当场断掉，日志里连一行崩溃栈都没有）。
+ *   但 `taskkill /PID <n>` / `kill <pid>` **放行**——agent 必须能掐掉自己起的
+ *   失控计算进程（OpenMM 跑飞、端口被占），不挡的话它只能等超时。
+ *   残留风险：agent 若先 `tasklist` 拿到平台服务的 PID 再按 PID 杀，仍打得中。
+ *   兜底是让**服务用独立于 agent 计算进程的可执行名**——现在两边都叫
+ *   python.exe，所以「按名字杀」根本没有「只杀我自己的」这种写法。
  */
 
 import { createLocalBashOperations } from '@earendil-works/pi-coding-agent';
@@ -73,6 +83,29 @@ const MAX_DEPTH = 12;
  * 前者把当前 shell 换成待执行命令，后者把任意字符串留到信号触发时执行。
  */
 const DENY_ALWAYS = new Set(['eval', 'source', '.', 'exec', 'trap']);
+
+/**
+ * 按**名字**杀进程的命令：作用域是整机，不受工作目录约束。
+ *
+ * 2026-10-20 真机事故：agent 为了清理自己的残留进程跑了
+ * `taskkill //F //IM python.exe //T`，把平台自己的三个服务（都是 python.exe）
+ * 连同服务派生出来的 agent 进程一起杀了——工作流当场断掉，而且日志里连一行
+ * 崩溃栈都没有（被强杀，不是崩），排查时完全看不出是agent 自己动的手。
+ *
+ * 关键在于**平台的服务进程与 agent 的计算进程同叫 python.exe**：
+ * 「按名字杀 python」根本没有「只杀我自己的」这种写法，不存在既杀掉残留计算、
+ * 又放过平台的选项。所以按名字杀一律拒绝，agent 要清理残留只能用 PID。
+ */
+const DENY_KILL_BY_NAME = new Set(['pkill', 'killall', 'pskill']);
+
+/** taskkill 按名字杀的选项（Windows 上大小写不敏感，MSYS 下是 //IM 这种写法）。 */
+const TASKKILL_IMAGE_FLAGS = ['/im', '//im'];
+
+/**
+ * 内联解释器代码里出现即拒的词：**按名字杀进程**那一类。
+ * 用来窄化堵掉【缺口 1】里最要命的一类（见 checkInterpreter 的说明）。
+ */
+const KILL_BY_NAME_TOKENS = ['taskkill', 'stop-process', 'pkill', 'killall', 'pskill'];
 
 /**
  * 会改变文件系统的命令，需要对其操作数做路径判定。
@@ -545,9 +578,11 @@ function visitCallExpr(ce, ctx, depth) {
   }
 
   if (INTERPRETERS.has(base)) {
-    // 见【缺口 1】：只确认允许跑内联解释器，不检查内容。
-    return OK;
+    return checkInterpreter(base, words, ctx);
   }
+
+  const killVerdict = checkKill(base, words);
+  if (killVerdict) return killVerdict;
 
   if (WRAPPERS.has(base)) {
     return checkWrapper(base, words, ctx, depth);
@@ -615,6 +650,93 @@ function checkDestructive(base, words, ctx) {
     if (!isAbsoluteLike(value)) continue;           // 相对路径落在 cwd 内
     if (!isUnderAny(value, ctx.fileRoots)) {
       return bad(`${base} 作用于允许范围之外的路径：${value}`);
+    }
+  }
+  return OK;
+}
+
+/**
+ * 杀进程：**按名字杀一律拒绝，按 PID 杀放行**。
+ *
+ * 放行 PID 是因为 agent 必须能掐掉自己起的失控计算进程（OpenMM 跑飞、
+ * 端口被占）——这是正常需求，不挡的话 agent 只能等超时。
+ * 残留风险见文件头【缺口 7】：按 PID 定向杀仍然可能打到平台自己的进程。
+ */
+function checkKill(base, words) {
+  if (DENY_KILL_BY_NAME.has(base)) {
+    return bad(`\`${base}\` 按名字杀进程：作用域是整机，会连平台自己的服务一起杀掉，禁止`);
+  }
+  if (base === 'taskkill') {
+    for (const w of words) {
+      const { value, dynamic } = wordToString(w);
+      if (dynamic) return bad('taskkill 的参数来自变量，无法静态判定');
+      const v = value.toLowerCase();
+      if (TASKKILL_IMAGE_FLAGS.some((f) => v === f || v.startsWith(`${f}:`))) {
+        return bad(`taskkill 按名字杀进程（${value}）：会连平台自己的服务一起杀掉，禁止`);
+      }
+    }
+    return OK;
+  }
+  if (base === 'kill') {
+    const args = [];
+    for (const w of words.slice(1)) {
+      const s = wordToString(w);
+      if (s.dynamic) {
+        // 目标来自变量 → 无法静态判定，按【缺口 2】的规矩拒绝而不是猜。
+        return bad('kill 的目标来自变量，无法静态判定');
+      }
+      args.push(s.value);
+    }
+    const negatives = args.filter((a) => /^-[0-9]+$/.test(a));
+    if (negatives.length > 1) {
+      // 第一个负数是信号号，其余是进程组目标（`kill -9 -1` = 杀 1 号进程组）。
+      return bad('kill 的目标是负数（进程组）：会波及平台自己的服务，禁止');
+    }
+    if (negatives.length === 1 && args.length === 1) {
+      // `kill -1` 没有目标 = 向所有进程发信号。
+      return bad('kill 只有信号没有目标：等于「向所有进程发信号」，'
+        + '会波及平台自己的服务，禁止');
+    }
+    const sep = args.indexOf('--');
+    if (sep >= 0 && args.slice(sep + 1).some((a) => /^-\d+$/.test(a))) {
+      // `kill -- -1`：显式写的负数目标（进程组）。
+      return bad('kill 的目标是负数（进程组）：会波及平台自己的服务，禁止');
+    }
+    return OK;
+  }
+  return null;
+}
+
+/**
+ * 内联解释器：`python -c "<代码>"`。
+ *
+ * 见【缺口 1】：代码内容整体无法静态判定，所以这里**不检查它**。
+ * 但**按名字杀进程**这一类可以在代码层面窄化堵掉——它在代码里必然出现
+ * 固定的命令词（taskkill / Stop-Process / pkill / killall）。
+ * 判据是「出现即拒」：宁可误伤（agent 少打这几个字），不可放过
+ * （平台的服务被连带杀掉，整批工作流当场断掉）。
+ *
+ * `-encodedcommand`（base64）直接拒：内容不可读就等于不可判定，
+ * 按文件头第一条原则「失败即拒」。
+ */
+function checkInterpreter(base, words, ctx) {
+  for (let i = 1; i < words.length; i++) {
+    const { value, dynamic } = wordToString(words[i]);
+    if (dynamic) continue;
+    const flag = value.toLowerCase();
+    if (flag === '-encodedcommand' || flag === '--encodedcommand') {
+      return bad(`${base} 的编码命令内容不可读，无法静态判定，拒绝`);
+    }
+    if (!INTERPRETER_CODE_FLAGS.has(flag)) continue;
+    const code = words[i + 1];
+    if (!code) continue;
+    const s = wordToString(code);
+    if (s.dynamic) continue;              // 来自变量：整体不可判定（缺口 1 / 缺口 2）
+    const low = s.value.toLowerCase();
+    const hit = KILL_BY_NAME_TOKENS.find((t) => low.includes(t));
+    if (hit) {
+      return bad(`内联解释器代码里出现按名字杀进程的命令（${hit}）：`
+        + `会连平台自己的服务一起杀掉，禁止`);
     }
   }
   return OK;
