@@ -15,7 +15,7 @@
 - **数据盘 = `<仓库>\`**，由 `PROTFORGE_WEB_DATA_ROOT` 覆盖。代码在 `<仓库>\`。子目录固定：`data/web.db`、`data/uploads/<task_id>/`、`data/work/<task_id>/`、`data/packages/`、`data/logs/`
 - **端口**：用户 API `8473`（`0.0.0.0`）、管理员 `8474`（`127.0.0.1`）、内部 API `8475`（`127.0.0.1`）
 - **ProtForge 零改动**，只调用 `<技能仓>` 下的技能
-- **Python 用 `C:\ProgramData\anaconda3\python.exe`**，禁止装进 `<ProtForge 根>\venvs\oih\`（那是 ProtForge 的环境，混装会破坏 Docker 工具链）
+- **Python 用 `python`**，禁止装进 `<ProtForge 根>\venvs\oih\`（那是 ProtForge 的环境，混装会破坏 Docker 工具链）
 - **所有 API 的 `detail` 恒为中文字符串**，含 pydantic 框架层错误。数组透出去会让前端拿到 `"[object Object]"`
 - **鉴权用 `Authorization: Bearer`，不用 Cookie**（天然免 CSRF）。内部 agent 通道用一次性 `agent_token`，**与 task_id 绑定**
 - **界面不出现"AI""助手""大模型"字样**，统一称「自动化计算平台」「计算进程」
@@ -73,7 +73,7 @@ def temp_db(tmp_path, monkeypatch):
 import pytest, store, db
 
 def test_create_task_defaults_queued():
-    t = store.create_task("跑 freesasa", "分析 1ubq 的表面暴露", owner_id=1, actor="human")
+    t = store.create_task("跑 freesasa", "算一下 1ubq.pdb 的表面积", owner_id=1, actor="human")
     assert t["status"] == "queued" and t["step"] == "" and t["brief"].startswith("分析")
 
 def test_brief_rejected_when_too_long():
@@ -111,7 +111,7 @@ def test_audit_log_separate_from_events():
 
 - [ ] **Step 3: 跑测试确认失败**
 
-Run: `C:\ProgramData\anaconda3\python.exe -m pytest tests/test_store.py -q`
+Run: `python -m pytest tests/test_store.py -q`
 Expected: FAIL — `store` 模块不存在
 
 - [ ] **Step 4: 实现 db.py**
@@ -201,7 +201,7 @@ def truncate_step(text: str) -> str:
 
 - [ ] **Step 6: 跑测试确认通过**
 
-Run: `C:\ProgramData\anaconda3\python.exe -m pytest tests/test_store.py -q`
+Run: `python -m pytest tests/test_store.py -q`
 Expected: PASS
 
 - [ ] **Step 7: 提交**

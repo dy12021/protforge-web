@@ -171,6 +171,6 @@ test('消解在盘符映射之后发生（顺序不能反）', () => {
   // 映射前消解：`<ProtForge 根>\..` -> `E:\` -> `/mnt/e`，看着对，但 `<ProtForge 根>\..\oih\x`
   // 这类路径会先被砍成 `/mnt/e/protforge/x` 而掩盖真实的重复段。
   // 断言的是「映射后再消解」的结果本身，别靠直觉判断。
-  assert.equal(canonPath('E:\\protforge\\oih\\..\\data'), '/mnt/e/protforge/data');
+  assert.equal(canonPath('E:\\protforge\\pf\\..\\data'), '/mnt/e/protforge/data');
   assert.equal(canonPath('E:\\protforge\\..'), '/mnt/e');
 });

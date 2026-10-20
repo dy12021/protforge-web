@@ -9,7 +9,10 @@ rem  也不要把它存成 UTF-8 —— 那样 cmd 会把中文部分当成命令来跑，
 rem  报 'xxx' 不是内部或外部命令。路径写死在这里，不依赖 PATH 上的 python。
 rem ---------------------------------------------------------------------
 
-set "PYTHON=C:\ProgramData\anaconda3\python.exe"
+rem 解释器：先看 PROTFORGE_WEB_PYTHON，没有就取 PATH 上的 python.exe
+rem （Windows 上通常就是 Anaconda）。不写死某个安装位置——换个机器就起不来。
+set "PYTHON=%PROTFORGE_WEB_PYTHON%"
+if not defined PYTHON for /f "delims=" %%P in ('where python.exe 2^>nul') do if not defined PYTHON set "PYTHON=%%P"
 set "URL=http://127.0.0.1:8473"
 
 rem ---- 可选：载入 .env（没有这个文件就用代码里的默认值）---------------
@@ -28,7 +31,7 @@ if not defined PROTFORGE_WEB_WORKERS set "PROTFORGE_WEB_WORKERS=1"
 if not exist "%PYTHON%" (
     echo [错误] 找不到 Python：%PYTHON%
     echo.
-    echo     请装一个 Python，或者改本文件里的 PYTHON 变量指向你实际用的解释器。
+    echo     请装一个 Python 并放进 PATH，或用 PROTFORGE_WEB_PYTHON 指向你实际用的解释器。
     echo     本机 PATH 上的 python 未必是它。
     echo.
     pause
@@ -77,12 +80,12 @@ rem uvicorn 要一会儿才绑上端口，所以延时一点再开浏览器，
 rem 否则会先看到「无法访问此页面」。ping 当延时用；timeout 需要后台才有。
 start "" /min cmd /c "ping -n 6 127.0.0.1 >nul & start %URL%/"
 
-rem PYTHON 路径里没有空格，所以下面的命令一律不加引号：
+rem %PYTHON% 一律加引号：PATH 上的解释器可能带空格。
 rem start "标题" cmd /k "命令" 再套一层引号很容易被 cmd 拆错。
 rem cmd /k 让窗口在崩溃后仍然留着，能看到 Python 的报错。
-start "protforge-web 用户面板 8473" cmd /k %PYTHON% server\app.py public
-start "protforge-web 内部 API 8475" cmd /k %PYTHON% server\app.py internal
-start "protforge-web 管理员面板 8474" cmd /k %PYTHON% admin\app_admin.py
+start "protforge-web 用户面板 8473" cmd /k "%PYTHON%" server\app.py public
+start "protforge-web 内部 API 8475" cmd /k "%PYTHON%" server\app.py internal
+start "protforge-web 管理员面板 8474" cmd /k "%PYTHON%" admin\app_admin.py
 
 echo.
 echo 三个服务窗口已经拉起来了。等几秒浏览器会自动打开用户面板。

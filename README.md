@@ -391,7 +391,7 @@ Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 8473,8474,8
 
 ```bat
 cd /d <仓库>
-"C:\ProgramData\anaconda3\python.exe" -m pytest tests -q
+"<你的 Python>" -m pytest tests -q
 cd agent
 node guards.test.mjs
 ```

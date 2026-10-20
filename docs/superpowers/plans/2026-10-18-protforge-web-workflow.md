@@ -6,7 +6,7 @@
 
 **Architecture:** 工作流行 = 带 `workflow_id` / `workflow_row` / `workflow_archived` 三个可空列的普通 task，不造第二套任务生命周期，中止/重跑/打包/审计/详情/下载/SSE 全部原样复用。调度用**游标式**：`workflows.cursor` 只在放行时 +1，`workflow_archived` 是「这一行归档了吗」的唯一判据，调度器每 tick 跑一个放行 pass 和一个归档 pass。工作流源文件落 `data/workflows/<id>/`，刻意在 `guards.regions()` 四区之外，回写一律由平台做。
 
-**Tech Stack:** Python 3（`C:\ProgramData\anaconda3\python.exe`）、FastAPI 0.136.3、Starlette 1.3.1、SQLite、openpyxl 3.1.5、python-multipart 0.0.32；前端零构建原生 HTML/CSS/JS；agent 侧 Node ESM。
+**Tech Stack:** Python 3（`python`）、FastAPI 0.136.3、Starlette 1.3.1、SQLite、openpyxl 3.1.5、python-multipart 0.0.32；前端零构建原生 HTML/CSS/JS；agent 侧 Node ESM。
 
 ## Global Constraints
 
@@ -15,7 +15,7 @@
   ```powershell
   chcp 65001 | Out-Null; $env:PYTHONIOENCODING='utf-8'
   Set-Location '<仓库>'
-  & 'C:\ProgramData\anaconda3\python.exe' -m pytest tests -q --no-header -p no:cacheprovider
+  & 'python' -m pytest tests -q --no-header -p no:cacheprovider
   ```
 - **agent 测试**：`Set-Location '<仓库>\agent'; node --test guards.test.mjs`
 - **前端冒烟**：`Set-Location '<仓库>'; node tests\frontend_smoke.mjs web\app.js`
@@ -3760,7 +3760,7 @@ chcp 65001 | Out-Null; $env:PYTHONIOENCODING='utf-8'
 Set-Location '<仓库>'
 
 # 1. 全量测试
-& 'C:\ProgramData\anaconda3\python.exe' -m pytest tests -q --no-header -p no:cacheprovider
+& 'python' -m pytest tests -q --no-header -p no:cacheprovider
 
 # 2. agent 测试
 Set-Location '<仓库>\agent'

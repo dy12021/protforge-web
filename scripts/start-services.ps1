@@ -25,8 +25,10 @@ if (Test-Path $envFile) {
 }
 
 # ---- python ----------------------------------------------------------------
-$py = 'C:\ProgramData\anaconda3\python.exe'
-if (-not (Test-Path $py)) {
+# **走 PATH 上的 python.exe**（Windows 上通常就是 Anaconda），不写死某个安装
+# 位置——写死了换个机器就起不来。指不到就用 PROTFORGE_WEB_PYTHON 显式指定。
+$py = $env:PROTFORGE_WEB_PYTHON
+if (-not $py) {
     $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($cmd) { $py = $cmd.Source }
 }

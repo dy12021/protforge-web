@@ -51,8 +51,9 @@ foreach ($port in 8473, 8474, 8475) {
 }
 
 # ---- 2. by command line (the leftovers that hold no port) -----------------
-$py = 'C:\ProgramData\anaconda3\python.exe'
-if (-not (Test-Path $py)) {
+# 与启动脚本同一套取法：走 PATH 上的 python.exe，不写死某个安装位置。
+$py = $env:PROTFORGE_WEB_PYTHON
+if (-not $py) {
     $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($cmd) { $py = $cmd.Source }
 }

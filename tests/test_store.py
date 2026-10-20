@@ -1,8 +1,8 @@
 import pytest, store, db
 
 def test_create_task_defaults_queued():
-    t = store.create_task("跑 freesasa", "分析 1ubq 的表面暴露", owner_id=1, actor="human")
-    assert t["status"] == "queued" and t["step"] == "" and t["brief"].startswith("分析")
+    t = store.create_task("跑 freesasa", "算一下 1ubq.pdb 的表面积", owner_id=1, actor="human")
+    assert t["status"] == "queued" and t["step"] == "" and t["brief"].startswith("算一下")
 
 def test_brief_rejected_when_too_long():
     with pytest.raises(store.Invalid):
