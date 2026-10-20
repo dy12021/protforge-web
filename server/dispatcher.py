@@ -1323,6 +1323,17 @@ class Dispatcher:
         #    排这么前是因为它一旦被②盖住就永远走不到，而"重跑"只有这一条路。
         queued = store.workflow_queued_rows(wid)
         if queued:
+            # 认领之前必须先确认**没有正在执行的行**。
+            #
+            # 闸门⑤（workflow_has_live_rows）把 queued 也算成活着的行，而它排在
+            # ④ 后面——④ 要认领的恰恰就是 queued 行，所以⑤ 当不了④的前置，
+            # 只能在这里单独判一次「有没有真的在跑的」。
+            #
+            # 少了这一句的后果：管理员一次重投多行 → 头一轮认领一行、下一轮又
+            # 认领一行（上一行已经是 running，但④ 不看）→ **两行同时在跑**，
+            # 结果表回写会交错；而工作流的契约是「一行跑完归档回表格才放下一行」。
+            if store.workflow_has_running_rows(wid):
+                return None
             row = queued[0]
             row_index = int(row["workflow_row"])
             if row_index in skips:

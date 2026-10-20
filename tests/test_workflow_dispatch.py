@@ -299,6 +299,52 @@ def test_gate_4_precedes_gate_2(disp, tmp_path):
     assert store.get_workflow(wf["id"])["cursor"] == 1, "重跑不该再推游标"
 
 
+def test_gate_4_keeps_the_batch_serial_when_several_rows_are_retried(disp, tmp_path):
+    """管理员一次重投多行时，④ 不能把每一行都放出去。
+
+    工作流的契约是「一行跑完归档回表格才放下一行」。闸门⑤（有活着的行就不放
+    下一行）把 queued 也算成活着的行，而④ 排在⑤前面、④ 要认领的恰恰就是
+    queued 行——所以⑤ 当不了④ 的前置，④ 自己得先判一次「有没有**正在执行**的
+    行（running/packaging）」。
+
+    少了这一句会怎样：管理员把第 2、3 行一起重跑 → 头一轮认领第 2 行、下一轮
+    第 3 行又被认领（第 2 行已经是 running，④ 不看）→ **两行同时在跑**，
+    结果表回写交错。
+
+    这条用例单独存在的理由：整理闸门顺序的人不会想到去跑「一次重投多行」，
+    而「重跑整个工作流」正是管理员最常干的批量动作。
+    """
+    uid = _user()
+    wf = _workflow(uid, tmp_path, rows=3)
+    disp._workflow_run_pass()
+    r0 = _first_row(wf)
+    assert store.get_task(r0["id"])["status"] == "running", "第 1 行没被放行"
+
+    # 管理员把第 2、3 行重跑：两行同时处于 queued
+    r1 = store.create_task("r1", "b", owner_id=uid, actor="system",
+                           workflow_id=wf["id"], workflow_row=1)
+    r2 = store.create_task("r2", "b", owner_id=uid, actor="system",
+                           workflow_id=wf["id"], workflow_row=2)
+    store.set_status(r1["id"], "queued", actor="admin")
+    store.set_status(r2["id"], "queued", actor="admin")
+
+    got = disp._workflow_run_pass()
+    assert got == [], "有行正在跑的时候又放出一行：两行同时在跑"
+    assert store.get_task(r1["id"])["status"] == "queued", "第 2 行不该被放出去"
+    assert store.get_task(r2["id"])["status"] == "queued"
+
+    # 第 1 行跑完并归档之后，第 2 行才被放行；第 3 行仍然等着
+    store.update_task(r0["id"], status="done")
+    disp._workflow_archive_pass()
+    assert disp._archive_wait(30)
+    disp._running.clear()
+    got = disp._workflow_run_pass()
+    assert len(got) == 1, f"归档之后该放行一行了，实际放了 {len(got)} 行"
+    assert store.get_task(r1["id"])["status"] == "running"
+    assert store.get_task(r2["id"])["status"] == "queued", \
+        "第 3 行跟着一起被放行了：又变成两行同时在跑"
+
+
 def test_regular_tasks_go_first(disp, tmp_path):
     """顺序层让路：常规任务和工作流行任务同时有空槽时，先给常规的。"""
     uid = _user()

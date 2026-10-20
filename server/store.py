@@ -880,6 +880,26 @@ def workflow_has_live_rows(workflow_id: int) -> bool:
         c.close()
 
 
+def workflow_has_running_rows(workflow_id: int) -> bool:
+    """闸门④的前置：有没有**正在执行**的行（running / packaging）。
+
+    **刻意不算 queued**：管理员重跑产生的行本身就是 queued，把它算进去等于
+    「只要有重跑行就永远不认领」——重跑这条路直接堵死。
+
+    为什么不能直接用闸门⑤（workflow_has_live_rows）：它把 queued 也算成活着的行，
+    而闸门④要认领的恰恰就是 queued 行、且④必须排在⑤前面。⑤当不了④的前置，
+    只能在这里单独判一次「有没有真的在跑的」。
+    """
+    c = db.connect()
+    try:
+        return c.execute(
+            "SELECT 1 FROM tasks WHERE workflow_id = ?"
+            " AND status IN ('running','packaging') LIMIT 1",
+            (int(workflow_id),)).fetchone() is not None
+    finally:
+        c.close()
+
+
 def workflow_queued_rows(workflow_id: int) -> list[dict]:
     """闸门④：要认领的 queued 行任务。管理员重跑产生的就在这里。"""
     c = db.connect()
