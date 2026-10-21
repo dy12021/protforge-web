@@ -133,15 +133,32 @@
       <label class="toggle"><input id="wf-only-failed" type="checkbox"> 只看失败行</label>
       <span class="toolbar-gap"></span>
       <span class="who" id="wf-filter-note"></span>
+      <span class="toolbar-gap"></span>
+      <!-- 任务表 ↔ 行列表 的切换。任务表给的是**任务本身**的信息：
+           跑到哪一步、成没成、为什么、产物在哪——这些原来只在任务看板的抽屉里。 -->
+      <button id="wf-task-toggle" class="secondary" type="button">看任务表</button>
     </div>
-    <div class="wf-table-wrap">
+    <div class="wf-table-wrap" id="wf-rows-wrap">
       <table class="wf-table">
         <thead><tr id="wf-head"></tr></thead>
         <tbody id="wf-body"></tbody>
       </table>
     </div>
 
+    <!-- 任务表：一行一个**已经跑起来**的任务。没跑的不列（用户原话：
+         「可以不展开还没运行的」）。点「详情」在下面展开只读详情。 -->
+    <div class="wf-table-wrap" id="wf-task-table-wrap" hidden>
+      <table class="wf-table">
+        <thead><tr id="wf-task-head"></tr></thead>
+        <tbody id="wf-task-body"></tbody>
+      </table>
+    </div>
     <div class="toolbar">
+      <span class="who" id="wf-task-note"></span>
+    </div>
+    <div id="wf-task-detail" hidden></div>
+
+    <div class="toolbar" id="wf-preview-bar">
       <span class="who">第 <span id="wf-preview-row">1</span> 行渲染出来的提示词</span>
     </div>
     <pre id="wf-preview"></pre>

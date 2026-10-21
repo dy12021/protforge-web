@@ -274,6 +274,7 @@ async function boot() {
 
 async function loadList() {
   const d = await api("GET", "/api/workflows");
+  stopPolling();
   $("#wf-list").hidden = false;
   $("#wf-detail").hidden = true;
   const box = $("#wf-cards");
@@ -395,9 +396,11 @@ async function openDetail(id) {
   }));
   renderHead();
   renderRows(d);
+  renderTaskTable(d);
   stepNow = stepByState();
   showStep();
   closeColPick();
+  startPolling();
   await loadPreview(0);
 }
 
@@ -599,6 +602,230 @@ function renderHere() {
     renderSlots($("#wf-template").value || "", slots);
 }
 
+/* ---------------------------------------------------------------- 任务表
+
+   工作流里每一行都是一个计算任务。原来的「每一行」那张表给的是**列与行**
+   （点表头改角色、点行看提示词），任务本身的信息——跑到哪一步、成没成、
+   为什么、产物在哪——只在任务看板的抽屉里；用户在工作流页看不到，也
+   不知道那一行现在算得怎么样了。
+
+   这里补一张**任务表**：一行一个已经跑起来的任务，**没跑的不列**
+   （用户原话：「可以不展开还没运行的」）。
+
+   数据不用新接口：详情端点返回的 rows 就是行任务本身
+   （brief / step / summary / error / package_path 都在里面）。
+
+   **只读**：改需求说明、中止、删除、审计命令那些都在看板与值班台，
+   这里只做「看」。同一件事不写两份——所以这里一个编辑按钮都没有。
+*/
+function mkTd(text, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  td.textContent = text == null ? "" : String(text);
+  return td;
+}
+
+function renderTaskTable(d) {
+  const head = $("#wf-task-head");
+  const body = $("#wf-task-body");
+  if (!head || !body) return;
+  head.innerHTML = "";
+  body.innerHTML = "";
+  for (const c of ["行", "状态", "当前步骤", "需求", "结果 / 失败原因", "产物", "操作"]) {
+    const th = document.createElement("th");
+    th.className = "wf-rownum";
+    th.textContent = c;
+    head.appendChild(th);
+  }
+  const skips = skipSet(d);
+  const tasks = (d.rows || []).filter((r) => r && r.id);
+  for (const t of tasks) {
+    const idx = Number(t.workflow_row) || 0;
+    const tr = document.createElement("tr");
+    tr.dataset.row = String(idx);
+    tr.appendChild(mkTd(String(idx + 1), "wf-rownum"));
+
+    const st = document.createElement("td");
+    const dot = document.createElement("span");
+    dot.className = "wf-dot";
+    dot.dataset.status = rowStatus(t, skips);
+    st.appendChild(dot);
+    st.appendChild(document.createTextNode(
+      ROW_STATUS_LABEL[rowStatus(t, skips)] || t.status || ""));
+    tr.appendChild(st);
+
+    tr.appendChild(mkTd(t.step || "—"));
+    const brief = String(t.brief || "").replace(/\s+/g, " ").trim();
+    tr.appendChild(mkTd(brief ? (brief.length > 48 ? brief.slice(0, 48) + "…" : brief) : "—"));
+    tr.appendChild(mkTd(t.error || t.summary || "—"));
+
+    const art = document.createElement("td");
+    if (t.package_path) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "secondary";
+      b.textContent = "下载产物包";
+      b.onclick = (e) => {
+        e.stopPropagation();
+        guard("下载产物包", () => downloadTaskPackage(t.id, idx + 1));
+      };
+      art.appendChild(b);
+    } else {
+      art.textContent = "—";
+    }
+    tr.appendChild(art);
+
+    const act = document.createElement("td");
+    const b2 = document.createElement("button");
+    b2.type = "button";
+    b2.className = "secondary";
+    b2.textContent = "详情";
+    b2.onclick = (e) => {
+      e.stopPropagation();
+      guard("打开任务详情", () => showTaskDetail(t.id));
+    };
+    act.appendChild(b2);
+    tr.appendChild(act);
+    body.appendChild(tr);
+  }
+  const note = $("#wf-task-note");
+  if (note) {
+    note.textContent = tasks.length
+      ? `已跑 ${tasks.length} 行（没跑的不列）· 每 10 秒自动刷新`
+      : "还没有跑起来的行";
+  }
+}
+
+/** 只读的任务详情：需求说明 / 当前步骤 / 结果 / 失败原因 / 产物 / 时间线。 */
+async function showTaskDetail(taskId) {
+  const host = $("#wf-task-detail");
+  if (!host) return;
+  const d = await api("GET", `/api/tasks/${taskId}`);
+  const t = d.task || {};
+  taskDetailId = taskId;
+  host.hidden = false;
+  host.textContent = "";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "secondary";
+  close.textContent = "收起";
+  close.onclick = () => { host.hidden = true; taskDetailId = null; };
+  host.appendChild(close);
+  const h = document.createElement("h4");
+  h.textContent = t.title || ("任务 #" + taskId);
+  host.appendChild(h);
+  for (const pair of [["需求说明", t.brief], ["当前步骤", t.step],
+                      ["结果说明", t.summary], ["失败原因", t.error]]) {
+    if (!pair[1]) continue;
+    const p = document.createElement("p");
+    const b = document.createElement("strong");
+    b.textContent = pair[0] + "：";
+    p.appendChild(b);
+    p.appendChild(document.createTextNode(String(pair[1])));
+    host.appendChild(p);
+  }
+  const arts = d.artifacts || [];
+  if (arts.length) {
+    const p = document.createElement("p");
+    const b = document.createElement("strong");
+    b.textContent = `产物（${arts.length}）：`;
+    p.appendChild(b);
+    p.appendChild(document.createTextNode(arts.map((a) => a.name).join("、")));
+    host.appendChild(p);
+  }
+  const evs = (d.events || []).slice(-20);
+  if (evs.length) {
+    const p = document.createElement("p");
+    const b = document.createElement("strong");
+    b.textContent = "时间线（最近 20 条）：";
+    p.appendChild(b);
+    host.appendChild(p);
+    const ul = document.createElement("ul");
+    for (const e of evs) {
+      const li = document.createElement("li");
+      const when = String(e.created_at || "").replace("T", " ").slice(0, 19);
+      li.textContent = `${when}  ${e.message || ""}`;
+      ul.appendChild(li);
+    }
+    host.appendChild(ul);
+  }
+}
+
+/** 单独下某一行的产物包。 */
+async function downloadTaskPackage(taskId, rowNo) {
+  const r = await fetch(apiBase() + `/api/tasks/${taskId}/package`,
+                        { headers: authHeaders() });
+  if (!r.ok) throw await errFrom(r);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `第${rowNo}行-产物包.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 20000);
+}
+
+let taskView = false;        // false = 行列表视图；true = 任务表视图
+let taskDetailId = null;     // 正在展开详情的那个任务
+let pollTimer = null;
+
+function setTaskView(on) {
+  taskView = !!on;
+  const rows = $("#wf-rows-wrap");
+  const table = $("#wf-task-table-wrap");
+  const prevBar = $("#wf-preview-bar");
+  const prevBox = $("#wf-preview");
+  const btn = $("#wf-task-toggle");
+  if (rows) rows.hidden = taskView;
+  if (table) table.hidden = !taskView;
+  if (prevBar) prevBar.hidden = taskView;
+  if (prevBox) prevBox.hidden = taskView;
+  if (btn) btn.textContent = taskView ? "看行列表" : "看任务表";
+  if (taskView) renderTaskTable(lastDetail || {});
+}
+
+/** 每 10 秒刷一次**会变的那几处**。
+ *
+ * 只刷任务表、进度、失败数。**绝不重画向导里的输入框**——用户正在敲的
+ * 模板与变量名被一次轮询冲掉，是最招骂的一种刷新。整页重画是 openDetail
+ * 的事，轮询不碰它。
+ */
+async function refreshLive() {
+  if (wfId == null) return;
+  try {
+    const d = await api("GET", `/api/workflows/${wfId}`);
+    lastDetail = d;
+    const wf = d.workflow || {};
+    const prog = $("#wf-progress-text");
+    if (prog) {
+      prog.textContent = `${Number(wf.cursor) || 0} / ${Number(wf.total_rows) || 0}`
+        + (wf.abort_requested ? " · 已请求中止" : "");
+    }
+    const skips = skipSet(d);
+    const failed = (d.rows || []).filter((r) => r && r.id && isFailedRow(r, skips)).length;
+    const fb = $("#wf-failed");
+    if (fb) {
+      fb.textContent = failed > 0 ? `失败 ${failed} 行` : "没有失败行";
+      fb.className = failed > 0 ? "who wf-failed is-bad" : "who";
+    }
+    renderTaskTable(d);
+    if (taskDetailId) await showTaskDetail(taskDetailId);
+  } catch (e) {
+    // 轮询失败不弹提示条：它每 10 秒一次，弹一次就刷屏。
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(() => { refreshLive(); }, 10000);
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
 /* ---------------------------------------------------------------- 动作 */
 
 async function saveMapping() {
@@ -700,6 +927,11 @@ $("#wf-download").addEventListener("click", (e) => {
 $("#wf-packages").addEventListener("click", (e) => {
   e.preventDefault();
   guard("下载全部产物包", downloadPackages);
+});
+
+$("#wf-task-toggle").addEventListener("click", (e) => {
+  e.preventDefault();
+  setTaskView(!taskView);
 });
 
 /* 角色选择器里的五颗按钮在页面加载时就建好：它们不依赖任何一份行数据，

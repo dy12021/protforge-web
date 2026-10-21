@@ -476,6 +476,61 @@ async function checkSkippedRows(r) {
 }
 
 /**
+ * 工作流页的**任务表**：一行一个任务，看得到跑到哪一步、成没成、为什么。
+ *
+ * 断的是**渲染结果**（表里有几行、每格是什么），不是源码里有没有某个词。
+ * 三件事一起看：
+ *   ① 已跑起来的行都在表里（没跑的不列——用户原话「可以不展开还没运行的」）；
+ *   ② 状态跟「每一行」那张表用**同一套判据**（用户跳过的行不许表现成失败）；
+ *   ③ 结果说明与失败原因分得开（summary 与 error 不是一回事）。
+ */
+function checkTaskTable(r) {
+  const detail = FIXTURES['/api/workflows/1'];
+  const box = (id) => r.sandbox.document.getElementById(id);
+  const bad = [];
+  // 桩的 innerHTML = '' 不清 children（真 DOM 会），这里手动清一下再重绘——
+  // 否则上面 openDetail 已经画过一遍，计数会翻倍。
+  const body = box('wf-task-body');
+  body.children.length = 0;
+  r.sandbox.renderTaskTable(detail);
+  const rows = (body.children || []);
+  if (rows.length !== 4) {
+    bad.push(`任务表里有 ${rows.length} 行，应该是 4 行（4 个行任务都跑起来了）`);
+  }
+  const cells = (n) => (rows[n] && rows[n].children) || [];
+  // **用 textOf 不用 textContent**：状态格是「色点 span + 文本节点」拼出来的，
+  // 桩的 textContent 只存直接赋值的那一句，读它永远是空串。
+  const cellText = (n, i) => textOf(cells(n)[i]);
+  // 状态列（第 2 格）：第 3 行是用户跳过的，必须是「已跳过」而不是「失败」
+  if (cellText(2, 1) !== '已跳过') {
+    bad.push(`任务表里用户跳过的那一行显示「${cellText(2, 1)}」，应该是「已跳过」`);
+  }
+  const dot = cells(2)[1] && cells(2)[1].children && cells(2)[1].children[0];
+  if (!dot || dot.dataset.status !== 'skipped') {
+    bad.push('任务表里跳过那行的状态色点不是 skipped');
+  }
+  if (cellText(3, 1) !== '失败') {
+    bad.push(`任务表里真失败的那一行显示「${cellText(3, 1)}」，应该是「失败」`);
+  }
+  // 结果说明与失败原因分得开：完成的行给 summary，失败的行给 error
+  if (cellText(0, 4) !== '算完了') {
+    bad.push(`任务表里完成那行的结果列是「${cellText(0, 4)}」，应该是 summary「算完了」`);
+  }
+  if (cellText(3, 4) !== '计算进程崩了') {
+    bad.push(`任务表里失败那行的结果列是「${cellText(3, 4)}」，应该是 error「计算进程崩了」`);
+  }
+  // 表头要有那几列
+  const head = box('wf-task-head');
+  const headText = (head.children || []).map((th) => String(th.textContent || '').trim());
+  for (const need of ['行', '状态', '当前步骤', '产物']) {
+    if (!headText.includes(need)) {
+      bad.push(`任务表表头少了「${need}」这一列（现有：${headText.join(' | ')}）`);
+    }
+  }
+  return bad;
+}
+
+/**
  * Minor-2 的跨语言一致性围栏：本地预览与服务端 workflow.render() 是**两份实现**，
  * 同一段模板 + 同一组取值，两边必须给出同一句话。
  *
@@ -908,6 +963,7 @@ for (const f of files) {
     //   ② 本地预览与服务端 render() 必须给出同一句话（Minor-2）。
     if (/web[\\/]workflow\.js$/.test(f)) {
       for (const m of await checkSkippedRows(r)) errs.push(new Error(m));
+      for (const m of checkTaskTable(r)) errs.push(new Error(m));
       for (const m of checkParity(r.sandbox)) errs.push(new Error(m));
     }
     // 值班台的反思按钮：确认之前不许写，确认之后必须写。
