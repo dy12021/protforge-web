@@ -1834,6 +1834,14 @@ class Dispatcher:
         env["PROTFORGE_WEB_DATA_ROOT"] = str(self.data_root)
         # agent 侧的路径守卫要跟服务端用同一个 ProtForge 根，否则它读的是另一片 outputs
         env.setdefault("PROTFORGE_DATA", DEFAULT_PROTFORGE_DATA)
+        # 计算进程这一整棵子树的 stdout/stderr 一律用 UTF-8。
+        # Windows 上 Python 的 stdout 默认跟随控制台 code page（本机是 cp936），
+        # 中文会被按 GBK 写出来；而协议层是 UTF-8（_pump_stdout 按 utf-8 解，
+        # 写给 agent 的 stdin 也按 utf-8 编码），两边对不上，中文全变 U+FFFD。
+        # node 自己不受影响（它的 stdout 恒为 UTF-8），但 agent 拉起的 Python
+        # 技能脚本、以及测试里当 fake agent 的 Python 子进程都会中招。
+        # 只设 PYTHONIOENCODING（stdout/stderr），不动 open() 的默认编码。
+        env["PYTHONIOENCODING"] = "utf-8"
 
         # 模型配置跟着任务走：写在工作目录里，跟着任务建、跟着任务删。
         agent_dir, have_key = llm.materialize_model_config(work_dir)
