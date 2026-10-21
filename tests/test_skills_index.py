@@ -208,6 +208,20 @@ def test_pesto_and_esm_timeouts_are_measured():
     assert timeout_for("esm") >= 600
 
 
+def test_parasurf_timeout_is_measured():
+    """parasurf 于 2026-10-21 实测：CPU torch、223 残基的 Fv，约 9 分钟。
+
+    这份镜像装的是 CPU 版 torch，网格采样和力场特征全在 CPU 上跑——按
+    「秒级几何工具」的直觉给档位，会把一次本来能跑完的推理腰斩。
+
+    档位取 MED（2h）：比默认 4h 早收口，又比实测宽一个数量级。
+    """
+    assert timeout_for("parasurf") == skills_index.TIMEOUT_MED_S
+    assert timeout_for("protforge-parasurf") == skills_index.TIMEOUT_MED_S
+    # 实测约 540 s。档位至少要留一个数量级的余量给更大的 Fv。
+    assert timeout_for("parasurf") >= 600
+
+
 # --- 其它字段 -----------------------------------------------------------
 
 

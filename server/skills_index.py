@@ -66,6 +66,11 @@ _TIMEOUT_BY_SKILL: dict[str, int] = {
     # 数量级，收口时间砍一半。
     "pesto": TIMEOUT_MED_S,
     "esm": TIMEOUT_MED_S,
+    # parasurf 实测（2026-10-21 本机，CPU torch，223 残基的 Fv）：约 9 分钟。
+    # 这份镜像装的是 CPU 版 torch，网格采样和力场特征全在 CPU 上跑，比看上去慢得多。
+    # 档位取 MED（2h）：比默认 4h 早收口两小时，同时比实测宽一个数量级，
+    # 大输入的 Fv 也不会被腰斩。
+    "parasurf": TIMEOUT_MED_S,
 }
 
 # 档位未经验证的技能，供上层在 UI/日志上标出来，别让人当成实测值引用。
