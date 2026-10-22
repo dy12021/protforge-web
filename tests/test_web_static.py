@@ -802,13 +802,20 @@ def test_skipped_rows_get_a_colour_of_their_own_not_the_queued_one():
         "跳过画成了失败那档红色——用户分不清「我跳过的」和「跑失败的」"
 
 
-def test_homepage_links_to_the_workflow_page():
-    """两边都要有入口：首页进得去（规格 8.2「独立页面怎么挂上去」），工作流页回得来。
+def test_workflows_live_on_the_board_not_behind_a_link():
+    """工作流**不再单独设一个页面**——它以主卡片的形式长在同一块看板上。
 
-    上一版是零入口——页面能打开，但没人找得到。
+    上一版要求首页挂一个跳去 workflow.html 的链接，那是在「工作流是另一个页面」
+    的前提下。现在首页再挂一条跳去独立页的路，等于给同一件事留两个入口。
+
+    **独立页本身还在**（web/workflow.html 与它自己的测试都在），所以它回首页的
+    链接要留着——那是「直接访问旧地址」的人的回程路。
     """
-    assert 'href="workflow.html"' in _html("index.html"), \
-        "首页没有工作流入口，页面只能靠手敲 URL 到达"
+    html = _html("index.html")
+    assert 'href="workflow.html"' not in html, \
+        "首页还挂着一个跳去独立工作流页的链接——工作流已经在看板里了"
+    assert 'id="wf-zone"' in html or 'id="wf-cards"' in html, \
+        "首页看板上没有工作流区，工作流无处可去"
     assert 'href="index.html"' in _html("workflow.html"), \
         "工作流页没有回到首页的链接"
 

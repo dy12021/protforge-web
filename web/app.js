@@ -9,6 +9,10 @@
  *   2. 零外链零构建：只用同源 style.css / app.js，字体全是系统自带。
  *   3. 鉴权走 Authorization: Bearer（不放 Cookie），所以实时流不能用
  *      EventSource（它发不了自定义头），必须 fetch + ReadableStream 自己读。
+ *
+ * 这一版把**工作流并进了看板**：以前工作流是另一个页面（workflow.html），
+ * 现在它是看板上的主卡片，展开就是行列表；新建与修改工作流也并进了
+ * 「提交计算任务」这个对话框的两种模式。
  */
 
 /* ---------------------------------------------------------------- 状态机
@@ -46,6 +50,82 @@ const FIELD_CN = {
   summary: "结果说明", error: "失败原因",
 };
 
+/* ---------------------------------------------- 工作流的词表
+ *
+ * 工作流的 status 词与行任务**不是**一套：workflows 表的 CHECK 是
+ * draft/running/paused/finished，终态是 finished；行任务才是 done/failed。
+ * 混用会写出永远不触发的分支。 */
+const WF_STATUS_LABEL = {
+  draft: "未开始", running: "运行中", paused: "已暂停", finished: "已跑完",
+};
+/* 工作流状态 → 芯片类。颜色只借任务那五个（灰=排队、暖=在算、紫=打包、
+ * 绿=完成、红=失败），不另起一套色：同一个界面里两种语义用两套颜色，
+ * 读的人就要先学一遍。 */
+const WF_CHIP = {
+  draft: "chip-queued", running: "chip-running",
+  paused: "chip-none", finished: "chip-done",
+};
+/* 行任务的第五种显示态：跳过。库里它是 failed（tasks.status 没有 skipped），
+ * 界面按 workflow_skips 推出来——跳过的行「没跑过」，与「跑失败了」是两件事。 */
+const ROW_STATUS_LABEL = {
+  queued: "已排队", running: "计算中", packaging: "打包中",
+  done: "已完成", failed: "失败", skipped: "已跳过",
+};
+const WF_ROLES = ["ignore", "key", "input", "context", "output"];
+const WF_ROLE_LABEL = {
+  ignore: "忽略", key: "标识列", input: "输入列",
+  context: "上下文", output: "结果列",
+};
+/* 结果字段是服务端白名单，写一个不在表里的名字整条保存会 422。 */
+const WF_OUTPUT_FIELDS = ["status", "summary", "error", "artifacts"];
+const WF_OUTPUT_LABEL = {
+  status: "状态", summary: "结果说明", error: "失败原因", artifacts: "产物清单",
+};
+
+/* ---------------------------------------------- 筛选条的统一状态词
+ *
+ * 任务与工作流各有一套状态词，但**筛选项只有一套**——否则「全部」视图下
+ * 一个下拉框没法同时筛两种东西。每一条筛选项写清楚它盖住哪些状态：
+ * 任务那边一套、工作流那边一套，缺一边的就是「这一类在这一档上没有对应」。 */
+const FILTER_OPTIONS = [
+  { key: "", label: "全部状态" },
+  { key: "active", label: "进行中" },
+  { key: "queued", label: "排队中" },
+  { key: "running", label: "计算中" },
+  { key: "packaging", label: "打包中" },
+  { key: "paused", label: "已暂停" },
+  { key: "done", label: "已完成" },
+  { key: "failed", label: "失败" },
+];
+const FILTER_TASKS = {
+  active: ["queued", "running", "packaging"],
+  queued: ["queued"], running: ["running"], packaging: ["packaging"],
+  paused: [], done: ["done"], failed: ["failed"],
+};
+const FILTER_WORKFLOWS = {
+  active: ["draft", "running", "paused"],
+  queued: ["draft"], running: ["running"], packaging: [],
+  paused: ["paused"], done: ["finished"], failed: [],
+};
+/* 「只看在跑的」覆盖的那一档（与 active 同一口径）。 */
+const ACTIVE_TASKS = ["queued", "running", "packaging"];
+const ACTIVE_WORKFLOWS = ["draft", "running", "paused"];
+
+/* ------------------------------------------------- 时间线的事件分档
+ *
+ * 关键事件（状态变更、报错、收口、打包起止）单独一路突出；
+ * 过程输出（日志、说明、上传、修改）降级成一组，收起来。
+ *
+ * **step 事件不进时间线**：一次计算里它能被调用几百次，混进来时间线就被刷屏，
+ * 而"当前在干什么"只需要卡片上那一条。 */
+const KEY_KINDS = new Set(["created", "status", "error", "finished", "package"]);
+const TIMELINE_FILTERS = [
+  { key: "all", label: "全部" },
+  { key: "key", label: "关键事件" },
+  { key: "error", label: "只看报错" },
+  { key: "status", label: "只看状态变化" },
+];
+
 const state = {
   items: [],            // GET /api/tasks 的快照（最新在前）
   byId: new Map(),      // id -> task
@@ -54,7 +134,18 @@ const state = {
   reached: new Map(),   // taskId -> 走到的站序；failed 时用它把红点放对位置
   streams: new Map(),   // taskId -> { stop, ac, lastId }
   cols: new Map(),      // status -> 列的 .col-list
-  filter: { q: "", status: "", activeOnly: false },
+  filter: { q: "", status: "", activeOnly: false, view: "all" },
+  workflows: [],        // GET /api/workflows 的快照
+  wfById: new Map(),    // workflowId -> workflow
+  wfCards: new Map(),   // workflowId -> 卡片元素（复用）
+  wfOpen: new Set(),    // 展开了哪些工作流
+  wfDetail: new Map(),  // workflowId -> 详情快照（行列表）
+  wfStatus: new Map(),  // workflowId -> /api/status/workflow/{id} 的快照
+  wfEdit: null,         // 对话框当前在配的工作流（null = 新建）
+  wfDraft: null,        // 对话框里已上传的表（{workflow, headers, row_count}）
+  wfCols: [],           // 对话框里的列模型（唯一事实）
+  timelineFilter: "all",
+  timelineOpen: false,  // 过程输出那一组是展开还是收起
   openId: null,         // 抽屉当前开着的任务
   editing: false,       // 抽屉里有字段正在编辑 —— 此时**不重绘抽屉**
   me: null,
@@ -146,6 +237,24 @@ function el(tag, cls, text) {
 function fmtTime(ts) {
   if (typeof ts !== "string" || ts.length < 16 || ts[10] !== "T") return ts || "";
   return ts.slice(5, 10) + " " + ts.slice(11, 16);
+}
+
+/* 耗时：秒 -> 人看得懂的样子。跑了 3 小时的和跑了 40 秒的要能一眼分开。 */
+function fmtDur(sec) {
+  const n = Number(sec);
+  if (!isFinite(n) || n < 0) return "";
+  if (n < 60) return Math.round(n) + " 秒";
+  if (n < 3600) return Math.round(n / 60) + " 分钟";
+  if (n < 86400) return (n / 3600).toFixed(1) + " 小时";
+  return (n / 86400).toFixed(1) + " 天";
+}
+
+/* 两个 ISO 时间戳之间的秒数。任一头缺了就说不知道，不猜。 */
+function spanSec(from, to) {
+  if (!from || !to) return null;
+  const a = Date.parse(from), b = Date.parse(to);
+  if (!isFinite(a) || !isFinite(b)) return null;
+  return Math.max(0, Math.round((b - a) / 1000));
 }
 
 function setMsg(host, text, kind) {
@@ -302,8 +411,11 @@ function buildCols() {
 function filtered() {
   const q = state.filter.q.toLowerCase();
   return state.items.filter(t => {
-    if (state.filter.status && t.status !== state.filter.status) return false;
-    if (state.filter.activeOnly && !ACTIVE.has(t.status)) return false;
+    if (state.filter.status) {
+      const allow = FILTER_TASKS[state.filter.status] || [];
+      if (allow.indexOf(t.status) < 0) return false;
+    }
+    if (state.filter.activeOnly && ACTIVE_TASKS.indexOf(t.status) < 0) return false;
     if (!q) return true;
     return (t.title + " " + (t.brief || "") + " " + (t.step || "")).toLowerCase().indexOf(q) >= 0;
   });
@@ -332,12 +444,40 @@ function render() {
 function renderStatusFilter() {
   const sel = document.getElementById("status-filter");
   sel.textContent = "";
-  sel.append(new Option("全部状态", ""));
-  COLUMNS.forEach(c => sel.append(new Option(c.label, c.key)));
+  FILTER_OPTIONS.forEach(o => sel.append(new Option(o.label, o.key)));
   sel.value = state.filter.status;
 }
 
-// ---------------------------------------------------------------- 数据加载
+/* ---------------------------------------------------------------- 筛选条
+ *
+ * 视图范围（全部 / 普通任务 / 工作流）+ 状态 + 关键字。**纯前端筛选**：
+ * GET /api/tasks 没有声明 q 参数（服务端只按 owner 过滤），拿关键词去请求
+ * 后端只会白跑一趟，而且搜不搜得到全看后端怎么实现。
+ */
+function applyView() {
+  const view = state.filter.view;
+  document.getElementById("filters").dataset.view = view;   // 给 CSS 一个钩子
+  document.getElementById("wf-zone").hidden = view === "task";
+  document.getElementById("board").hidden = view === "workflow";
+  document.querySelectorAll("#view-switch .seg-btn").forEach(b =>
+    b.classList.toggle("is-on", b.dataset.view === view));
+  render();
+  renderWorkflows();
+  renderFilterNote();
+}
+
+function renderFilterNote() {
+  const view = state.filter.view;
+  const t = filtered().length;
+  const w = filteredWorkflows().length;
+  const parts = [];
+  if (view !== "workflow") parts.push(t + " 个计算任务");
+  if (view !== "task") parts.push(w + " 个工作流");
+  const note = document.getElementById("filter-note");
+  note.textContent = parts.length ? parts.join(" · ") : "";
+}
+
+/* ---------------------------------------------------------------- 数据加载 */
 
 let loadSeq = 0;
 
@@ -530,13 +670,15 @@ function scheduleRefresh(id) {
 
 // ---------------------------------------------------------------- 抽屉
 
-/* 时间线是活动流，不是日志表：一条竖线 + 一个点，主文本在上、时间与操作人在下。
- * 两点硬要求：不裸露字段名（FIELD_CN 翻译），状态跃迁染成状态芯片而不是文字箭头。
- * `step` 事件**不进时间线**：一次计算里它能被调用几百次，混进来时间线就被刷屏，
- * 而"当前在干什么"只需要卡片上那一条（SPEC 20.3）。 */
+/* 状态芯片：任务与工作流共用一套语汇，颜色只借那五个状态色。 */
 function statusChip(key) {
   if (!key) return el("span", "chip chip-none", "—");
   return el("span", "chip chip-" + key, STATUS_LABEL[key] || key);
+}
+
+function wfStatusChip(key) {
+  const k = key || "draft";
+  return el("span", "chip " + (WF_CHIP[k] || "chip-none"), WF_STATUS_LABEL[k] || k);
 }
 
 function prettyEdited(msg) {
@@ -544,34 +686,6 @@ function prettyEdited(msg) {
   if (!m) return "改了内容";
   const names = m[1].split("、").map(x => FIELD_CN[x] || x);
   return "改了" + names.join("、");
-}
-
-function eventLine(e) {
-  const li = el("li", "tl-item tl-" + e.kind);
-  li.append(el("span", "tl-dot"));
-  const main = el("div", "tl-main");
-  const line = el("div", "tl-line");
-  if (e.kind === "status") {
-    line.append(statusChip(e.from_status), el("span", "tl-arrow", "→"), statusChip(e.to_status));
-    if (e.message) line.append(el("span", "tl-what", e.message));
-  } else if (e.kind === "created") {
-    line.append(el("span", "tl-what", "提交了这个计算任务"));
-  } else if (e.kind === "edited") {
-    line.append(el("span", "tl-what", prettyEdited(e.message)));
-  } else {
-    line.append(el("span", "tl-what",
-      (KIND_LABEL[e.kind] || e.kind) + (e.message ? "：" + e.message : "")));
-  }
-  main.append(line, el("div", "tl-meta",
-    fmtTime(e.created_at) + " · " + (ACTOR_LABEL[e.actor] || e.actor)));
-  li.append(main);
-  return li;
-}
-
-function taskEvents(id) {
-  const m = state.events.get(id);
-  const list = m ? [...m.values()].filter(e => e.kind !== "step") : [];
-  return list.sort((a, b) => (a.id || 0) - (b.id || 0) || (a.created_at || "").localeCompare(b.created_at || ""));
 }
 
 /* 区块 = 小标题 + 右侧小字「编辑」。内容默认只读，点「编辑」才进编辑态，
@@ -804,15 +918,7 @@ function drawDrawer(id, t) {
 
   /* --- 时间线 ------------------------------------------------------------ */
   const tlSlot = section(body, "时间线");
-  const evs = taskEvents(id);
-  if (!evs.length) {
-    tlSlot.append(el("p", "tl-empty",
-      "这一页只显示打开之后收到的进展。要完整历史请在任务运行时打开。"));
-  } else {
-    const ul = el("ul", "timeline");
-    evs.forEach(e => ul.append(eventLine(e)));
-    tlSlot.append(ul);
-  }
+  drawTimeline(tlSlot, id);
 
   /* --- 危险区 ------------------------------------------------------------ */
   if (state.canDelete) {
@@ -824,6 +930,108 @@ function drawDrawer(id, t) {
     body.append(zone);
   }
 }
+
+// ---------------------------------------------------------- 时间线视图
+//
+// 时间线是**活动流**，不是日志表：一条竖轴 + 一个节点，主文本在上、
+// 时间与操作人在下。三件事是硬要求：
+//
+//   1. 关键事件突出（状态变更、报错、收口、打包起止），过程输出降级并收起来；
+//   2. 能按类型过滤（全部 / 关键事件 / 只看报错 / 只看状态变化）；
+//   3. **不裸露字段名**——服务端 message 是中文契约，裸字段名的翻译放显示层。
+
+function taskEvents(id) {
+  const m = state.events.get(id);
+  const list = m ? [...m.values()].filter(e => e.kind !== "step") : [];
+  return list.sort((a, b) => (a.id || 0) - (b.id || 0) || (a.created_at || "").localeCompare(b.created_at || ""));
+}
+
+function timelineKeeps(e) {
+  switch (state.timelineFilter) {
+    case "key": return KEY_KINDS.has(e.kind);
+    case "error": return e.kind === "error";
+    case "status": return e.kind === "status";
+    default: return true;
+  }
+}
+
+/* 一条事件的主文本。**不出现字段名**：状态跃迁渲染成状态芯片，
+ * 「修改了：body」翻成「改了需求说明」，其余按 KIND_LABEL 拼。 */
+function eventHead(e) {
+  const head = el("div", "tl-head");
+  if (e.kind === "status") {
+    head.append(statusChip(e.from_status), el("span", "tl-arrow", "→"), statusChip(e.to_status));
+    if (e.message) head.append(el("span", "tl-what", e.message));
+  } else if (e.kind === "created") {
+    head.append(el("span", "tl-what", "提交了这个计算任务"));
+  } else if (e.kind === "edited") {
+    head.append(el("span", "tl-what", prettyEdited(e.message)));
+  } else if (e.kind === "error") {
+    head.append(el("span", "tl-what", e.message || "出错了"));
+  } else {
+    head.append(el("span", "tl-what",
+      (KIND_LABEL[e.kind] || e.kind) + (e.message ? "：" + e.message : "")));
+  }
+  return head;
+}
+
+function eventNode(e) {
+  const li = el("li", "tl-node tl-" + e.kind + (KEY_KINDS.has(e.kind) ? " is-key" : " is-soft"));
+  li.append(el("span", "tl-point"));
+  const card = el("div", "tl-card");
+  card.append(eventHead(e));
+  card.append(el("div", "tl-meta",
+    fmtTime(e.created_at) + " · " + (ACTOR_LABEL[e.actor] || e.actor)));
+  li.append(card);
+  return li;
+}
+
+function drawTimeline(host, id) {
+  const evs = taskEvents(id).filter(timelineKeeps);
+  if (!evs.length) {
+    host.append(el("p", "tl-empty",
+      "这一页只显示打开之后收到的进展。要完整历史请在任务运行时打开。"));
+    return;
+  }
+  /* 过滤器：放在区块头上，点一下就换一批事件。 */
+  const bar = el("div", "tl-bar");
+  TIMELINE_FILTERS.forEach(f => {
+    const b = el("button", "tl-chip", f.label);
+    b.type = "button";
+    b.dataset.tlfilter = f.key;
+    if (state.timelineFilter === f.key) b.classList.add("is-on");
+    b.onclick = () => {
+      state.timelineFilter = f.key;
+      host.textContent = "";
+      drawTimeline(host, id);
+    };
+    bar.append(b);
+  });
+  host.append(bar);
+
+  const key = evs.filter(e => KEY_KINDS.has(e.kind));
+  const soft = evs.filter(e => !KEY_KINDS.has(e.kind));
+
+  const track = el("ol", "tl-track");
+  key.forEach(e => track.append(eventNode(e)));
+  host.append(track);
+
+  if (soft.length) {
+    /* 过程输出收起来。**收起的理由写在这里**：这类事件一次计算能有几百条，
+     * 摊开就把真正要读的那几条埋掉了。 */
+    const det = el("details", "tl-fold");
+    const sum = el("summary", null, "过程输出（" + soft.length + " 条）");
+    det.append(sum);
+    const inner = el("ol", "tl-track is-soft");
+    soft.forEach(e => inner.append(eventNode(e)));
+    det.append(inner);
+    det.open = state.timelineOpen;
+    det.addEventListener("toggle", () => { state.timelineOpen = det.open; });
+    host.append(det);
+  }
+}
+
+/* ---------------------------------------------------------------- 危险动作 */
 
 function abortBtn(t) {
   const b = el("button", "btn btn-warn", "中止任务");
@@ -980,6 +1188,682 @@ function setDrawerFull(on) {
 }
 function isDrawerFull() { return document.getElementById("drawer").classList.contains("is-full"); }
 
+// ---------------------------------------------------------------- 工作流
+//
+// 工作流以前是另一个页面（workflow.html）。现在它是看板上的**主卡片**：
+// 展开后是行列表（行号、状态、当前步骤、产物、耗时），旁边是控制按钮。
+//
+// 判据与旧页完全一致，**只动界面不改业务**：
+//   - 跳过的行按 skipped 显示（判据只有 workflow_skips 一处）；
+//   - 「失败行数」在服务端没给出来的时候写「没算出来」，不当成 0；
+//   - 动作按状态开关：跑完了再点开始没有意义。
+
+/** 跳过的行集合。库里它是 failed（tasks.status 没有 skipped）。 */
+function skipSet(d) {
+  return new Set((d && d.skips) || []);
+}
+
+/** 面向用户的那一行是什么状态。**跳过优先于 status**。 */
+function rowStatus(row, skips) {
+  return skips.has(Number(row.workflow_row)) ? "skipped" : (row.status || "queued");
+}
+
+/** 「只看失败行」与两个失败计数共用这一条判据。 */
+function isFailedRow(row, skips) {
+  return rowStatus(row, skips) === "failed";
+}
+
+function filteredWorkflows() {
+  const q = state.filter.q.toLowerCase();
+  return state.workflows.filter(w => {
+    if (state.filter.status) {
+      const allow = FILTER_WORKFLOWS[state.filter.status] || [];
+      if (allow.indexOf(w.status) < 0) return false;
+    }
+    if (state.filter.activeOnly && ACTIVE_WORKFLOWS.indexOf(w.status) < 0) return false;
+    if (!q) return true;
+    return (w.name || "").toLowerCase().indexOf(q) >= 0;
+  });
+}
+
+async function loadWorkflows() {
+  const got = await api("GET", "/api/workflows");
+  const list = Array.isArray(got) ? got : (got.workflows || []);
+  state.workflows = list;
+  state.wfById = new Map(list.map(w => [Number(w.id), w]));
+  renderWorkflows();
+  renderFilterNote();
+}
+
+function renderWorkflows() {
+  const host = document.getElementById("wf-cards");
+  const empty = document.getElementById("wf-empty");
+  if (!host) return;
+  const list = filteredWorkflows();
+  const seen = new Set();
+  list.forEach(w => {
+    const id = Number(w.id);
+    seen.add(id);
+    let node = state.wfCards.get(id);
+    if (!node) { node = makeWorkflowCard(w); state.wfCards.set(id, node); }
+    paintWorkflowCard(node, w);
+    if (node.parentNode !== host) host.appendChild(node);
+  });
+  state.wfCards.forEach((node, id) => {
+    if (!seen.has(id)) { node.remove(); state.wfCards.delete(id); }
+  });
+  empty.hidden = list.length > 0;
+  document.getElementById("wf-zone-sub").textContent = list.length
+    ? (list.length + " 个 · 表格每行一个计算任务，逐行串行跑")
+    : "";
+}
+
+function makeWorkflowCard(w) {
+  const card = el("article", "wf-card");
+  card.dataset.id = w.id;
+
+  const head = el("div", "wfc-head");
+  head.append(el("div", "wfc-title", w.name || "（未命名工作流）"));
+  head.append(el("span", "wfc-chip"));
+  card.append(head);
+
+  const meta = el("div", "wfc-meta");
+  meta.append(el("span", "wfc-id", "#" + w.id));
+  meta.append(el("span", "wfc-count"));
+  meta.append(el("span", "wfc-failed"));
+  card.append(meta);
+
+  const bar = el("div", "bar");
+  bar.append(el("div", "bar-fill"));
+  card.append(bar);
+
+  const stats = el("div", "wfc-stats");
+  card.append(stats);
+
+  const acts = el("div", "wfc-acts");
+  const toggle = el("button", "btn", "展开");
+  toggle.type = "button";
+  toggle.onclick = () => toggleWorkflow(Number(w.id));
+  acts.append(toggle);
+  const edit = el("button", "btn", "编辑配置");
+  edit.type = "button";
+  edit.onclick = () => openComposerForWorkflow(Number(w.id));
+  acts.append(edit);
+  acts.append(el("span", "wfc-ctrl"));
+  card.append(acts);
+
+  const rows = el("div", "wfc-rows");
+  rows.hidden = true;
+  card.append(rows);
+  return card;
+}
+
+function paintWorkflowCard(card, w) {
+  const id = Number(w.id);
+  const failed = w.failed_rows;
+  const hasFailed = failed !== undefined && failed !== null;
+  const failedN = Number(failed) || 0;
+  const total = Number(w.total_rows) || 0;
+  const done = Number(w.cursor) || 0;
+
+  card.querySelector(".wfc-chip").className = "wfc-chip";
+  const chip = card.querySelector(".wfc-chip");
+  chip.className = "chip " + (WF_CHIP[w.status] || "chip-none");
+  chip.textContent = WF_STATUS_LABEL[w.status] || w.status;
+
+  card.querySelector(".wfc-id").textContent = "#" + id;
+  card.querySelector(".wfc-count").textContent = done + " / " + total + " 行";
+  const fb = card.querySelector(".wfc-failed");
+  /* **两个键缺一都要照实说**：缺 failed_rows 时写「没算出来」而不是 0，
+   * 把「没这个数」显示成「没有失败行」等于对着一个没发生过的故障报平安。 */
+  fb.textContent = !hasFailed
+    ? "失败行数没算出来"
+    : failedN > 0 ? ("失败 " + failedN + " 行") : "没有失败行";
+  fb.className = "wfc-failed" + (failedN > 0 ? " is-bad" : "");
+  card.classList.toggle("is-failed", failedN > 0);
+
+  const bar = card.querySelector(".bar");
+  const fill = bar.querySelector(".bar-fill");
+  fill.style.width = (total > 0 ? Math.round(done * 100 / total) : 0) + "%";
+  bar.classList.toggle("is-running", w.status === "running");
+
+  /* 预计还要多久、每小时能跑几行：服务端给了就用，没给就不说。 */
+  const st = state.wfStatus.get(id);
+  const stats = card.querySelector(".wfc-stats");
+  if (st) {
+    const bits = [];
+    if (st.eta_seconds != null) bits.push("预计还要 " + fmtDur(st.eta_seconds));
+    if (st.throughput_rows_per_hour != null) {
+      bits.push("每小时 " + st.throughput_rows_per_hour + " 行");
+    }
+    if (st.duration && st.duration.avg_row_seconds != null) {
+      bits.push("每行平均 " + fmtDur(st.duration.avg_row_seconds));
+    }
+    stats.textContent = bits.join(" · ");
+  } else {
+    stats.textContent = "";
+  }
+
+  /* 控制按钮按状态开关：跑完了再点开始没有意义，别的状态下点暂停是空转。 */
+  const ctrl = card.querySelector(".wfc-ctrl");
+  ctrl.textContent = "";
+  if (w.status === "running") {
+    ctrl.append(wfControlBtn(w.id, "pause", "暂停（当前行跑完再停）"));
+    ctrl.append(wfControlBtn(w.id, "abort", "中止整批"));
+  } else if (w.status === "paused") {
+    ctrl.append(wfControlBtn(w.id, "resume", "继续（接着跑下一行）"));
+    ctrl.append(wfControlBtn(w.id, "abort", "中止整批"));
+  } else if (w.status === "draft") {
+    ctrl.append(wfControlBtn(w.id, "start", "开始（逐行跑）"));
+  } else {
+    ctrl.append(el("span", "who", "已跑完。整批重跑要重新上传表格。"));
+  }
+
+  const toggle = card.querySelector(".wfc-acts .btn");
+  const open = state.wfOpen.has(id);
+  toggle.textContent = open ? "收起" : "展开";
+  card.querySelector(".wfc-rows").hidden = !open;
+  if (open) paintWorkflowRows(card.querySelector(".wfc-rows"), id);
+}
+
+function wfControlBtn(id, action, label) {
+  const b = el("button", "btn", label);
+  b.type = "button";
+  b.onclick = async () => {
+    if (action === "abort") {
+      const ok = await confirmAction({
+        title: "中止整批？",
+        lead: "中止之后这一批不会再往下走，已经算出来的部分仍然留着。",
+        items: [
+          "当前正在跑的那一行会被立刻停掉",
+          "已经归档的行结果仍能下载",
+          "中止之后只能继续或者重新上传一份表",
+        ],
+        okLabel: "确认中止",
+      });
+      if (!ok) return;
+    }
+    b.disabled = true;
+    try {
+      await api("POST", "/api/workflows/" + id + "/" + action);
+      await loadWorkflows();
+      await refreshOpenWorkflow(id);
+      setMsg(document.getElementById("board-msg"), "已" + actionLabel(action), "ok");
+    } catch (e) {
+      b.disabled = false;
+      setMsg(document.getElementById("board-msg"), e.message || "操作失败", "bad");
+    }
+  };
+  return b;
+}
+
+function actionLabel(action) {
+  return { pause: "暂停", resume: "继续", abort: "中止", start: "开始" }[action] || action;
+}
+
+/* 展开 / 收起。展开时才去取行列表——没展开就不打那个接口。 */
+async function toggleWorkflow(id) {
+  if (state.wfOpen.has(id)) {
+    state.wfOpen.delete(id);
+    const node = state.wfCards.get(id);
+    if (node) paintWorkflowCard(node, state.wfById.get(id));
+    return;
+  }
+  state.wfOpen.add(id);
+  const node = state.wfCards.get(id);
+  if (node) paintWorkflowCard(node, state.wfById.get(id));
+  await refreshOpenWorkflow(id);
+}
+
+async function refreshOpenWorkflow(id) {
+  if (!state.wfOpen.has(id)) return;
+  try {
+    const d = await api("GET", "/api/workflows/" + id);
+    state.wfDetail.set(id, d);
+  } catch (e) {
+    /* 读不到就保持上一次的样子，不把卡片清空。 */
+  }
+  /* 状态端点是**可选**的（还没上线时 404）：读不到就不显示预计时间，
+   * 而不是显示一个空进度条。 */
+  try {
+    const st = await api("GET", "/api/status/workflow/" + id);
+    state.wfStatus.set(id, st);
+  } catch (e) {
+    state.wfStatus.delete(id);
+  }
+  const node = state.wfCards.get(id);
+  const w = state.wfById.get(id);
+  if (node && w) paintWorkflowCard(node, w);
+}
+
+function paintWorkflowRows(host, id) {
+  const d = state.wfDetail.get(id);
+  host.textContent = "";
+  if (!d) {
+    host.append(el("p", "tl-empty", "正在取这一批的行…"));
+    return;
+  }
+  const rows = d.rows || [];
+  const skips = skipSet(d);
+  const table = el("table", "wf-rows-table");
+  const head = el("thead");
+  const htr = el("tr");
+  ["行", "状态", "当前步骤", "产物", "耗时"].forEach(t => htr.append(el("th", null, t)));
+  head.append(htr);
+  table.append(head);
+  const body = el("tbody");
+  if (!rows.length) {
+    const tr = el("tr");
+    const td = el("td", "wf-rows-empty", "还没有跑起来的行");
+    td.colSpan = 5;
+    tr.append(td);
+    body.append(tr);
+  }
+  rows.forEach(row => {
+    const tr = el("tr");
+    tr.append(el("td", "wf-rownum", String(Number(row.workflow_row) + 1)));
+    const st = el("td");
+    const dot = el("span", "wf-dot");
+    dot.dataset.status = rowStatus(row, skips);
+    st.append(dot);
+    st.append(el("span", null, ROW_STATUS_LABEL[rowStatus(row, skips)] || row.status || ""));
+    tr.append(st);
+    tr.append(el("td", "wf-row-step", row.step || "—"));
+    const art = el("td");
+    if (row.package_path) {
+      const b = el("button", "mini", "下载产物包");
+      b.type = "button";
+      b.onclick = (e) => {
+        e.stopPropagation();
+        downloadTaskPackage(row.id, Number(row.workflow_row) + 1).catch(err =>
+          setMsg(document.getElementById("board-msg"), err.message || "下载失败", "bad"));
+      };
+      art.append(b);
+    } else {
+      art.append(el("span", "who", "—"));
+    }
+    tr.append(art);
+    const dur = spanSec(row.created_at, row.done_at || row.updated_at);
+    tr.append(el("td", "wf-row-dur", dur == null ? "—" : fmtDur(dur)));
+    body.append(tr);
+  });
+  table.append(body);
+  host.append(table);
+}
+
+/* 单独下某一行的产物包。走 fetch + blob：令牌在请求头里，<a> 带不了。 */
+async function downloadTaskPackage(taskId, rowNo) {
+  const r = await fetch(apiBase() + "/api/tasks/" + taskId + "/package", { headers: authHeaders() });
+  if (!r.ok) throw await errFrom(r);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = el("a");
+  a.href = url;
+  a.download = "第" + rowNo + "行-产物包.zip";
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 20000);
+}
+
+// ---------------------------------------------------------------- 状态面板
+//
+// 三条硬口径：
+//   1. **系统指标与全局速度只对管理员显示**，判据是**账号角色**（/api/me 的 role），
+//      不是「哪个面板」——同一个账号在哪个面板上看到的范围都一样。
+//   2. 普通用户**根本不发**那个请求：不是先请求再藏起来。普通用户调
+//      /api/status/system 服务端会 403，前端连问都不问。
+//   3. 接口还没上线时（404）显示「暂无数据」，不报错、不空白。
+
+function isAdmin() { return !!(state.me && state.me.role === "admin"); }
+
+async function loadStatus() {
+  const admin = isAdmin();
+  let ov = null;
+  try {
+    ov = await api("GET", "/api/status/overview");
+  } catch (e) {
+    if (e && e.status === 401) { signedOut("登录已过期，请重新登录"); return; }
+    ov = null;
+  }
+  renderStatusOverview(ov, admin);
+  if (!admin) return;
+  let sys = null;
+  try {
+    sys = await api("GET", "/api/status/system");
+  } catch (e) {
+    sys = null;                       // 403 / 404 都按「拿不到」处理
+  }
+  renderStatusSystem(sys);
+}
+
+function metric(label, value, sub, tone) {
+  const m = el("div", "sp-metric" + (tone ? " is-" + tone : ""));
+  m.append(el("div", "sp-m-label", label));
+  m.append(el("div", "sp-m-value", value));
+  if (sub) m.append(el("div", "sp-m-sub", sub));
+  return m;
+}
+
+function renderStatusOverview(ov, admin) {
+  const host = document.getElementById("sp-metrics");
+  const note = document.getElementById("sp-note");
+  host.textContent = "";
+  if (!ov || !ov.tasks) {
+    host.append(el("p", "sp-empty", "暂无数据"));
+    note.textContent = "";
+    return;
+  }
+  const t = ov.tasks || {};
+  const d = ov.duration || {};
+  /* scope 写到面板上：管理员视角与本人视角不是同一件事，
+   * CSS 可以据此把「全局」那几格标出来。 */
+  document.getElementById("status-panel").dataset.scope = ov.scope || "";
+  const total = Number(t.total) || 0;
+  const running = (Number(t.queued) || 0) + (Number(t.running) || 0) + (Number(t.packaging) || 0);
+  const failed = Number(t.failed) || 0;
+
+  host.append(metric("任务总数", String(total), null));
+  host.append(metric("进行中", String(running),
+    "排队 " + (Number(t.queued) || 0) + " · 计算 " + (Number(t.running) || 0)
+    + " · 打包 " + (Number(t.packaging) || 0)));
+  host.append(metric("已完成", String(Number(t.done) || 0), null));
+  host.append(metric("失败", String(failed), failed ? "要处理" : null, failed ? "bad" : null));
+  const rate = ov.success_rate;
+  host.append(metric("成功率", (rate == null ? "—" : Math.round(rate * 100) + "%"),
+    null, failed ? "warn" : null));
+  if (d.avg_seconds != null) {
+    host.append(metric("平均耗时", fmtDur(d.avg_seconds),
+      d.median_seconds != null ? ("中位 " + fmtDur(d.median_seconds)) : null));
+  }
+  /* 全局速度**只给管理员**：普通用户的 overview 里压根没有这个字段。 */
+  if (admin && ov.throughput_per_hour != null) {
+    host.append(metric("全局速度", ov.throughput_per_hour + " 个/小时", "全部任务", "accent"));
+  }
+  note.textContent = ov.scope === "admin" ? "管理员视角 · 全平台" : "我的任务";
+}
+
+function renderStatusSystem(sys) {
+  const host = document.getElementById("sp-system");
+  host.textContent = "";
+  if (!sys) {
+    host.hidden = false;
+    host.append(el("p", "sp-empty", "系统指标暂无数据"));
+    return;
+  }
+  host.hidden = false;
+  const bar = (label, pct, text) => {
+    const b = el("div", "sp-bar-item");
+    const top = el("div", "sp-bar-head");
+    top.append(el("span", "sp-bar-label", label));
+    top.append(el("span", "sp-bar-val", text));
+    b.append(top);
+    const track = el("div", "sp-bar");
+    const fill = el("div", "sp-bar-fill");
+    fill.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + "%";
+    track.append(fill);
+    b.append(track);
+    return b;
+  };
+  const cpu = sys.cpu || {};
+  const mem = sys.memory || {};
+  const gpu = sys.gpu || {};
+  const disk = sys.disk || {};
+
+  host.append(bar("CPU", cpu.percent,
+    (cpu.percent == null ? "—" : cpu.percent + "%") + " · " + (cpu.cores || 0) + " 核"));
+  host.append(bar("内存", mem.percent,
+    (mem.percent == null ? "—" : mem.percent + "%") + " · "
+    + (mem.used_gb == null ? "—" : mem.used_gb) + " / " + (mem.total_gb == null ? "—" : mem.total_gb) + " GB"));
+  if (gpu.available === false) {
+    host.append(el("div", "sp-note-line", "无 GPU"));
+  } else {
+    host.append(bar("GPU", gpu.util_percent,
+      (gpu.util_percent == null ? "—" : gpu.util_percent + "%") + " · "
+      + (gpu.used_gb == null ? "—" : gpu.used_gb) + " / " + (gpu.total_gb == null ? "—" : gpu.total_gb) + " GB"));
+  }
+  host.append(bar("磁盘", disk.total_gb ? ((Number(disk.used_gb) || 0) / disk.total_gb * 100) : 0,
+    (disk.used_gb == null ? "—" : disk.used_gb) + " / " + (disk.total_gb == null ? "—" : disk.total_gb)
+    + " GB · 剩 " + (disk.free_gb == null ? "—" : disk.free_gb) + " GB"));
+}
+
+// ---------------------------------------------------------------- 提交表单
+//
+// 两种模式：**单个任务** 与 **工作流（表格 + 模板）**。
+// 工作流不再是另一个界面——新建与修改都走这一张表，字段按模式切换。
+
+function composerMode() {
+  const on = document.querySelector("#mode-switch .seg-btn.is-on");
+  return on ? on.dataset.mode : "task";
+}
+
+function setComposerMode(mode) {
+  document.querySelectorAll("#mode-switch .seg-btn").forEach(b =>
+    b.classList.toggle("is-on", b.dataset.mode === mode));
+  const isTask = mode === "task";
+  document.getElementById("c-task-fields").hidden = !isTask;
+  document.getElementById("c-wf-fields").hidden = isTask;
+  document.getElementById("c-title-h").textContent =
+    isTask ? "提交计算任务" : (state.wfEdit ? "修改工作流配置" : "新建工作流");
+  document.getElementById("c-lead").textContent = isTask
+    ? "用一句话说清想算什么。提交后平台自己编排技能链，中间不用管，进度在看板上看得到。"
+    : "上传一张表格，每一行算一个计算任务，逐行串行跑。表格绑定的变量写成两个大括号包起来，例如 {{seq}}。";
+  document.getElementById("c-save").textContent = isTask
+    ? "提交" : (state.wfEdit ? "保存配置" : "开始（逐行跑）");
+  /* 单个任务的两个必填项在切到工作流模式时不该再挡着提交。 */
+  document.getElementById("c-title").required = isTask;
+  document.getElementById("c-brief").required = isTask;
+}
+
+function openComposer() {
+  state.wfEdit = null;
+  state.wfDraft = null;
+  state.wfCols = [];
+  document.getElementById("c-title").value = "";
+  document.getElementById("c-brief").value = "";
+  document.getElementById("c-wf-file").value = "";
+  document.getElementById("c-wf-template").value = "";
+  document.getElementById("c-wf-writeback").checked = true;
+  document.getElementById("c-wf-cols").textContent = "";
+  document.getElementById("c-wf-note").textContent = "";
+  setComposerMode("task");
+  const dlg = document.getElementById("composer");
+  dlg.showModal();
+  document.getElementById("c-title").focus();
+}
+
+/* 修改一个已存在的工作流：把它的列与模板读进来改。 */
+async function openComposerForWorkflow(id) {
+  state.wfEdit = Number(id);
+  state.wfDraft = null;
+  let d;
+  try {
+    d = await api("GET", "/api/workflows/" + id);
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "打不开这个工作流", "bad");
+    return;
+  }
+  const wf = d.workflow || {};
+  state.wfCols = (d.columns || []).map(c => ({
+    col_index: Number(c.col_index),
+    header: c.header || "",
+    role: c.role,
+    slot: c.slot || "",
+    field: c.field || "",
+  }));
+  document.getElementById("c-title").value = "";
+  document.getElementById("c-brief").value = "";
+  document.getElementById("c-wf-template").value = wf.prompt_template || "";
+  document.getElementById("c-wf-writeback").checked = !!Number(wf.writeback);
+  document.getElementById("c-wf-note").textContent =
+    "正在修改「" + (wf.name || ("#" + id)) + "」· " + (Number(wf.total_rows) || 0) + " 行";
+  setComposerMode("workflow");
+  renderWfCols();
+  const dlg = document.getElementById("composer");
+  dlg.showModal();
+}
+
+/* 列的角色：每一列一个下拉（忽略 / 标识列 / 输入列 / 上下文 / 结果列），
+ * 选了输入列或上下文再给一个变量名，结果列给一个结果字段。 */
+function renderWfCols() {
+  const host = document.getElementById("c-wf-cols");
+  host.textContent = "";
+  if (!state.wfCols.length) {
+    host.append(el("p", "who", "先上传一张表格，表头出来之后在这里选每一列的用途。"));
+    return;
+  }
+  state.wfCols.forEach((c, i) => {
+    const row = el("div", "wf-col-row");
+    row.append(el("span", "wf-col-name", c.header || ("列" + (c.col_index + 1))));
+    const sel = el("select", "wf-col-role");
+    sel.setAttribute("aria-label", "这一列的用途");
+    WF_ROLES.forEach(r => sel.append(new Option(WF_ROLE_LABEL[r], r)));
+    sel.value = c.role;
+    sel.onchange = () => {
+      const role = sel.value;
+      c.role = role;
+      if (role !== "input" && role !== "context") c.slot = "";
+      if (role !== "output") c.field = "";
+      if (role === "output" && !c.field) c.field = WF_OUTPUT_FIELDS[1];
+      renderWfCols();
+    };
+    row.append(sel);
+    if (c.role === "input" || c.role === "context") {
+      const slot = el("input", "wf-col-slot");
+      slot.type = "text";
+      slot.placeholder = "变量名，例如 seq";
+      slot.value = c.slot || "";
+      slot.oninput = () => { c.slot = slot.value; };
+      row.append(slot);
+    } else if (c.role === "output") {
+      const f = el("select", "wf-col-field");
+      f.setAttribute("aria-label", "结果字段");
+      WF_OUTPUT_FIELDS.forEach(k => f.append(new Option(WF_OUTPUT_LABEL[k], k)));
+      f.value = c.field || WF_OUTPUT_FIELDS[1];
+      f.onchange = () => { c.field = f.value; };
+      row.append(f);
+    }
+    host.append(row);
+  });
+}
+
+/* 模板里的变量名，按出现顺序去重。 */
+function templateSlots(tpl) {
+  const out = [];
+  const re = /\{\{\s*([^{}\s]+)\s*\}\}/g;
+  let m;
+  while ((m = re.exec(tpl || "")) !== null) {
+    if (out.indexOf(m[1]) === -1) out.push(m[1]);
+  }
+  return out;
+}
+
+/* 第 2 步还缺什么：返回空串就是配好了。
+ * 判据与服务端 validate_binding 同一套——模板不是那句占位文本、每条输入/
+ * 上下文列都绑了变量名、模板里的变量都有列、绑了的变量模板里都用上了。 */
+function wfMissingConfig() {
+  const tpl = (document.getElementById("c-wf-template").value || "").trim();
+  if (!tpl) return "先写提示词模板";
+  const bound = state.wfCols.filter(c => c.role === "input" || c.role === "context");
+  if (!bound.length) return "至少把一列设成输入列或上下文";
+  if (bound.some(c => !(c.slot || "").trim())) return "有输入列或上下文列还没绑变量名";
+  const slots = bound.map(c => (c.slot || "").trim());
+  const used = templateSlots(tpl);
+  const unbound = used.filter(n => slots.indexOf(n) === -1);
+  if (unbound.length) return "提示词里的这些变量没有列绑定：" + unbound.join("、");
+  const unused = slots.filter(n => used.indexOf(n) === -1);
+  if (unused.length) return "这些列绑了变量但模板里没用到：" + unused.join("、");
+  return "";
+}
+
+/* 上传表格。FormData 自己带 boundary，**不能**手写 Content-Type，
+ * 否则浏览器不会补 boundary，服务端那边 multipart 解析直接失败。 */
+async function uploadWorkflowFile() {
+  const f = document.getElementById("c-wf-file").files[0];
+  const note = document.getElementById("c-wf-note");
+  if (!f) { note.textContent = "先选一个 xlsx 表格。"; return; }
+  note.textContent = "上传中…";
+  const fd = new FormData();
+  fd.append("file", f);
+  try {
+    const r = await fetch(apiBase() + "/api/workflows/upload",
+      { method: "POST", headers: authHeaders(), body: fd });
+    if (!r.ok) throw await errFrom(r);
+    const d = await r.json();
+    state.wfDraft = d;
+    state.wfEdit = null;
+    state.wfCols = (d.headers || []).map((h, i) => ({
+      col_index: i, header: h, role: "ignore", slot: "", field: "",
+    }));
+    note.textContent = f.name + " 共 " + (Number(d.row_count) || 0)
+      + " 行，选好每一列的用途再写模板。";
+    setComposerMode("workflow");
+    renderWfCols();
+  } catch (e) {
+    note.textContent = "上传失败：" + (e.message || "");
+  }
+}
+
+/* 保存列配置与模板。列是**整体替换**，所以服务端要的是完整的一份。 */
+async function saveWorkflowConfig(id) {
+  return api("POST", "/api/workflows", {
+    workflow_id: id,
+    prompt_template: document.getElementById("c-wf-template").value,
+    columns: state.wfCols.map(c => ({
+      col_index: c.col_index,
+      header: c.header,
+      role: c.role,
+      slot: (c.role === "input" || c.role === "context") ? (c.slot || "").trim() : "",
+      field: c.role === "output" ? c.field : "",
+    })),
+    writeback: document.getElementById("c-wf-writeback").checked,
+  });
+}
+
+document.getElementById("c-cancel").onclick = () => document.getElementById("composer").close();
+
+document.getElementById("composer-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const save = document.getElementById("c-save");
+  save.disabled = true;
+  try {
+    if (composerMode() === "task") {
+      const created = detailTask(
+        await api("POST", "/api/tasks", {
+          title: document.getElementById("c-title").value.trim(),
+          brief: document.getElementById("c-brief").value.trim(),
+        }), "提交任务");
+      document.getElementById("composer").close();
+      await load();
+      openDrawer(created.id);
+      return;
+    }
+
+    /* 工作流模式：新建要先有表（上传那一步已经建了记录），
+     * 修改则直接用现有 id。 */
+    const id = state.wfEdit || (state.wfDraft && state.wfDraft.workflow
+      ? Number(state.wfDraft.workflow.id) : null);
+    if (!id) throw new Error("先上传一张表格");
+    const gap = wfMissingConfig();
+    if (gap) throw new Error(gap);
+    await saveWorkflowConfig(id);
+    if (!state.wfEdit) {
+      await api("POST", "/api/workflows/" + id + "/start");
+    }
+    document.getElementById("composer").close();
+    await loadWorkflows();
+    setMsg(document.getElementById("board-msg"),
+      state.wfEdit ? "工作流配置已保存" : "工作流已提交，逐行开跑", "ok");
+  } catch (err) {
+    if (err && err.status === 401) signedOut("登录已过期，请重新登录");
+    else setMsg(document.getElementById("board-msg"), err.message || "提交失败", "bad");
+  } finally {
+    save.disabled = false;
+  }
+});
+
+document.getElementById("c-wf-upload").onclick = uploadWorkflowFile;
+
 // ---------------------------------------------------------------- 登录
 
 function showLogin(msg) {
@@ -1001,8 +1885,14 @@ function signedOut(msg) {
   state.cards.forEach(n => n.remove());
   state.cards.clear();
   state.cols.forEach(c => { c.list.textContent = ""; c.count.textContent = "0"; });
+  state.workflows = [];
+  state.wfById.clear();
+  state.wfCards.forEach(n => n.remove());
+  state.wfCards.clear();
   closeDrawer();
   document.getElementById("who").textContent = "";
+  document.getElementById("sp-metrics").textContent = "";
+  document.getElementById("sp-system").hidden = true;
   showLogin(msg || "请登录");
 }
 
@@ -1031,39 +1921,6 @@ document.getElementById("login-form").addEventListener("submit", async e => {
   }
 });
 
-// ---------------------------------------------------------------- 提交表单
-
-function openComposer() {
-  document.getElementById("c-title").value = "";
-  document.getElementById("c-brief").value = "";
-  const dlg = document.getElementById("composer");
-  dlg.showModal();
-  document.getElementById("c-title").focus();
-}
-
-document.getElementById("c-cancel").onclick = () => document.getElementById("composer").close();
-
-document.getElementById("composer-form").addEventListener("submit", async e => {
-  e.preventDefault();
-  const save = document.getElementById("c-save");
-  save.disabled = true;
-  try {
-    const created = detailTask(
-      await api("POST", "/api/tasks", {
-        title: document.getElementById("c-title").value.trim(),
-        brief: document.getElementById("c-brief").value.trim(),
-      }), "提交任务");
-    document.getElementById("composer").close();
-    await load();
-    openDrawer(created.id);
-  } catch (err) {
-    if (err && err.status === 401) signedOut("登录已过期，请重新登录");
-    else setMsg(document.getElementById("board-msg"), err.message, "bad");
-  } finally {
-    save.disabled = false;
-  }
-});
-
 // ---------------------------------------------------------------- 工具条
 
 let qTimer = null;
@@ -1072,10 +1929,27 @@ document.getElementById("q").oninput = e => {
   // 拿关键词去请求后端只会白跑一趟，而且搜不搜得到全看后端怎么实现。
   state.filter.q = e.target.value.trim();
   clearTimeout(qTimer);
-  qTimer = setTimeout(render, 120);         // 连续输入时合并重排，别每敲一下就重画整板
+  qTimer = setTimeout(() => { render(); renderWorkflows(); renderFilterNote(); }, 120);
 };
-document.getElementById("status-filter").onchange = e => { state.filter.status = e.target.value; render(); };
-document.getElementById("only-active").onchange = e => { state.filter.activeOnly = e.target.checked; render(); };
+document.getElementById("status-filter").onchange = e => {
+  state.filter.status = e.target.value;
+  render(); renderWorkflows(); renderFilterNote();
+};
+document.getElementById("only-active").onchange = e => {
+  state.filter.activeOnly = e.target.checked;
+  render(); renderWorkflows(); renderFilterNote();
+};
+document.getElementById("view-switch").onclick = e => {
+  const b = e.target.closest(".seg-btn");
+  if (!b) return;
+  state.filter.view = b.dataset.view;
+  applyView();
+};
+document.getElementById("mode-switch").onclick = e => {
+  const b = e.target.closest(".seg-btn");
+  if (!b) return;
+  setComposerMode(b.dataset.mode);
+};
 document.getElementById("new-btn").onclick = () => openComposer();
 document.getElementById("logout-btn").onclick = () => signedOut("已退出");
 document.getElementById("drawer-close").onclick = () => closeDrawer();
@@ -1103,6 +1977,8 @@ setInterval(() => {
   if (!state.me) return;          // 还没通过 /api/me 确认身份（含没登录）就别空转
   if (document.visibilityState !== "visible") return;
   reload();
+  loadWorkflows().catch(() => {});
+  state.wfOpen.forEach(id => refreshOpenWorkflow(id));
 }, 10000);
 
 // 计划里说这批名字暴露给控制台/端到端调试。顶层 const 不会挂到 window 上，
@@ -1111,7 +1987,9 @@ Object.assign(window, {
   api, state, el, render, load, reload, filtered, fmtTime,
   STATUS_ORDER, STATUS_LABEL, COLUMNS, buildRail, paintRail, slideRail,
   railIndex, openDrawer, closeDrawer, setDrawerFull, confirmAction,
-  taskEvents, eventLine, FIELD_CN, KIND_LABEL, ACTOR_LABEL, apiBase, detailTask,
+  taskEvents, FIELD_CN, KIND_LABEL, ACTOR_LABEL, apiBase, detailTask,
+  loadWorkflows, renderWorkflows, filteredWorkflows, toggleWorkflow, loadStatus,
+  drawTimeline, WF_STATUS_LABEL, ROW_STATUS_LABEL,
 });
 
 /* 登录与否由服务端说了算，不由 localStorage 里有没有令牌说了算。
@@ -1128,6 +2006,9 @@ async function boot() {
     document.getElementById("who").textContent =
       (who.username || "") + (who.role === "admin" ? "（管理员）" : "");
     await load();
+    /* 工作流读不到不该挡住看板：接口 404 时只是没有工作流这一块。 */
+    await loadWorkflows().catch(() => {});
+    await loadStatus().catch(() => {});
   } catch (e) {
     if (e && e.status === 401) {
       // 有过令牌才叫"过期"；一进来就没有是"还没登录"，提示语不该混成一句
@@ -1136,6 +2017,7 @@ async function boot() {
       setMsg(document.getElementById("board-msg"), (e && e.message) || "连不上服务", "bad");
     }
   }
+  applyView();
 }
 
 boot();

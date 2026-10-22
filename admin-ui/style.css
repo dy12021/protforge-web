@@ -372,7 +372,6 @@ button:disabled { opacity: .45; cursor: default; }
 .row-msg.is-ok { color: var(--st-done); border-color: var(--st-done); background: color-mix(in srgb, var(--st-done) 6%, transparent); }
 .row-msg.is-warn { color: var(--st-running); border-color: var(--st-running); }
 
-/* ------------------------------------------------------------------ 反思
  *
  * 每条反思是一张卡片而不是表格的一行：它要先读判断、再翻原文、最后才动手，
  * 三个动作挤进一行表格就没法点。左侧一道竖条说当前状态，与待确认产物那套
@@ -380,67 +379,28 @@ button:disabled { opacity: .45; cursor: default; }
  *
  * **正文默认收起**。反思正文不短，默认展开等于把这一页变成一堵墙，
  * 而管理员进来第一眼要的是「有几条等我判」。 */
-.refl {
-  background: var(--card); border: 1px solid var(--border);
-  border-left: 3px solid var(--st-queued);
-  border-radius: var(--r-sm); padding: .45rem .6rem; margin-bottom: .45rem;
-  display: flex; flex-direction: column; gap: .28rem;
-}
 .refl[data-status=reviewed] { border-left-color: var(--st-running); }
 .refl[data-status=applied]   { border-left-color: var(--st-done); }
 .refl[data-status=rejected]  { border-left-color: var(--border); opacity: .75; }
 .refl[data-status=failed]    { border-left-color: var(--st-failed); }
-.refl-top { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-.refl-task { font-weight: 600; overflow-wrap: anywhere; }
-.refl-when {
-  margin-left: auto; color: var(--fg-dim);
-  font-family: var(--mono); font-size: .7rem; white-space: nowrap;
-}
 /* 建议行刻意不染色：模型给的分类只是建议，定了之后才由 .refl-by 补一句
  * 「谁定成了什么」。染色会让两者看起来一样权威。 */
-.refl-suggest { font-size: .74rem; color: var(--fg-dim); }
 .refl-suggest b { color: var(--fg); }
-.refl-by { color: var(--fg-dim); }
-.refl-bad { font-size: .74rem; color: var(--st-failed); overflow-wrap: anywhere; }
-.refl-detail-row { display: flex; gap: .3rem; align-items: center; }
-.refl-acts { display: flex; gap: .3rem; flex-wrap: wrap; align-items: center; }
 
-.refl-panel {
-  display: flex; flex-direction: column; gap: .3rem;
-  border-top: 1px solid var(--line); padding-top: .4rem;
-}
 /* display:flex 与 [hidden] 同特异性且写在后面，必须配伴生规则才藏得住
  * （文件开头第 1 条已经写过这个坑）。 */
 .refl-panel[hidden] { display: none; }
-.refl-sec {
-  font-size: .72rem; color: var(--fg-dim); font-weight: 600; letter-spacing: .04em;
-}
 .body-text {
   font-size: .78rem; color: var(--fg); line-height: 1.55;
   overflow-wrap: anywhere; white-space: pre-wrap;
 }
-.refl-ul { margin: 0; padding-left: 1.1rem; }
 .refl-ul li { margin: .1rem 0; overflow-wrap: anywhere; }
 /* 模型原话：默认收起，但它是对付「解析不出结构」的兜底——
  * 结构化字段认不出来时，至少还能一眼看出模型到底写了什么。 */
-.refl-raw, .refl-diff {
-  background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--r-sm); padding: .45rem .55rem; margin: 0;
-  font-family: var(--mono); font-size: .7rem; line-height: 1.5;
-  overflow: auto; max-height: 22rem;
-}
-.refl-raw { white-space: pre-wrap; overflow-wrap: anywhere; }
 .refl-raw[hidden] { display: none; }
 /* diff **不折行**：折了就看不出改的是哪一行，只能横向滚。 */
-.refl-diff { white-space: pre; overflow-wrap: normal; }
 
 /* 要改的文件路径照原样显示、不截断：路径错了改到的是另一个文件。 */
-.refl-propose { display: flex; gap: .3rem; align-items: center; flex-wrap: wrap; }
-.refl-target {
-  flex: 1 1 22rem; min-width: 0; background: var(--card); color: var(--fg);
-  border: 1px solid var(--border); border-radius: var(--r-sm);
-  padding: .28rem .5rem; font-family: var(--mono); font-size: .72rem;
-}
 .refl-target:focus { border-color: var(--accent); }
 
 /* ------------------------------------------------------------------ 提示 */
@@ -536,11 +496,8 @@ button:disabled { opacity: .45; cursor: default; }
   .row-form .field { flex: 1 1 100%; }
   .row-form .field input, .row-form .field-narrow select { width: 100%; }
 
-  /* 反思：窄屏一列放不下「路径输入 + 按钮」并排，两样各占整行。
    * .refl-when 的 margin-left:auto 在这里反而把时间戳顶到最右，
    * 标题一长就被挤出屏幕，所以窄屏下让它回到行首那一格。 */
-  .refl-when { margin-left: 0; width: 100%; }
-  .refl-target { flex: 1 1 100%; }
 }
 
 /* 触控设备：44px 最小可点区域。表格行**不给** 44px——值班台的行高就是密度，

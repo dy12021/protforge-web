@@ -70,15 +70,9 @@ const state = {
   counts: {},               // 同上，按当前范围统计的各状态计数
   filter: { q: "", status: "", activeOnly: false },
   auditFilter: { task: "", kind: "", q: "", failOnly: false },
-  reflections: [],         // 反思列表快照
-  reflCounts: {},          // 各状态计数（角标与「待处理 N 条」都从这里来）
-  reflDetail: null,        // 最近一次展开的正文详情（分类/落地按钮要读它的解析结果）
-  reflOpenId: null,        // 哪一条的正文是展开的。**存 state 而不是存卡片**：
                            // 轮询会整块重画列表，存在元素上的开合状态活不过一轮
-  reflTargetInputs: new Map(),  // 反思 id -> 「生成修改方案」的目标输入框（**复用元素**）。
                                 // 轮询会整块重画列表：每次都新建输入框，管理员刚敲的
                                 // 路径就被换掉，点按钮只剩「先填要改哪个文件」
-  reflTimer: null,         // 「方案正在生成」时的自轮询句柄
   tab: "live",
   me: null,
   clockTimer: null,
@@ -1241,462 +1235,6 @@ function confirmBody(content, okLabel, read) {
   });
 }
 
-// ---------------------------------------------------------------- 反思
-//
-// 这一块的取舍只有一条：**模型的分类只是建议，落地一定经过人的手**。
-// 经验一旦写进全局经验文件，下一个任务开工就会读到它；而那之后没人说得清
-// 某条奇怪的要求是从哪来的。所以分类、落地、改技能都各是一个独立的确认动作。
-
-const REFL_LABEL = {
-  draft: "待分类", reviewed: "已分类待落地", applied: "已落地",
-  rejected: "已否决", failed: "生成失败",
-};
-const REFL_KIND_LABEL = { lesson: "经验", tool_gap: "工具不够用" };
-
-async function loadReflections() {
-  /* 每次进来先撤掉上一次挂的定时器。这一行是被 10 秒兜底轮询逼出来的：
-   * 方案生成期间一次调用挂 4 秒定时器、10 秒轮询又调一次，两条路都会挂，
-   * 不撤就成了 4 秒一次、且越挂越多的定时器群。 */
-  if (state.reflTimer) { clearTimeout(state.reflTimer); state.reflTimer = null; }
-  const status = document.getElementById("refl-status").value || "";
-  const got = await api("GET", "/reflections" + (status ? "?status=" + status : ""));
-  state.reflections = got.reflections || [];
-  state.reflCounts = got.counts || {};
-
-  const dl = document.getElementById("refl-skill-list");
-  dl.textContent = "";
-  (got.skills || []).forEach(n => dl.append(el("option", null, n)));
-
-  const todo = (state.reflCounts.draft || 0) + (state.reflCounts.reviewed || 0);
-  const badge = document.getElementById("badge-reflections");
-  badge.textContent = String(todo);
-  badge.hidden = todo === 0;
-
-  renderReflections();
-
-  // 正在生成方案的那条要自己轮询：它没有实时通道（生成在服务端的另一条线程上），
-  // 而管理员盯着这一个页面等它出来。不轮询的话表现是「按钮按了，什么都没发生」。
-  if (state.reflections.some(r => r.proposal_state === "running")) {
-    state.reflTimer = setTimeout(() => loadReflections().catch(() => {}), 4000);
-  }
-}
-
-function renderReflections() {
-  const host = document.getElementById("refl-list");
-  const empty = document.getElementById("refl-empty");
-  const note = document.getElementById("refl-note");
-  /* 重画之前先记住「谁正在被编辑」。
-   *
-   * 整块重画会把输入框从 DOM 里摘下来，管理员正打到一半的路径会继续吃按键、
-   * 字却打不进去——看起来像键盘坏了。目标输入框是**同一个元素**（见
-   * state.reflTargetInputs），所以重画之后把它重新聚焦即可。 */
-  const active = document.activeElement;
-  const editing = active && active.closest ? active.closest(".refl") : null;
-  host.textContent = "";
-  const rows = state.reflections || [];
-  empty.hidden = rows.length > 0;
-  note.textContent = rows.length ? "" : "还没有反思。计算任务收工之后会自动生成。";
-
-  const counts = state.reflCounts || {};
-  document.getElementById("refl-sub").textContent = rows.length
-    ? ("共 " + rows.length + " 条 · 待处理 " +
-       ((counts.draft || 0) + (counts.reviewed || 0)) + " 条")
-    : "";
-
-  rows.forEach(r => host.append(reflCard(r)));
-  /* 焦点还回去，光标停在末尾。 */
-  if (editing && active && active.focus) {
-    active.focus();
-    if (active.setSelectionRange && typeof active.value === "string") {
-      try {
-        active.setSelectionRange(active.value.length, active.value.length);
-      } catch (e) { /* 某些输入类型不支持选区，忽略 */ }
-    }
-  }
-}
-
-function reflCard(r) {
-  const box = el("article", "refl");
-  box.dataset.id = String(r.id);
-  /* 状态同时上到 data-*：竖条的颜色走 CSS，这里只管把状态说清楚。
-   * 不写在 JS 里拼 class 是因为那边已经有 5 个状态色，再加一套必然跑偏。 */
-  box.dataset.status = r.status;
-
-  const top = el("div", "refl-top");
-  top.append(el("span", "chip chip-" + (r.status === "failed" ? "failed"
-            : r.status === "applied" ? "done" : "queued"),
-            REFL_LABEL[r.status] || r.status));
-  top.append(el("span", "refl-task",
-            "#" + r.task_id + " " + (r.task_title || "（任务已删除）")));
-  top.append(el("span", "refl-when", (r.created_at || "").slice(5, 16).replace("T", " ")));
-  box.append(top);
-
-  const sug = el("div", "refl-suggest");
-  sug.append(el("span", null, "模型建议："));
-  sug.append(el("b", null,
-    REFL_KIND_LABEL[r.suggested] || "没给建议（等你定）"));
-  if (r.decided_by) {
-    sug.append(el("span", "refl-by", " · 由 " + r.decided_by + " 定为「" +
-      (REFL_KIND_LABEL[r.kind] || r.kind) + "」"));
-  }
-  box.append(sug);
-
-  if (r.status === "failed") {
-    box.append(el("div", "refl-bad", r.error || "生成失败，没有写明原因"));
-  }
-
-  box.append(el("div", "refl-detail-row"));
-  const detail = box.querySelector(".refl-detail-row");
-  const toggle = el("button", "btn", "看正文");
-  toggle.type = "button";
-  const panel = el("div", "refl-panel");
-  /* 开合状态存在 state 里，**不留在卡片元素上**。
-   *
-   * 这条是被真机抓出来的：10 秒兜底轮询（为了让角标不走样）会把 #refl-list
-   * 整块重画，卡片元素一换，"开着"就跟着没了——管理员刚点开的正文十秒后自己
-   * 收起来，读到一半的内容不见了，而界面上没有任何东西提示发生过这件事。 */
-  panel.hidden = state.reflOpenId !== r.id;
-  toggle.textContent = panel.hidden ? "看正文" : "收起正文";
-  toggle.addEventListener("click", async () => {
-    const open = panel.hidden;                     // 这次是「点开」还是「点收」
-    state.reflOpenId = open ? r.id : null;
-    panel.hidden = !open;
-    toggle.textContent = open ? "收起正文" : "看正文";
-    panel.textContent = "";                        // 收起时清干净，别留上次的内容
-    if (!open) return;
-    if (!state.reflDetail || state.reflDetail.id !== r.id) panel.textContent = "正在取…";
-    try {
-      await renderReflPanel(panel, r);
-    } catch (e) {
-      panel.textContent = "";
-      panel.append(el("div", "refl-bad", e.message || "取正文失败"));
-    }
-  });
-  detail.append(toggle);
-
-  /* 轮询重画之后，如果这条仍是展开的，正文**内容**也要补回来。
-   *
-   * 只把 hidden 恢复成 false 是不够的——实测那正是半修的状态：新卡片里的
-   * panel 是个空 div，于是变成一个"开着、但什么都没有"的白框，比干脆收起来
-   * 更容易让人以为页面坏了。手里有缓存就直接重画，不再打接口。 */
-  if (!panel.hidden && state.reflDetail && state.reflDetail.id === r.id) {
-    renderReflPanel(panel, r).catch(e => {
-      panel.textContent = "";
-      panel.append(el("div", "refl-bad", e.message || "取正文失败"));
-    });
-  }
-
-  const acts = el("div", "refl-acts");
-  if (r.status === "draft") {
-    acts.append(classifyBtn(r, "lesson", "判为经验"));
-    acts.append(classifyBtn(r, "tool_gap", "判为工具不够用"));
-    acts.append(rejectBtn(r));
-  } else if (r.status === "reviewed" && r.kind === "lesson") {
-    acts.append(landBtn(r));
-    acts.append(reclassifyBtn(r, "tool_gap", "其实该改工具"));
-  } else if (r.status === "reviewed" && r.kind === "tool_gap") {
-    acts.append(proposeRow(r));
-  } else if (r.status === "failed") {
-    /* 失败的那条必须有个重跑的口子。
-     *
-     * 没有的话，模型调不通一次、或者正文写坏一次，这条反思就**永远**停在
-     * 失败态——而管理员看到的只是一条没有按钮的卡片，既不能重试也不能
-     * 否决，只能干看着。 */
-    acts.append(retryBtn(r));
-  }
-  if (acts.childNodes.length) box.append(acts);
-
-  box.append(panel);
-  return box;
-}
-
-/* 重跑：作废这条，让巡检重新做一遍。
- *
- * 走两步确认：它把一条记录从库里删了，管理员得知道「这条没了」是本意，
- * 不是出错了。 */
-function retryBtn(r) {
-  const b = el("button", "btn btn-warn", "重新生成");
-  b.type = "button";
-  b.addEventListener("click", () => {
-    const body = el("div");
-    body.append(el("h2", "confirm-title", "让这条反思重新生成一次？"));
-    body.append(el("p", "confirm-lead",
-      "这一条当前是「生成失败」。重跑会把它作废，巡检会再试一次——"
-      + "新的那条会以新的编号出现在列表里。"));
-    body.append(el("p", "confirm-lead",
-      r.error ? "失败原因：" + r.error : ""));
-    confirmBody(body, "重跑", () => {
-      api("POST", "/reflections/" + r.id + "/retry")
-        .then(got => {
-          state.reflOpenId = null;
-          setMsg(document.getElementById("board-msg"),
-                 (got && got.message) || "已重新排队", "ok");
-          return loadReflections();
-        })
-        .catch(e => setMsg(document.getElementById("board-msg"),
-                            e.message || "重跑失败", "bad"));
-      return true;
-    });
-  });
-  return b;
-}
-
-function classifyBtn(r, kind, label) {
-  const b = el("button", "btn" + (kind === "lesson" ? " btn-ok" : " btn-warn"), label);
-  b.type = "button";
-  b.addEventListener("click", () => doClassify(r, kind));
-  return b;
-}
-
-function reclassifyBtn(r, kind, label) {
-  const b = el("button", "btn", label);
-  b.type = "button";
-  b.addEventListener("click", () => doClassify(r, kind));
-  return b;
-}
-
-async function doClassify(r, kind) {
-  const skill = (state.reflDetail && state.reflDetail.id === r.id)
-    ? (state.reflDetail.suggested_skill || "") : "";
-  try {
-    await api("POST", "/reflections/" + r.id + "/classify", { kind, skill });
-    await loadReflections();
-  } catch (e) {
-    setMsg(document.getElementById("board-msg"), e.message || "分类失败", "bad");
-  }
-}
-
-function rejectBtn(r) {
-  const b = el("button", "btn", "否决（这次没什么可沉淀的）");
-  b.type = "button";
-  b.addEventListener("click", () => {
-    const body = el("div");
-    body.append(el("h2", "confirm-title", "否决这条反思？"));
-    body.append(el("p", "confirm-lead",
-      "否决之后它不再出现在待办里，但反思正文仍然留着，随时能翻出来看。"));
-    confirmBody(body, "否决", () => {
-      api("POST", "/reflections/" + r.id + "/reject")
-        .then(() => loadReflections())
-        .catch(e => setMsg(document.getElementById("board-msg"),
-                            e.message || "否决失败", "bad"));
-      return true;
-    });
-  });
-  return b;
-}
-
-function landBtn(r) {
-  const b = el("button", "btn btn-ok", "写进经验");
-  b.type = "button";
-  b.addEventListener("click", () => {
-    const body = el("div");
-    body.append(el("h2", "confirm-title", "把这些经验写进记忆？"));
-    body.append(el("p", "confirm-lead",
-      "写进去之后，之后每一个计算任务开工时都会先读到它们。"));
-    const ul = el("ul", "confirm-list");
-    (state.reflDetail && state.reflDetail.id === r.id
-      ? ((state.reflDetail.parsed && state.reflDetail.parsed.lessons) || [])
-      : []
-    ).forEach(i => ul.append(el("li", null, i.text)));
-    if (!ul.childNodes.length) {
-      ul.append(el("li", null, "（正文还没取到，先点「看正文」再写）"));
-    }
-    body.append(ul);
-    /* 技能归属：模型大多不认识真实的技能名（它写「通用」），所以这里给一个
-     * **人**能填的输入。填了它，这些经验会**同时**落进那个技能的 references
-     * ——那是「知识待在离工具最近的地方」的一层；不填就只留在全局经验文件里。
-     * 候选项就是真实技能目录（#refl-skill-list 是那个 datalist）。 */
-    body.append(el("p", "confirm-lead",
-      "这些经验属于哪个技能（可留空；留空就只留在全局经验文件里）"));
-    const skill = el("input", null, "");
-    skill.type = "text";
-    /* **不预填。**
-     *
-     * 预填会把「模型的猜测」变成「管理员明确指定」——而这两者的区别正是归属
-     * 的依据：模型正文标「通用」= 这条经验是跨技能的通用做法，就只留全局；
-     * 管理员**明确填了**某个技能，才说明它就该待在那个技能旁边。
-     * 一旦预填，「通用」那条就会被自动塞进某个技能目录，那是污染。
-     *
-     * 模型的建议改成 placeholder：看得见、抄得动，但**没填就不算指定**。 */
-    const guess = (state.reflDetail && state.reflDetail.id === r.id
-      ? (state.reflDetail.suggested_skill || "") : "") || (r.skill || "");
-    skill.placeholder = guess
-      ? ("技能名（模型建议：" + guess + "；留空就只留全局）")
-      : "技能名（留空就只留全局）";
-    skill.setAttribute("list", "refl-skill-list");
-    body.append(skill);
-    confirmBody(body, "写进去", () => {
-      api("POST", "/reflections/" + r.id + "/land", { skill: skill.value.trim() })
-        .then(got => {
-          /* 落地**可能只落了一半**：没指定技能、模型标的又对不上真实技能时，
-           * 那几条只进了全局经验文件。服务端把这件事写在 note 里，界面必须
-           * 说出来——不然管理员以为技能目录里也已经有它了。 */
-          const note = got && got.note;
-          setMsg(document.getElementById("board-msg"),
-                 note || ("已写进经验文件 "
-                          + ((got && got.landed) || 0) + " 条"),
-                 note ? "warn" : "ok");
-          return loadReflections();
-        })
-        .catch(e => setMsg(document.getElementById("board-msg"),
-                            e.message || "写经验失败", "bad"));
-      return true;
-    });
-  });
-  return b;
-}
-
-function proposeRow(r) {
-  const wrap = el("div", "refl-propose");
-  /* 目标输入框**复用同一个元素**。
-   *
-   * 这条是被真机抓出来的：填完目标路径再点按钮，界面只回一句「先填要改哪个文件」。
-   * 因为兜底轮询每 10 秒无条件重画整个列表，输入框被换掉，管理员敲的字没了。
-   * 人敲 34 个字符的路径要好几秒，**必然**跨过一次轮询——不是偶发竞态。
-   *
-   * 复用元素而不是「存草稿再回填」：元素上带着的不只是值，还有光标位置、
-   * 选区、输入法状态，全都不用重建（同一个套路，任务卡片那边是 state.cards）。 */
-  let input = state.reflTargetInputs.get(r.id);
-  const fresh = !input;
-  if (fresh) {
-    input = el("input", null, "");
-    state.reflTargetInputs.set(r.id, input);
-  }
-  input.type = "text";
-  input.placeholder = "要改的技能文件，例如 skills/protforge-xxx/SKILL.md";
-  input.className = "refl-target";
-  input.setAttribute("list", "refl-skill-list");
-  /* 复用来的元素**不再覆写值**：那正是管理员正在敲的东西。 */
-  if (fresh) input.value = r.proposal_target || "";
-  const go = el("button", "btn", r.proposal ? "重新生成方案" : "生成修改方案");
-  go.type = "button";
-  go.addEventListener("click", async () => {
-    const target = input.value.trim();
-    if (!target) {
-      setMsg(document.getElementById("board-msg"), "先填要改哪个文件", "warn");
-      return;
-    }
-    go.disabled = true;
-    try {
-      await api("POST", "/reflections/" + r.id + "/propose", { target });
-      await loadReflections();
-    } catch (e) {
-      setMsg(document.getElementById("board-msg"), e.message || "生成方案失败", "bad");
-      go.disabled = false;
-    }
-  });
-  wrap.append(input, go);
-
-  if (r.proposal_state === "running") {
-    wrap.append(el("span", "who", "方案正在生成，要一两分钟…"));
-  } else if (r.proposal_state === "failed") {
-    /* 失败要说出**为什么**。原来只有一句「上一次生成没成功，可以改完再试」，
-     * 管理员既分不清是模型调不通还是路径写错，也不知道该不该改完再试——
-     * 而「改完再试」的前提正是他知道哪里不对。 */
-    wrap.append(el("span", "refl-bad", "上一次生成没成功，可以改完再试"));
-    if (r.proposal_error) {
-      wrap.append(el("div", "refl-bad", "原因：" + r.proposal_error));
-    }
-  } else if (r.proposal) {
-    wrap.append(applyBtn(r));
-  }
-  return wrap;
-}
-
-function applyBtn(r) {
-  const b = el("button", "btn btn-warn", "应用方案（改技能文件）");
-  b.type = "button";
-  b.addEventListener("click", async () => {
-    let detail;
-    try {
-      detail = await api("GET", "/reflections/" + r.id);
-    } catch (e) {
-      setMsg(document.getElementById("board-msg"), e.message || "取方案失败", "bad");
-      return;
-    }
-    if (!detail.diff) {
-      setMsg(document.getElementById("board-msg"), "方案内容读不出来，先重新生成", "warn");
-      return;
-    }
-    const body = el("div");
-    body.append(el("h2", "confirm-title", "把下面这些改动写进技能文件？"));
-    body.append(el("p", "confirm-lead",
-      "会改 " + detail.proposal_target + " 并在该仓库提交一次。"
-      + "这一步之后技能立刻生效，写错了只能靠 git 回退。"));
-    const pre = el("pre", "refl-diff", detail.diff);
-    body.append(pre);
-    confirmBody(body, "应用", () => {
-      api("POST", "/reflections/" + r.id + "/apply")
-        .then(() => loadReflections())
-        .catch(e => setMsg(document.getElementById("board-msg"),
-                            e.message || "应用失败", "bad"));
-      return true;
-    });
-  });
-  return b;
-}
-
-async function renderReflPanel(panel, r) {
-  const detail = await api("GET", "/reflections/" + r.id);
-  state.reflDetail = detail;
-  panel.textContent = "";
-  const parsed = detail.parsed;
-  if (!parsed) {
-    panel.append(el("div", "refl-bad",
-      "这一次的正文解析不出结构（可能模型换了说法）。原话在下面："));
-  } else {
-    ["did", "went_well", "stuck", "lessons", "tool_gaps"].forEach(k => {
-      const v = parsed[k];
-      if (!v || (Array.isArray(v) && !v.length)) return;
-      panel.append(el("div", "refl-sec", k === "did" ? "这次实际做了什么"
-        : k === "went_well" ? "顺利的地方"
-        : k === "stuck" ? "卡住的地方"
-        : k === "lessons" ? "经验" : "工具意见"));
-      if (k === "did") {
-        panel.append(el("div", "body-text", v));
-      } else {
-        const ul = el("ul", "refl-ul");
-        v.forEach(i => ul.append(el("li", null,
-          typeof i === "string" ? i : "[" + (i.skill || "通用") + "] " + i.text)));
-        panel.append(ul);
-      }
-    });
-  }
-  const raw = el("pre", "refl-raw", detail.body || "");
-  raw.hidden = true;
-  const tog = el("button", "btn", "看模型原话");
-  tog.type = "button";
-  tog.addEventListener("click", () => { raw.hidden = !raw.hidden; });
-  panel.append(tog, raw);
-
-  // 判为经验/工具意见时可能要用详情里的解析结果（预览条目、预填技能名），
-  // 所以把动作条重画一遍。
-  const box = panel.closest(".refl");
-  const old = box.querySelector(".refl-acts");
-  if (old) old.remove();
-  const acts = el("div", "refl-acts");
-  const fresh = (state.reflections || []).find(x => x.id === r.id) || r;
-  if (fresh.status === "draft") {
-    acts.append(classifyBtn(fresh, "lesson", "判为经验"));
-    acts.append(classifyBtn(fresh, "tool_gap", "判为工具不够用"));
-    acts.append(rejectBtn(fresh));
-  } else if (fresh.status === "reviewed" && fresh.kind === "lesson") {
-    acts.append(landBtn(fresh));
-  } else if (fresh.status === "reviewed" && fresh.kind === "tool_gap") {
-    acts.append(proposeRow(fresh));
-  } else if (fresh.status === "failed") {
-    // 失败那条的重跑入口：漏了它的话，点一下「看正文」重跑按钮就没了。
-    acts.append(retryBtn(fresh));
-  }
-  if (acts.childNodes.length) panel.insertBefore(acts, panel.firstChild);
-}
-
-document.getElementById("refl-refresh").addEventListener("click", () =>
-  loadReflections().catch(e =>
-    setMsg(document.getElementById("board-msg"), e.message || "反思拉取失败", "bad")));
-document.getElementById("refl-status").addEventListener("change", () =>
-  loadReflections().catch(() => {}));
-
 // ---------------------------------------------------------------- 页签
 
 function showTab(name) {
@@ -1713,10 +1251,6 @@ function showTab(name) {
   }
   // 反思每次切进来都拉（不像审计那样只拉第一次）：它是有时效的待办，
   // 管理员判完一条回值班台、再切回来时看到的必须是最新那批。
-  if (name === "reflections") {
-    loadReflections().catch(e =>
-      setMsg(document.getElementById("board-msg"), e.message || "反思拉取失败", "bad"));
-  }
 }
 
 // ---------------------------------------------------------------- 登录
@@ -1743,7 +1277,6 @@ function signedOut(msg) {
   state.cards.clear();
   state.pending.clear();
   state.users = [];
-  state.reflections = [];
   state.reflCounts = {};
   state.reflDetail = null;
   state.reflOpenId = null;
@@ -1859,7 +1392,6 @@ setInterval(() => {
   /* 反思这里**无条件**拉，不看当前页签：页签上的角标是「有多少条等我判」，
    * 只在打开页签时刷，那个角标会一直停在打开那一刻的值，等于没有角标。
    * 代价只是一个只读列表接口，很便宜。 */
-  loadReflections().catch(() => {});
 }, 10000);
 
 function startClock() {
@@ -1884,11 +1416,10 @@ function startClock() {
  * 曾经就有一个 `render` 留在名单里：渲染早就拆成 renderLive / renderTasks 等
  * 几个函数，render 这个名字早就不存在了。整个值班台于是从来没活过。 */
 Object.assign(window, {
-  api, state, el, load, reload: load, loadUsers, loadAudit, loadReflections,
+  api, state, el, load, reload: load, loadUsers, loadAudit,
   renderLive, renderPending, renderTasks, renderAudit, renderUsers, setScope,
-  renderReflections, reflCard, renderReflPanel,
   fmtTime, fmtMs, fmtSize, STATUS_ORDER, STATUS_LABEL, ROLE_LABEL,
-  SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL, REFL_LABEL, REFL_KIND_LABEL,
+  SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL,
   apiBase, token,
   buildRail, paintRail, railIndex, confirmAction, confirmBody,
   exportAuditCsv, doVerify, doAbort, doRetry, sendRpc, showTab,
@@ -1907,7 +1438,6 @@ async function boot() {
     /* 角标要在**开页时就**有，而不是等第一次 10 秒轮询。
      * 只靠轮询的话：刷新之后那十秒里「反思」页签上一个角标都没有，
      * 值班的人会以为没有待办——而实际上有十三条。 */
-    await loadReflections().catch(() => {});
     startClock();
   } catch (e) {
     if (e && e.status === 401) {

@@ -59,12 +59,28 @@ def _normalize(path: str) -> str:
     return PARAM_RE.sub("{x}", path.split("?", 1)[0])
 
 
-def _routes_of(app) -> set[str]:
-    out = set()
+def _routes_of(app) -> list[str]:
+    """路由表。**白名单型的路径参数要展开成具体值。**
+
+    工作流的启停是参数化路由 ``/api/workflows/{workflow_id}/{action}``，
+    而前端写的是 ``/api/workflows/12/start``。按字符串比，两边永远对不上——
+    路由表里只有 ``/api/workflows/{x}/{x}``，而 action 的合法取值是有限几个。
+    所以这里按白名单展开，展开之后 ``start`` 能对上，**拼错的 action 仍对不上**。
+    """
+    out: list[str] = []
     for r in app.routes:
         p = getattr(r, "path", None)
-        if p:
-            out.add(_normalize(p))
+        if not p:
+            continue
+        segs = p.split("/")
+        if "action" in segs:
+            idx = segs.index("action")
+            for act in sorted(WORKFLOW_ACTIONS):
+                one = list(segs)
+                one[idx] = act
+                out.append(_normalize("/".join(one)))
+            continue
+        out.append(_normalize(p))
     return out
 
 
@@ -161,13 +177,31 @@ def test_user_panel_api_base_does_not_double_prefix(path):
         "拼出来是 /api/api/xxx，面板每个接口都会 404")
 
 
+def _route_matches(path: str, routes: list[str]) -> bool:
+    """一条前端路径在不在路由表里。**按段比**，不是按整串相等。
+
+    段数必须一样，每一段要么字面相等、要么有一边是占位符 ``{x}``。
+    这比整串相等松一点（``/api/tasks/{x}/audit`` 能匹配 ``/api/tasks/{x}`` 这种
+    不会发生——段数不同），但仍然能抓住「前端请求了服务端没有的路径」。
+    """
+    segs = path.split("/")
+    for r in routes:
+        rsegs = r.split("/")
+        if len(rsegs) != len(segs):
+            continue
+        if all(a == b or a == '{x}' or b == '{x}'
+               for a, b in zip(rsegs, segs)):
+            return True
+    return False
+
+
 def test_every_user_panel_url_exists_in_the_public_app():
     routes = _routes_of(svc.create_public_app())
     missing = []
     for src in _user_srcs():
         for p in _js_paths(src):
             n = _normalize(p)
-            if n not in routes:
+            if not _route_matches(n, routes):
                 missing.append(n)
     assert not missing, f"前端会请求这些地址，服务端一条都没有：{sorted(missing)}"
 

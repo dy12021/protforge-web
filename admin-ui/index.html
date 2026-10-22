@@ -31,9 +31,6 @@
     </button>
     <button class="tab" data-tab="tasks" role="tab" type="button">全部任务</button>
     <button class="tab" data-tab="audit" role="tab" type="button">审计日志</button>
-    <button class="tab" data-tab="reflections" role="tab" type="button">
-      反思<span class="badge" id="badge-reflections" hidden>0</span>
-    </button>
     <button class="tab" data-tab="users" role="tab" type="button">用户</button>
   </nav>
 
@@ -129,36 +126,6 @@
     </section>
 
     <!-- ========================== 6 · 反思 ================================ -->
-    <section class="pane" id="pane-reflections" data-pane="reflections" hidden>
-      <div class="pane-head">
-        <h2 class="pane-h">反思</h2>
-        <span class="pane-sub" id="refl-sub"></span>
-      </div>
-      <p class="pane-lead">
-        每条计算任务收工之后，平台会让它自己写一份复盘。复盘里的分类**只是建议**，
-        落地由你定：判成「经验」就写进每个任务开工都会读到的经验文件；判成
-        「工具不够用」就去改对应的技能文件——改之前你会先看到真实的改动内容，
-        看过确认才会落盘并提交。
-      </p>
-
-      <div class="filters">
-        <select id="refl-status" aria-label="按状态筛选">
-          <option value="">全部状态</option>
-          <option value="draft">待分类</option>
-          <option value="reviewed">已分类待落地</option>
-          <option value="applied">已落地</option>
-          <option value="rejected">已否决</option>
-          <option value="failed">生成失败</option>
-        </select>
-        <button class="secondary" id="refl-refresh" type="button">刷新</button>
-        <span class="toolbar-gap"></span>
-        <span class="who" id="refl-note"></span>
-      </div>
-
-      <datalist id="refl-skill-list"></datalist>
-      <div id="refl-list"></div>
-      <p class="empty" id="refl-empty">还没有反思。计算任务收工之后会自动生成。</p>
-    </section>
 
     <!-- ========================== 5 · 用户 ============================== -->
     <section class="pane" id="pane-users" data-pane="users" hidden>

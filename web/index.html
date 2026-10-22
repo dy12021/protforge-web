@@ -16,46 +16,114 @@
 <body>
   <header class="toolbar">
     <h1>自动化计算平台</h1>
-    <input id="q" type="search" placeholder="搜索标题、需求或当前步骤" autocomplete="off" aria-label="搜索">
-    <select id="status-filter" aria-label="状态筛选"><option value="">全部状态</option></select>
-    <label class="toggle"><input id="only-active" type="checkbox"> 只看在跑的</label>
-    <button id="new-btn" class="primary" type="button">＋ 提交计算任务</button>
     <span class="toolbar-gap"></span>
     <span id="who" class="who"></span>
-    <!-- 工作流入口（规格 8.2 第 523 行）。少了这一行，工作流页就只能手敲 URL 到达：
-         路由是单段 + 白名单，页面做得再好，没人找得到就等于没有。 -->
-    <a class="who" href="workflow.html" title="表格每行一个计算任务，逐行串行跑">工作流 →</a>
+    <button id="new-btn" class="primary" type="button">＋ 提交计算任务</button>
     <button id="logout-btn" class="secondary" type="button">退出</button>
   </header>
+
+  <!-- 筛选条：视图范围（全部 / 普通任务 / 工作流）+ 状态 + 关键字。
+       工作流不再是另一个页面，所以「看哪一类」是**看板内的一个开关**，
+       而不是一次跳转。 -->
+  <div class="filters" id="filters">
+    <div class="seg" id="view-switch" role="group" aria-label="视图范围">
+      <button class="seg-btn is-on" data-view="all" type="button">全部</button>
+      <button class="seg-btn" data-view="task" type="button">普通任务</button>
+      <button class="seg-btn" data-view="workflow" type="button">工作流</button>
+    </div>
+    <input id="q" type="search" placeholder="搜索标题、需求、当前步骤或表格名" autocomplete="off" aria-label="搜索">
+    <select id="status-filter" aria-label="状态筛选"><option value="">全部状态</option></select>
+    <label class="toggle"><input id="only-active" type="checkbox"> 只看在跑的</label>
+    <span class="toolbar-gap"></span>
+    <span id="filter-note" class="who"></span>
+  </div>
+
+  <!-- 状态面板：平台整体的量。**默认只读**——它是给人看现状的，不是给人填的。
+       指标是动态画的（#sp-metrics / #sp-system），所以正文里没有一堆空壳容器。 -->
+  <section class="status-panel" id="status-panel" aria-label="平台状态">
+    <div class="sp-head">
+      <h2 class="sp-title">平台状态</h2>
+      <span class="sp-note" id="sp-note"></span>
+    </div>
+    <div class="sp-metrics" id="sp-metrics"></div>
+    <!-- 系统指标（CPU / 内存 / GPU / 磁盘）只对管理员渲染。
+         普通用户**根本不发那个请求**——不是发完再藏起来。 -->
+    <div class="sp-system" id="sp-system" hidden></div>
+  </section>
 
   <!-- 只读提示条：服务没起来 / 登录过期这类全局问题落在这里，
        不能塞进抽屉或某个卡片里——抽屉关着的时候用户看不见。 -->
   <div id="board-msg" class="board-msg" hidden></div>
 
+  <!-- 工作流区：工作流以**主卡片**的形式出现，展开后是行列表。
+       以前它是另一个页面（workflow.html），现在与计算任务同处一块看板。 -->
+  <section class="wf-zone" id="wf-zone" aria-label="工作流">
+    <div class="zone-head">
+      <h2 class="zone-title">工作流</h2>
+      <span class="zone-sub" id="wf-zone-sub"></span>
+    </div>
+    <div class="wf-cards" id="wf-cards"></div>
+    <p class="zone-empty" id="wf-empty" hidden>还没有工作流。</p>
+  </section>
+
+  <!-- 计算任务看板：五站主链 + 失败。 -->
   <main class="board" id="board"></main>
 
-  <!-- 提交计算任务：页面内的表单。
-       不是 window.prompt——浏览器自带的小灰框，样式不受控、一关输入就没了。
+  <!-- 提交计算任务 / 新建工作流 / 修改工作流：**同一个对话框**。
+       两种模式按字段切换，不是另开一个界面。
        <dialog> 原生自带 Esc 关闭与焦点约束。 -->
   <dialog class="composer" id="composer">
     <form class="composer-inner" id="composer-form" method="dialog">
-      <h2 class="composer-title">提交计算任务</h2>
-      <p class="composer-lead">
+      <h2 class="composer-title" id="c-title-h">提交计算任务</h2>
+      <div class="seg seg-mode" id="mode-switch" role="group" aria-label="提交方式">
+        <button class="seg-btn is-on" data-mode="task" type="button">单个任务</button>
+        <button class="seg-btn" data-mode="workflow" type="button">工作流（表格 + 模板）</button>
+      </div>
+      <p class="composer-lead" id="c-lead">
         用一句话说清想算什么。提交后平台自己编排技能链，中间不用管，
         进度在看板上看得到。
       </p>
-      <label class="field">
-        <span>任务标题</span>
-        <input id="c-title" required maxlength="200" placeholder="例如：1ubq 折叠稳定性打分"
-               autocomplete="off">
-      </label>
-      <label class="field">
-        <span>需求说明</span>
-        <!-- 上限 20000 字符，与后端一致：超出后端返 422，前端先挡住，
-             别让用户白等一次往返才发现写多了。 -->
-        <textarea id="c-brief" required maxlength="20000" rows="7"
-                  placeholder="要算什么、输入是什么、想要什么形式的产物。写得越具体，计算链越不用猜。"></textarea>
-      </label>
+
+      <!-- 模式一：单个任务 -->
+      <div id="c-task-fields">
+        <label class="field">
+          <span>任务标题</span>
+          <input id="c-title" required maxlength="200" placeholder="例如：1ubq 折叠稳定性打分"
+                 autocomplete="off">
+        </label>
+        <label class="field">
+          <span>需求说明</span>
+          <!-- 上限 20000 字符，与后端一致：超出后端返 422，前端先挡住，
+               别让用户白等一次往返才发现写多了。 -->
+          <textarea id="c-brief" required maxlength="20000" rows="7"
+                    placeholder="要算什么、输入是什么、想要什么形式的产物。写得越具体，计算链越不用猜。"></textarea>
+        </label>
+      </div>
+
+      <!-- 模式二：工作流。表格每行一个计算任务，逐行串行跑。 -->
+      <div id="c-wf-fields" hidden>
+        <div class="wf-upload-row">
+          <label class="field">
+            <span>表格文件（xlsx）</span>
+            <input id="c-wf-file" type="file" accept=".xlsx">
+          </label>
+          <button id="c-wf-upload" class="secondary" type="button">上传表格</button>
+        </div>
+        <p class="who" id="c-wf-note"></p>
+        <!-- 列的角色：上传之后才有表头可点。这里是动态画的，
+             所以正文里只留一个容器。 -->
+        <div class="wf-cols" id="c-wf-cols"></div>
+        <label class="field">
+          <span>提示词模板</span>
+          <textarea id="c-wf-template" rows="4"
+                    placeholder="列绑定的变量写成两个大括号包起来，例如：序列号是 {{seq}}。"></textarea>
+        </label>
+        <label class="toggle">
+          <input id="c-wf-writeback" type="checkbox" checked>
+          把结果写回 Excel（关掉后结果只存在平台里，不生成结果表）
+        </label>
+      </div>
+
       <div class="composer-actions">
         <button class="secondary" type="button" id="c-cancel">算了</button>
         <button class="primary" type="submit" id="c-save">提交</button>

@@ -431,42 +431,86 @@ button { cursor: pointer; }
 
 /* --------------------------------------------- 时间线：活动流，不是日志表
  *
- * 一条竖线 + 一个点，主文本在上、时间与操作人在下。
- * 两条硬要求：
- *   1. **不裸露字段名**——服务端 `edited` 的 message 是「修改了：brief」，
- *      服务端中文是 API 契约不能改，所以翻译放在显示层（FIELD_CN）。
- *   2. 状态跃迁渲染成**状态芯片**，而不是纯文字箭头。
- * 竖线用 li::before 画，最后一条不画，否则会在最后一个点底下拖一截无意义的线。
+ * 时间线是**专门的一视图**，不是日志表：一条竖轴 + 一个节点，主文本在上、
+ * 时间与操作人在下。三条硬要求：
+ *   1. **关键事件突出**（状态变更、报错、收口、打包起止），过程输出降级并收起来；
+ *   2. 能按类型过滤（全部 / 关键事件 / 只看报错 / 只看状态变化）；
+ *   3. **不裸露字段名**——服务端 message 是中文契约，裸字段名的翻译放显示层。
+ *
+ * 竖轴用 .tl-track::before 画，最后一个点底下不拖线（:.tl-node:last-child）。
  */
-.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
-.tl-item {
-  position: relative; display: grid; grid-template-columns: .8rem 1fr;
-  gap: .55rem; padding: 0 0 .95rem;
+.tl-bar { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: .6rem; }
+.tl-chip {
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid var(--border); border-radius: 999px;
+  font-size: .72rem; padding: .1rem .55rem; cursor: pointer;
 }
-.tl-item::before {
-  content: ""; position: absolute; left: .32rem; top: .5rem; bottom: -.1rem;
+.tl-chip:hover { color: var(--fg); background: var(--panel); }
+.tl-chip.is-on {
+  color: var(--accent); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent); font-weight: 600;
+}
+
+.tl-track {
+  list-style: none; margin: 0; padding: 0 0 0 1.15rem; position: relative;
+}
+.tl-track::before {
+  content: ""; position: absolute; left: .34rem; top: .55rem; bottom: .55rem;
   width: 1px; background: var(--line);
 }
-.tl-item:last-child::before { display: none; }
-.tl-item:last-child { padding-bottom: 0; }
-.tl-dot {
-  width: .68rem; height: .68rem; border-radius: 50%; margin-top: .3rem;
+.tl-node { position: relative; padding: 0 0 .75rem; }
+.tl-node:last-child { padding-bottom: 0; }
+.tl-point {
+  position: absolute; left: -1.15rem; top: .34rem;
+  width: .7rem; height: .7rem; border-radius: 50%;
   background: var(--card); border: 2px solid var(--border);
 }
-.tl-created .tl-dot { border-color: var(--st-queued); }
-.tl-status  .tl-dot { border-color: var(--accent); background: var(--accent); }
-.tl-note    .tl-dot { border-color: var(--st-packaging); }
-.tl-package .tl-dot { border-color: var(--st-done); background: var(--st-done); }
-.tl-error   .tl-dot { border-color: var(--st-failed); background: var(--st-failed); }
-.tl-edited  .tl-dot { border-color: var(--border); }
-.tl-step    .tl-dot { border-color: var(--st-running); }
+/* 关键事件：点更大、填实、外面套一圈卡片色的环（把点从轴上"抬"起来）。 */
+.tl-node.is-key .tl-point {
+  width: .82rem; height: .82rem; left: -1.21rem; top: .28rem;
+  border-width: 2px; box-shadow: 0 0 0 3px var(--card);
+}
+.tl-node.tl-status.is-key .tl-point { border-color: var(--accent); background: var(--accent); }
+.tl-node.tl-error.is-key  .tl-point { border-color: var(--st-failed); background: var(--st-failed); }
+.tl-node.tl-package.is-key .tl-point { border-color: var(--st-done); background: var(--st-done); }
+.tl-node.tl-created.is-key .tl-point { border-color: var(--st-queued); background: var(--st-queued); }
+.tl-node.tl-finished.is-key .tl-point { border-color: var(--st-done); background: var(--st-done); }
 
-.tl-main { min-width: 0; }
-.tl-line { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem; font-size: .84rem; line-height: 1.5; }
+.tl-card {
+  border-left: 2px solid transparent;
+  padding: .05rem 0 .05rem .6rem;
+}
+.tl-node.is-key .tl-card {
+  border-left-color: var(--border);
+  background: var(--lift); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  padding: .3rem .55rem .3rem .6rem;
+}
+.tl-node.tl-status.is-key .tl-card { border-left-color: var(--accent); }
+.tl-node.tl-error.is-key  .tl-card { border-left-color: var(--st-failed); }
+.tl-node.tl-package.is-key .tl-card,
+.tl-node.tl-finished.is-key .tl-card { border-left-color: var(--st-done); }
+.tl-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .3rem;
+  font-size: .84rem; line-height: 1.5;
+}
 .tl-what { color: var(--fg); overflow-wrap: anywhere; }
+.tl-node.is-soft .tl-what { color: var(--fg-dim); font-size: .8rem; }
 .tl-arrow { color: var(--fg-dim); font-size: .74rem; }
 .tl-meta { color: var(--fg-dim); font-size: .72rem; margin-top: .1rem; font-family: var(--mono); }
 .tl-empty { color: var(--fg-dim); font-size: .82rem; }
+
+/* 过程输出：默认收起来。原来是一条流水账，一次计算能有几百条输出，
+ * 摊开就把真正要读的那几条埋掉了。 */
+.tl-fold { margin-top: .5rem; }
+.tl-fold > summary {
+  cursor: pointer; color: var(--fg-dim); font-size: .76rem;
+  list-style: none; display: inline-flex; align-items: center; gap: .3rem;
+  border: 1px dashed var(--border); border-radius: 999px; padding: .12rem .6rem;
+}
+.tl-fold > summary::-webkit-details-marker { display: none; }
+.tl-fold > summary:hover { color: var(--fg); border-color: #C6CFDA; }
+.tl-fold[open] > summary { border-style: solid; }
+.tl-fold .tl-track { margin-top: .55rem; }
 
 /* ------------------------------------------------------------------ 读数失败的兜底 */
 
@@ -615,6 +659,160 @@ button { cursor: pointer; }
 }
 .wf-role-tag[data-role="input"], .wf-role-tag[data-role="context"] { color: var(--accent); border-color: var(--accent); }
 .wf-role-tag[data-role="output"] { color: var(--st-done); border-color: var(--st-done); }
+
+/* ------------------------------------------------------------------ 筛选条
+ *
+ * 一行三样：**看哪一类**（分段开关）、**状态**、**关键字**。
+ * 工作流不再是另一个页面，所以「看哪一类」是看板内的一个开关而不是一次跳转。
+ */
+
+.filters {
+  display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+  padding: .5rem 1.1rem;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 2.55rem; z-index: 9;
+}
+.filters input[type=search] {
+  flex: 0 1 18rem; background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .35rem .6rem;
+}
+.filters select {
+  background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: .35rem .55rem;
+}
+.filters input[type=search]:focus, .filters select:focus { border-color: var(--accent); }
+.filters .toggle { display: flex; align-items: center; gap: .35rem; color: var(--fg-dim); font-size: .8rem; }
+.filters .toggle input { accent-color: var(--st-running); }
+
+/* 分段开关：几选一。选中那一格用品牌紫的浅染 + 实边，
+ * 不选中就是纸面——这样「现在看的是哪一档」永远一眼可见。 */
+.seg {
+  display: inline-flex; border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--card); overflow: hidden;
+}
+.seg-btn {
+  background: transparent; color: var(--fg-dim); border: 0;
+  border-right: 1px solid var(--border);
+  padding: .3rem .7rem; font-size: .78rem; white-space: nowrap;
+}
+.seg-btn:last-child { border-right: 0; }
+.seg-btn:hover { color: var(--fg); background: var(--panel); }
+.seg-btn.is-on {
+  color: var(--accent); font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 9%, var(--card));
+}
+.seg-mode { margin: 0 0 .7rem; }
+
+/* ------------------------------------------------------------------ 状态面板
+ *
+ * 一排读数 + （管理员才有的）系统指标条。**只读**：它是给人看现状的。
+ * 读数用显示体的大字，标签用小字灰——层级只有两级，不要再加装饰。
+ */
+
+.status-panel {
+  margin: .7rem 1.1rem 0;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r);
+  padding: .55rem .7rem .6rem;
+}
+.sp-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .45rem; }
+.sp-title { font-family: var(--display); font-size: .8rem; margin: 0; letter-spacing: .04em; }
+.sp-note { color: var(--fg-dim); font-size: .72rem; margin-left: auto; }
+.sp-metrics { display: flex; flex-wrap: wrap; gap: .4rem 1.1rem; }
+.sp-metric { min-width: 4.6rem; }
+.sp-m-label { font-size: .7rem; color: var(--fg-dim); }
+.sp-m-value {
+  font-family: var(--display); font-size: 1.25rem; line-height: 1.15;
+  color: var(--fg); font-weight: 600;
+}
+.sp-m-sub { font-size: .68rem; color: var(--fg-dim); }
+.sp-metric.is-bad .sp-m-value { color: var(--st-failed); }
+.sp-metric.is-warn .sp-m-value { color: var(--st-running); }
+.sp-metric.is-accent .sp-m-value { color: var(--accent); }
+.sp-empty { color: var(--fg-dim); font-size: .78rem; margin: 0; }
+
+/* 系统指标：四条细进度条。条比数字有用——「内存 61%」看一眼就知道，
+ * 而「24.1 / 39.4 GB」得在脑子里算一遍才知道紧不紧张。 */
+.sp-system {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: .4rem .9rem;
+  margin-top: .55rem; padding-top: .5rem; border-top: 1px solid var(--line);
+}
+.sp-system[hidden] { display: none; }
+.sp-bar-head { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem; }
+.sp-bar-label { font-size: .72rem; color: var(--fg-dim); }
+.sp-bar-val { font-size: .72rem; color: var(--fg); font-family: var(--mono); }
+.sp-bar { height: 5px; border-radius: 999px; background: var(--line); overflow: hidden; margin-top: .18rem; }
+.sp-bar-fill { height: 100%; background: var(--st-running); border-radius: 999px; }
+.sp-note-line { font-size: .74rem; color: var(--fg-dim); }
+
+/* ------------------------------------------------------------------ 工作流区
+ *
+ * 工作流是看板上的**主卡片**：一行一张，展开后是行列表。
+ * 进度条零填充——0% 要真的看不见，1px 的边框会让「没跑过」看着像跑过。
+ */
+
+.wf-zone { margin: .7rem 1.1rem 0; }
+.zone-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .4rem; }
+.zone-title { font-family: var(--display); font-size: .82rem; margin: 0; letter-spacing: .03em; }
+.zone-sub { color: var(--fg-dim); font-size: .74rem; }
+.zone-empty { color: var(--fg-dim); font-size: .8rem; margin: .2rem 0; }
+.wf-cards { display: flex; flex-direction: column; gap: .5rem; }
+
+.wf-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--r);
+  padding: .55rem .65rem .6rem; box-shadow: var(--shadow);
+  transition: border-color .15s, box-shadow .15s;
+}
+.wf-card:hover { border-color: #C6CFDA; }
+/* 失败只给卡片一道红边——与任务卡片同一条规矩。 */
+.wf-card.is-failed { border-color: var(--st-failed); }
+.wfc-head { display: flex; align-items: center; gap: .5rem; }
+.wfc-title {
+  font-size: .9rem; font-weight: 600; overflow-wrap: anywhere;
+  min-width: 0; flex: 1 1 auto;
+}
+.wfc-chip { flex: none; }
+.wfc-meta {
+  display: flex; flex-wrap: wrap; gap: .3rem; align-items: baseline;
+  margin-top: .2rem; font-size: .74rem; color: var(--fg-dim);
+}
+.wfc-id { font-family: var(--mono); }
+.wfc-failed { color: var(--fg-dim); }
+.wfc-failed.is-bad { color: var(--st-failed); font-weight: 700; }
+.bar {
+  width: 100%; height: 6px; border-radius: 999px; background: var(--line);
+  overflow: hidden; margin: .4rem 0 .25rem;
+}
+.bar-fill { height: 100%; width: 0; border-radius: 999px; background: var(--st-done); }
+.bar.is-running .bar-fill { background: var(--st-running); }
+.wfc-stats { font-size: .72rem; color: var(--fg-dim); min-height: .95rem; }
+.wfc-acts {
+  display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; margin-top: .45rem;
+}
+.wfc-ctrl { display: inline-flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+
+/* 展开后的行列表。行号列横向粘住：横着看长表时不会把「第几行」滚没。 */
+.wfc-rows { margin-top: .55rem; }
+.wf-rows-table {
+  border-collapse: separate; border-spacing: 0; width: 100%; font-size: .76rem;
+}
+.wf-rows-table th, .wf-rows-table td {
+  padding: .28rem .45rem; text-align: left;
+  border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.wf-rows-table thead th {
+  color: var(--fg-dim); font-weight: 600; font-size: .72rem;
+  border-bottom: 1px solid var(--border);
+}
+.wf-rows-table tbody tr:hover td { background: var(--lift); }
+.wf-rows-table .wf-rownum {
+  position: sticky; left: 0; z-index: 1; background: var(--card);
+  color: var(--fg-dim); font-family: var(--mono); text-align: right; min-width: 2.4rem;
+}
+.wf-rows-table thead th.wf-rownum { z-index: 2; background: var(--panel); }
+.wf-row-step { overflow-wrap: anywhere; white-space: normal !important; max-width: 22rem; }
+.wf-row-dur { font-family: var(--mono); color: var(--fg-dim); }
+.wf-rows-empty { color: var(--fg-dim); text-align: center; padding: .6rem 0 !important; }
 
 /* ------------------------------------------- 窄屏适配：平板三列 / 手机单列堆叠
  *
