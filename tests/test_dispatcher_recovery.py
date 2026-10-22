@@ -225,9 +225,23 @@ def test_recover_settles_stale_running_task_and_kills_orphan_tree(
     assert wait_for(lambda: ap.proc.poll() is not None), "残留进程还活着，还在烧 GPU"
 
     # 3) 杀的是整棵树：孙进程心跳必须停
-    before = hb_size(hb)
-    time.sleep(1.0)
-    assert hb_size(hb) == before, "孙进程还在写心跳，只杀了 node 本体没杀树"
+    #    **必须轮询等它真的停，不能只睡一秒就断言。** kill_tree 杀整棵树要
+    #    一点时间，机器一忙一秒就不够——于是这条在全量跑里偶发误红（单独跑
+    #    从来不红）。判据是「心跳停止增长」，不是「一秒钟后没增长」。
+    deadline = time.time() + 15.0
+    last = hb_size(hb)
+    quiet = 0.0
+    while time.time() < deadline:
+        time.sleep(0.3)
+        now = hb_size(hb)
+        if now == last:
+            quiet += 0.3
+            if quiet >= 1.2:
+                break
+        else:
+            quiet = 0.0
+            last = now
+    assert hb_size(hb) == last, "孙进程还在写心跳，只杀了 node 本体没杀树"
 
     # 4) 状态是带中文原因的可解释终态，不是静默改状态
     row = store.get_task(task["id"], is_admin=True)
