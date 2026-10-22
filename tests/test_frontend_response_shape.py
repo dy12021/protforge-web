@@ -138,7 +138,7 @@ def test_abort_really_returns_the_envelope(panel, task_id):
 def test_the_scanner_actually_finds_the_detail_fetches():
     """防恒真：扫到 0 个就等于什么都没检查。"""
     found = _detail_fetches()
-    assert len(found) == 6, f"预期 6 个取详情信封的调用点，实际 {len(found)}：{found}"
+    assert len(found) == 7, f"预期 7 个取详情信封的调用点，实际 {len(found)}：{found}"
 
 
 def test_the_scanner_does_not_swallow_the_list_endpoint():

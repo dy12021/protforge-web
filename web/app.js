@@ -1550,7 +1550,11 @@ async function retryTask(taskId, rowNo, wfId) {
   });
   if (!ok) return;
   try {
-    await api("POST", "/api/tasks/" + taskId + "/retry");
+    /* 动作端点返回详情信封，得经 detailTask() 拆过再用——
+     * 这一层的约定是「凡是拿 {task, events, artifacts} 的地方都拆」，
+     * 漏一处就是拿整个信封当任务对象用。 */
+    state.byId.set(taskId, detailTask(
+      await api("POST", "/api/tasks/" + taskId + "/retry", {}), "重跑任务"));
     setMsg(document.getElementById("board-msg"),
       "第 " + rowNo + " 行已重新排队，它会等当前这行跑完再开始", "good");
     if (wfId != null) refreshOpenWorkflow(wfId);

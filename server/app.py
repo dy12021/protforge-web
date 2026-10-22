@@ -839,7 +839,11 @@ def create_public_app() -> FastAPI:
         store.update_task(task_id, workflow_archived=0)
         updated = store.set_status(task_id, "queued", actor="human",
                                    message="重新排队，重跑这一遍")
-        return {"task": _task_view(updated)}
+        # **返回详情信封**（{task, events, artifacts}），跟 abort 一样。
+        # 动作端点也返回信封是这一层的既有约定：前端拿到的就是最新状态，
+        # 不用再补一次请求；顺带避免「详情信封」这个形状在两个端点里各说各话。
+        sse.notify()
+        return _detail(updated)
 
     @app.post("/api/tasks/{task_id}/abort")
     def abort(task_id: int, user=Depends(auth.current_user)):
