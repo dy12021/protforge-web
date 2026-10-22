@@ -349,3 +349,23 @@ def test_assess_failure_makes_the_task_failed_not_crashed(failed_task, monkeypat
     assert task["status"] == "failed", "评估失败不该把任务改成别的状态"
     st = recovery.load_state()
     assert st[str(failed_task["id"])]["verdict"] == "error"
+
+def test_superseded_row_tasks_are_never_offered_to_the_sweep(make_task, monkeypatch):
+    """**被新一轮顶替的旧行任务不该再进恢复流程。**
+
+    一次重投会把旧行任务留在 failed 里，由新任务接管那一行。旧任务不是
+    「这一行又失败了」——判成「可恢复」并重投，等于把同一行跑第二遍：
+    白烧几小时 GPU，结果还是那一个。
+    """
+    wf = store.create_workflow(1, "批次", "做 {x}")
+    wid = int(wf["id"])
+    old = store.create_task("行 12 · 第一轮", "b", 1,
+                            workflow_id=wid, workflow_row=11)
+    store.set_status(old["id"], "failed", actor="system", message="炸了")
+    new = store.create_task("行 12 · 重跑", "b", 1,
+                            workflow_id=wid, workflow_row=11)
+    store.set_status(new["id"], "failed", actor="system", message="也炸了")
+
+    ids = [int(x["id"]) for x in recovery.candidates()]
+    assert int(old["id"]) not in ids, "被顶替的旧行任务又被拿出来了"
+    assert int(new["id"]) in ids, "真正在失败的那一行反而没进候选"

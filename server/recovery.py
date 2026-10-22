@@ -136,6 +136,41 @@ def attempts_of(state: dict, task_id: int) -> int:
 
 # --- 候选 -------------------------------------------------------------------
 
+def _superseded_ids() -> set[int]:
+    """已被新一轮顶替掉的行任务 id。
+
+    一次重投会把旧行任务留在 failed 里，由新任务接管那一行。旧任务**不是**
+    「这一行又失败了」——它早就跑完了（或早就放弃了），再评估它、尤其是判成
+    「可恢复」并重投，等于把同一行跑第二遍：白烧几小时 GPU，结果还是那一个。
+
+    判据：同一 (workflow_id, workflow_row) 下 id 更大的任务存在 → 旧的被顶替。
+    """
+    latest: dict[tuple, int] = {}
+    try:
+        rows = store.list_tasks(status=None, is_admin=True, limit=5000)
+    except Exception:                                     # noqa: BLE001
+        log.exception('读任务失败')
+        return set()
+    for row in rows:
+        wid = row.get('workflow_id')
+        wrow = row.get('workflow_row')
+        if wid is None or wrow is None:
+            continue
+        key = (int(wid), int(wrow))
+        tid = int(row['id'])
+        if key not in latest or tid > latest[key]:
+            latest[key] = tid
+    superseded: set[int] = set()
+    for row in rows:
+        wid = row.get('workflow_id')
+        wrow = row.get('workflow_row')
+        if wid is None or wrow is None:
+            continue
+        tid = int(row['id'])
+        if latest[(int(wid), int(wrow))] != tid:
+            superseded.add(tid)
+    return superseded
+
 def candidates() -> list[dict]:
     """待评估的失败任务。
 
@@ -146,6 +181,7 @@ def candidates() -> list[dict]:
     """
     out: list[dict] = []
     state = load_state()
+    superseded = _superseded_ids()
     try:
         rows = store.list_tasks(status="failed", is_admin=True, limit=200)
     except Exception:                                     # noqa: BLE001
@@ -165,6 +201,8 @@ def candidates() -> list[dict]:
         if attempts_of(state, tid) >= MAX_AUTO_RETRY:
             continue
         if _aborted_by_human(row):
+            continue
+        if tid in superseded:
             continue
         out.append(row)
         if len(out) >= SWEEP_LIMIT:
