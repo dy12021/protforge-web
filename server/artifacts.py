@@ -398,7 +398,16 @@ def package(task_id: int, out_zip=None, progress_cb=None,
 
 
 def _emit(task_id: int, payload: dict, progress_cb, last_pct: list[int]) -> None:
-    """进度出口：给了回调走回调，没给就写 events（按百分比去重）。"""
+    """进度出口：给了回调走回调，没给就写 events。
+
+    **中间那几十条百分比不落库了。** 一次打包原来要写二十来条
+    「打包中 83%（335/403）」，时间线被刷成一片，真正要读的那几条
+    （开始、结束、报错）全被埋掉了。现在时间线上只留**开始打包**和
+    **打包完成**两条；实时百分比照旧走 SSE 推给前端，进度条不受影响。
+
+    ``last_pct`` 参数留着是为了不改调用点的签名，但它已经没有用处了——
+    真要有别的调用方还想按步进落库，自己加回来。
+    """
     if progress_cb is not None:
         progress_cb(payload)
         return
@@ -406,13 +415,6 @@ def _emit(task_id: int, payload: dict, progress_cb, last_pct: list[int]) -> None
     if kind == "start":
         store.add_event(task_id, "package", "system",
                         f"开始打包（共 {payload.get('total', 0)} 个文件）")
-    elif kind == "progress":
-        done, total = int(payload.get("done", 0)), int(payload.get("total", 0))
-        pct = int(done * 100 / total) if total else 100
-        if pct - last_pct[0] < _PROGRESS_STEP:
-            return
-        last_pct[0] = pct
-        store.add_event(task_id, "package", "system", f"打包中 {pct}%（{done}/{total}）")
     elif kind == "done":
         store.add_event(task_id, "package", "system",
                         f"打包完成（{payload.get('files', 0)} 个文件）")

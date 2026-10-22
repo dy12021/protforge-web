@@ -204,7 +204,8 @@ def set_step(task_id: int, text: str) -> str:
 
 
 def set_status(task_id: int, status: str, actor: str = "system",
-               message: str = "", note: bool = False) -> dict:
+               message: str = "", note: bool = False,
+               allow_leave_terminal: bool = False) -> dict:
     """改状态并留一条 status 事件。进终态时顺手写 done_at。
 
     校验用 db.VALID_STATUSES（主链 4 态 + failed），不能用 STATUS_KEYS，
@@ -238,6 +239,10 @@ def set_status(task_id: int, status: str, actor: str = "system",
     """
     if status not in db.VALID_STATUSES:
         raise Invalid(f"未知状态：{status}")
+    # 「重跑」是唯一一个允许离开终态的动作，所以它得显式声明，
+    # 而且只允许回到 queued：这条口子开到别的目标状态上就成后门了。
+    if allow_leave_terminal and status != "queued":
+        raise Invalid("只有「重跑」可以把任务放回队列")
     tid = int(task_id)
     prev = ""
     won = False
@@ -251,7 +256,8 @@ def set_status(task_id: int, status: str, actor: str = "system",
             prev = str(row["status"])
             if (prev in db.TERMINAL_STATUSES
                     and status not in db.TERMINAL_STATUSES
-                    and actor not in _EXPLICIT_ACTORS):
+                    and actor not in _EXPLICIT_ACTORS
+                    and not allow_leave_terminal):
                 refused = True          # 别人已经收口/中止了，别盖回去
                 break
             # done_at 与状态同一条 UPDATE：条件成立才写，prev 是真读到的值，
@@ -468,6 +474,29 @@ def has_finished(task_id: int) -> bool:
     finally:
         c.close()
     return row is not None
+
+
+def finished_actor(task_id: int) -> str:
+    """收口标记是**谁**写的。
+
+    两种来源，语义完全不同：
+      * ``agent`` —— agent 自己调了 finish 端点，它认为活干完了；
+      * ``system`` —— 平台在「进程自己结束了、但没报收口」时补的，
+        这只说明进程结束了，**不代表它干成了**。
+
+    这个区分决定了「进程非零退出」要不要当成失败：agent 主动报收口之后
+    最后非零退出，多半是收尾时的毛病；平台补的标记遇上非零退出，
+    那就是它自己崩了——2026-10-22 真机上的任务 30 就是这么被洗成成功的
+    （agent OOM 死掉 → 平台补标记 → 退出码 1 → 记成「正常退出」）。
+    """
+    c = db.connect()
+    try:
+        row = c.execute(
+            "SELECT actor FROM events WHERE task_id = ? AND kind = 'finished' LIMIT 1",
+            (int(task_id),)).fetchone()
+    finally:
+        c.close()
+    return (row["actor"] if row else "") or ""
 
 
 # ---------------------------------------------------------------- 子模块

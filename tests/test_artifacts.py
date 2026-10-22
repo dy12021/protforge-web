@@ -290,15 +290,23 @@ def test_package_runs_in_subprocess_and_reports_progress(outputs, task):
 
 
 def test_package_writes_events_by_default(outputs, task):
-    """不传 progress_cb 时进度落进 events，前端 SSE 直接能推。"""
+    """不传 progress_cb 时也写 events，但**只写首尾两条**。
+
+    原来每 5% 写一条「打包中 83%（335/403）」，一次打包能刷出二十来条，
+    把时间线埋了。现在只留「开始打包」和「打包完成」——实时百分比照旧
+    走 SSE 推给前端，进度条不受影响。
+    """
     make_job(outputs, f"t{task['id']}_a", time.time() - 5, files=3)
     artifacts.discover(task_id=task["id"])
 
     artifacts.package(task["id"])
 
     msgs = [e["message"] for e in store.list_events(task["id"]) if e["kind"] == "package"]
-    assert msgs, "打包进度必须可观测"
-    assert any("100%" in m for m in msgs)
+    assert msgs, "打包必须可观测"
+    assert any("开始打包" in m for m in msgs), f"没有开始事件：{msgs}"
+    assert any("打包完成" in m for m in msgs), f"没有完成事件：{msgs}"
+    assert not any("%" in m for m in msgs), (
+        f"打包百分比又写回时间线了（一次打包刷出二十来条，把时间线埋了）：{msgs}")
 
 
 def test_package_without_verified_artifacts_raises(outputs, task):

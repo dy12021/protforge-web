@@ -54,6 +54,7 @@ import db                         # noqa: E402
 import store                      # noqa: E402
 import skills_index               # noqa: E402
 import reflection                 # noqa: E402
+import status_api                 # noqa: E402
 
 VERSION = "0.1.0"
 
@@ -512,6 +513,12 @@ def _start_proposal(reflection_id: int, target: str) -> None:
 def create_admin_app() -> FastAPI:
     db.init_db()
     app = FastAPI(title="蛋白计算平台（管理员面板）", version=VERSION)
+
+    # 状态面板：**和 public/internal 挂的是同一个 router**，路径一致
+    # （/api/status/*）。管理员面板是 8474，前端在 8474 上取数，
+    # 跨端口没有 CORS，所以这套端点必须在它自己的源上也有。
+    # 权限仍由 router 自己把关：/api/status/system 只对管理员开放。
+    app.include_router(status_api.router)
 
     @app.exception_handler(store.NotFound)
     async def _not_found(request, exc):

@@ -1,31 +1,39 @@
 """反思（rsi）：任务收工后让模型自己复盘，把可复用的东西沉淀下来。
 
-一条反思的生命周期：
+**这条链路已经改过两次。** 以前是：
 
     任务进终态 → 巡检发现它还没有反思 → 调模型复盘 → 写成一个 md 文件 + 一行库记录
       → 管理员分类
           ├─ lesson    → 追加进全局经验文件（每任务都注入）+ 对应技能的 references
           └─ tool_gap  → 生成修改方案（真实 diff）→ 人工看过 → 应用 + git 提交
 
-**正文住在文件里，库里只存指针与处理状态。** 读正文一律走 :func:`read_body`，
-它是唯一入口——正文被抄一份进库的话，迟早有一次分类只改到其中一份，
-界面上写着「已沉淀」而经验文件里根本没有那条。
+现在**经验的第一手写入者是干活的计算进程**：它收工前用 write / edit 工具
+直接把做法写进长期记忆（:mod:`memory`），工具问题写进当天的日期文件。
+「模型提出 → 管理员二选一 → 管理员点落地」那道关口没有了。
 
-**模型写的分类只是建议。** 落地一律由管理员分类之后触发：模型说这是经验，
-不代表它就配进下一次任务——没审过的自动沉淀会把一条错的经验喂给后面每一个任务。
+这里剩下的只有两件事：
+
+1. **复盘留档**：任务进终态 → 巡检发现它还没复盘 → 调模型复盘 →
+   写成一个 md 文件 + 一行库记录。**这份正文只是给人读的存档**，
+   它不再喂给任何自动流程——注入提示词的是长期记忆，不是它。
+2. **旧接口的弃用壳**：分类、落地、修改方案那几组函数**保留签名**
+   （管理端的路由还挂在它们上面，删路由是主线的事），但它们什么都不做，
+   调用它们不会抛异常、也不会写任何文件。
+
+**正文住在文件里，库里只存指针与处理状态。** 读正文一律走 :func:`read_body`，
+它是唯一入口——正文被抄一份进库的话，迟早有一次改只改到其中一份，
+界面上写着「已沉淀」而文件里根本没有那条。
 """
 from __future__ import annotations
 
-import difflib
-import hashlib
 import logging
 import os
 import re
-import subprocess
 from pathlib import Path
 
 import db
 import llm
+import memory
 import skills_index
 import store
 
@@ -35,11 +43,11 @@ REFLECTIONS_DIRNAME = "reflections"
 PROPOSALS_DIRNAME = "proposals"
 LESSONS_FILENAME = "lessons.md"
 
-# 注入 agent 提示词的经验块上限。经验是无上限增长的，而每个任务的上下文不是：
-# 一份塞满几百条旧经验的提示词会把真正的需求挤到注意力之外，
-# 而且那条路是从**所有**任务身上收的税。全量留在文件里，提示词只带最近这些。
-LESSONS_BLOCK_MAX = 2000
-LESSONS_BLOCK_ITEMS = 12
+# 注入 agent 提示词的经验块上限。**这两个常量已经搬到 :mod:`memory`**：
+# 现在注入的是长期记忆，不是这个模块里那份旧经验文件。
+# 这里留着是为了不让引用它们的地方断掉（测试、别的模块）。
+LESSONS_BLOCK_MAX = memory.MEMORY_BLOCK_MAX
+LESSONS_BLOCK_ITEMS = memory.MEMORY_BLOCK_ITEMS
 
 # 组装复盘上下文时每段的截断长度。给 agent 的 log 可能几万行，全塞进去
 # 会让这次复盘自己的上下文先炸掉——那就不是在复盘这次任务了。
@@ -63,7 +71,12 @@ def proposals_dir() -> Path:
 
 
 def lessons_path() -> Path:
-    return db.data_root() / LESSONS_FILENAME
+    """**旧的**全局经验文件（``<数据根>/lessons.md``）。
+
+    **只读，不再写。** 新的长期记忆在 :func:`memory.long_term_path`。
+    这里留着是因为迁移要读它（见 :func:`memory.migrate_legacy`）。
+    """
+    return memory.legacy_lessons_path()
 
 
 def skills_root() -> Path:
@@ -81,10 +94,13 @@ def plugin_root() -> Path:
 
 REFLECT_SYSTEM = """\
 你在为「自动化计算平台」做任务复盘。这个平台把你派出去干蛋白/抗体设计一类的
-计算活，现在活干完了（或者干脆没干成），你要写下这次的经验。
+计算活，现在活干完了（或者干脆没干成），你要写下这次的经过。
 
 只依据给你的材料说事。材料里没有的事实不要编，也不要写成通用的套话
 （「要注意环境配置」这种话对下一个任务一点用都没有）。
+
+**这份复盘只是存档**：不会再有「建议分类」这一步，也不会有人来挑拣。
+真正被下一个任务读到的经验，是干活的计算进程自己写进长期记忆的那一份。
 
 严格按下面的格式回答，每节都留着，没内容就写「无」：
 
@@ -97,19 +113,14 @@ REFLECT_SYSTEM = """\
 ## 卡住的地方
 - 具体的卡点、报错、反复试了几次
 
-## 经验
-- [技能 技能名] 一句话说清下次该怎么做的具体做法。
-  没有就写「无」。技能名写实际用到的 protforge-* 技能，不知道就写 [技能 通用]。
-
 ## 工具意见
 - [技能 技能名] 哪个工具缺了什么 / 哪里别扭 / 会导致什么后果。
-  这是要拿去改工具的，所以必须具体到「缺哪个参数」「哪一步只能靠猜」。
-  没有就写「无」。
+  写清楚到「缺哪个参数」「哪一步只能靠猜」「它给的输出会让人误解成什么」。
+  没有就写「无」。"""
 
-## 建议分类
-只写一个词：lesson 或 tool_gap。倾向写经验就写 lesson，
-主要是工具本身不够用才写 tool_gap。"""
-
+# 认识的小节标题。**「经验」和「建议分类」是旧流程留下的**：
+# 现在的提示词不再要求这两节，但老正文的解析还得认得它们——
+# 解析器要能读几个月前写下的那些存档。
 _SECTION_HEADS = ("这次实际做了什么", "顺利的地方", "卡住的地方",
                   "经验", "工具意见", "建议分类")
 
@@ -329,15 +340,17 @@ def render_md(task: dict, parsed: dict, raw: str) -> str:
     lines += ["", "## 卡住的地方"]
     lines += [f"- {t}" for t in parsed["stuck"]] or ["（无）"]
     lines += ["", "## 经验"]
-    # 条目一律写成 ``- [技能 x] …``：**与模型自己的输出、以及 _land_lesson
-    # 读的那套格式完全一致**。这里写成 `- [x]`，落地那一步的正则就一条都配不上，
-    # 表现是「管理员点了落地，经验一条也没写进去」。
+    # 条目一律写成 ``- [技能 x] …``。**这一节现在只是存档**：
+    # 真正被下一个任务读到的经验，是计算进程自己写进长期记忆的那一份。
     lines += [f"- [技能 {_skill_tag(i['skill'])}] {i['text']}" for i in parsed["lessons"]] \
         or ["（无）"]
     lines += ["", "## 工具意见"]
     lines += [f"- [技能 {_skill_tag(i['skill'])}] {i['text']}" for i in parsed["tool_gaps"]] \
         or ["（无）"]
-    lines += ["", "## 建议分类", parsed["suggested"] or "（模型没给建议，等管理员定）", ""]
+    lines += ["", "## 建议分类",
+              parsed["suggested"] or
+              "（不再需要分类：经验由计算进程自己写进长期记忆，"
+              "工具问题写进当天的日期文件）", ""]
     lines += ["---", "", "## 模型原始输出", "", "```", (raw or "").strip(), "```", ""]
     return "\n".join(lines)
 
@@ -380,6 +393,10 @@ def generate(task_id: int) -> dict:
     """给一条已进终态的任务做复盘。返回那条反思记录。
 
     幂等：已经有记录就直接返回，不重复调模型。巡检每 tick 都可能扫到同一条。
+
+    **这份复盘现在是存档**：它不再喂给任何自动流程——注入提示词的是长期记忆
+    （:func:`lessons_block`），工具问题走按日期命名的文件。留着它是因为
+    「这次到底发生了什么」仍然值得人读。
     """
     existing = store.get_reflection_by_task(task_id)
     if existing is not None:
@@ -473,96 +490,68 @@ def normalize_skill(name: str) -> str:
 
 
 def lessons_block() -> str:
-    """要注入 agent 提示词的经验块。文件不在或没内容时返回空串。"""
-    p = lessons_path()
-    if not p.is_file():
-        return ""
-    try:
-        text = p.read_text(encoding="utf-8")
-    except OSError:
-        log.warning("读经验文件失败，本轮不带经验")
-        return ""
-    items = [ln.strip() for ln in text.splitlines()
-             if ln.strip().startswith("- ")]
-    if not items:
-        return ""
-    items = items[-LESSONS_BLOCK_ITEMS:]
-    block = "\n".join(items)
-    return block[:LESSONS_BLOCK_MAX]
+    """要注入 agent 提示词的长期记忆块。**读的是新的长期记忆**，不是旧经验文件。
+
+    调度器（``dispatcher._dispatch_prompt``）在拼需求之前调它，把这块放在
+    需求前面——它是背景条件，不是补充说明。一条都没有时返回空串，
+    调用方据此不拼那一段（给模型一个空壳只会让它以为这里本来没什么可参考）。
+
+    容错在 :mod:`memory` 那一层做：文件不存在、编码坏了、格式坏了，
+    都读成「没有内容」，不抛异常——这个块是**每个任务开工都要读**的，
+    它坏一次就等于整批任务全炸。
+    """
+    return memory.memory_block()
 
 
 def append_lesson(skill: str, text: str, task_id: int, decided_by: str) -> str:
-    """把一条经验写进全局经验文件，返回写进去的那一行。
+    """**已弃用：什么都不写。** 返回空串。
 
-    全局文件是**唯一每任务都注入**的那一份，所以它必须自己站得住：
-    每条都带来源（哪个任务、第几条），将来有人觉得这条不对，能顺着它找到当时的复盘。
+    经验的第一手写入者现在是干活的计算进程：它收工前用 write / edit 工具
+    直接写进长期记忆（:func:`memory.long_term_path`）。
+    「管理员分类 → 点落地」那条路已经拆掉了。
+
+    **为什么留着一个空壳而不是删掉**：管理端还有路由挂在它上面，
+    删函数会让那些路由 500。留一个不抛异常、也不写任何东西的函数，
+    旧路由最多是「什么都没发生」，不会把整条链路带崩。
+
+    **遗留**：管理端那个「落地」端点仍会返回「已落地 N 条」，
+    而实际上一个字都没写。那个端点该被删掉（清单在交付报告里）。
     """
-    line = f"- {text.strip()}（来自任务 #{int(task_id)}，{decided_by} 于 {db.now_iso()[:10]} 归档）"
-    p = lessons_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if not p.is_file():
-        p.write_text(
-            "# 已沉淀的经验\n\n"
-            "**这一份由管理员分类「经验」后自动追加，不要手工改。**\n"
-            "每条来自哪次任务复盘都写在行尾，删条目请连同对应反思一起处理。\n\n",
-            encoding="utf-8")
-    with p.open("a", encoding="utf-8") as fh:
-        if not line.startswith("- "):
-            line = "- " + line
-        fh.write(line + "\n")
-    return line
+    log.warning("append_lesson 已弃用：经验改由计算进程自己写进长期记忆，"
+                "这条没有落地（任务 #%s）", task_id)
+    return ""
 
 
 def append_skill_lesson(skill: str, text: str, task_id: int) -> str:
-    """同时沉淀进技能自己的 references。**返回实际写到的路径，没写成功返回空串。**
+    """**已弃用：什么都不写。** 返回空串。
 
-    这一层是「知识待在该在的地方」的那一层，不是每任务都读的那一层——
-    技能没被加载时它就不在上下文里。它写失败不许影响全局经验那一步：
-    那一步才是保证生效的那一步。
+    同 :func:`append_lesson`：技能的 references 不再由这条路径写。
     """
-    name = normalize_skill(skill)
-    if not name:
-        return ""
-    ref_dir = skills_root() / name / "references"
-    try:
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        p = ref_dir / "lessons.md"
-        if not p.is_file():
-            p.write_text(
-                "# 经验沉淀\n\n"
-                "由自动化计算平台的反思流程写入（管理员分类为「经验」之后）。\n"
-                "来源见每条行尾的任务号，要撤销请回到对应反思处理。\n\n",
-                encoding="utf-8")
-        with p.open("a", encoding="utf-8") as fh:
-            fh.write(f"- {text.strip()}（来自任务 #{int(task_id)}）\n")
-        return str(p)
-    except OSError:
-        log.warning("沉淀经验到技能 %s 失败，全局经验那一步已写入，不受影响", skill)
-        return ""
+    log.warning("append_skill_lesson 已弃用：经验改由计算进程自己写进长期记忆，"
+                "这条没有沉淀进技能目录（任务 #%s）", task_id)
+    return ""
 
 
-# --- 修改方案（工具意见 → 真 diff → 人工应用）-------------------------------
+# --- 旧流程的弃用壳 ------------------------------------------------------------
+#
+# 以前这里是「工具意见 → 真 diff → 人工应用」：模型改一份技能文件，
+# 服务端算 diff，人看过 diff 才应用，还带 git 提交。
+#
+# **这条路整个废掉了。** 工具问题现在只写进按日期命名的文件
+# （``<数据根>/tool-issues/<YYYY-MM-DD>.md``），由用户每周用 minimax code
+# 统一修一遍：平台不生成 diff、不自动改技能仓库、不提交 git。
+#
+# 下面的 build_proposal / apply_proposal **保留签名**（管理端还有路由挂着
+# 它们，删函数会让那些路由 500），但它们什么都不做：不调模型、不写文件、
+# 不碰技能仓库、不提交 git。
 
-PROPOSE_SYSTEM = """\
-你在按一条「工具不够用」的反馈修改一个技能文件。
-
-规则：
-1. 只输出修改后的**完整文件内容**，不要输出任何解释、不要用 ``` 包裹、
-   不要只给片段。输出会被拿去和原文逐行 diff。
-2. 改动只针对反馈里说的那一点，不要顺手重构、不要改格式、不要加别的功能。
-3. **没提到的段落必须逐字逐行原样保留**：不要重新折行、不要改强调符号
-   （*text* 与 **text** 算改动）、不要动标点。重新排版会整段出现在 diff 里，
-   而管理员看 diff 的前提是「diff 里只有这次反馈真正要的改动」。
-4. 不确定的地方保持原样。宁可少改，不要把一个能用的技能改坏。
-"""
-
-_PROPOSE_FENCE = re.compile(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", re.S)
+_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", re.S)
 
 
 def strip_fence(text: str) -> str:
-    """模型很爱给整段加 ``` 包裹。剥掉，否则 diff 会显示成「整份文件换掉了」。"""
+    """模型很爱给整段加 ``` 包裹。剥掉，否则解析时小节标题认不出来。"""
     s = (text or "").strip()
-    m = _PROPOSE_FENCE.match(s)
+    m = _FENCE_RE.match(s)
     if m:
         return m.group(1)
     if s.startswith("```"):
@@ -572,178 +561,38 @@ def strip_fence(text: str) -> str:
     return s
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def diff_for(target: str, before: str, after: str) -> str:
-    """真 diff。用 difflib 算，不采信模型自己写的 diff。
-
-    模型直接产出 unified diff 时几乎总会漏 hunk 头或对错行号，
-    而那种 diff 打补丁时表现是「部分应用、剩下几块静默不动」。
-    让它产出**完整新内容**、我们自己算 diff，看到的和落盘的就一定是同一份。
-    """
-    return "".join(difflib.unified_diff(
-        before.splitlines(keepends=True), after.splitlines(keepends=True),
-        fromfile=f"a/{target}", tofile=f"b/{target}", n=3))
-
-
-def _squash(text: str) -> str:
-    """归一化一段文字：去掉强调标记、去掉所有空白。
-
-    去掉 ``*`` 是因为 ``*not*`` 与 ``**not**`` 说的是同一件事，模型顺手换一种
-    写法不该算改动。**不去掉下划线**：``num_diffusion_samples`` 这种标识符里
-    的下划线是有意义的，去掉它会把「改了变量名」也当成「只是排版」。
-    """
-    return re.sub(r"\s+", "", text.replace("*", ""))
-
-
-_BLOCK_SPLIT = re.compile(r"(\n[ \t]*\n+)")
-
-
-def _split_blocks(text: str) -> tuple[list[str], list[str]]:
-    """把文本切成**空行分隔的块**，并记住每块前面的分隔符。
-
-    返回 (分隔符列表, 块内容列表)，下标一一对应：第 i 块前面是分隔符 i。
-    分隔符原样留着——还原的时候要把原文的折行与空行一起还回去。
-    """
-    parts = _BLOCK_SPLIT.split(text)
-    contents = parts[0::2]
-    seps = [""] + parts[1::2]
-    return seps, contents
-
-
-def repair_reflow(before: str, after: str) -> str:
-    """把「只重新折了行、没真改」的块还原回原文。
-
-    **为什么需要这一步**：模型要输出的是**完整新文件**，它于是顺手把没提到的
-    段落也重新排了一遍——把三行折成两行、把 ``*not*`` 写成 ``**not**``。
-    那些改动与这次反馈毫无关系，却会整段出现在 diff 里。而「看 diff 再决定」
-    这条写路径存在的**全部前提**就是：diff 里只有这次反馈真正要的改动。
-    实测过一份真方案：3 个 hunk 里只有 1 个是反馈要的，另外 2 个是纯折行。
-
-    **按块对齐，不按行对齐**：折行会把一行变成两行，按行 diff 的话模型新加
-    的小节会和它旁边那段被折行的文字**粘成同一个块**——于是整块都当成
-    「模型改过的」，折行就留下了。按空行分块之后，块与块是对齐的：
-    折过行的那块归一化后与原文一样 → 还原；新加的小节是独立的一块 → 留下。
-
-    判据：归一化掉空白与强调标记之后与原文**完全一样** → 纯排版，还原；
-    只要有一处不同，就整体保留模型的写法（宁可留噪声，也不要把真改动
-    当成噪声抹掉）。
-    """
-    a_seps, a_blocks = _split_blocks(before)
-    b_seps, b_blocks = _split_blocks(after)
-    a_keys = [_squash(b) for b in a_blocks]
-    b_keys = [_squash(b) for b in b_blocks]
-    out: list[str] = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
-            None, a_keys, b_keys, autojunk=False).get_opcodes():
-        if tag == "equal":
-            # 原文的块：连同原文的折行与空行一起还回去
-            for k in range(i1, i2):
-                out.append(a_seps[k])
-                out.append(a_blocks[k])
-        elif tag in ("replace", "insert"):
-            for k in range(j1, j2):
-                out.append(b_seps[k])
-                out.append(b_blocks[k])
-        # delete：模型真的删了块，那是实质改动，保留（不还原）。
-    return "".join(out)
-
-
 def build_proposal(reflection_id: int, target: str) -> dict:
-    """为一条「工具意见」生成修改方案。
+    """**已弃用：什么都不做。**
 
-    ``target`` 是**技能仓库内的相对路径**，例如
-    ``skills/protforge-proteinmpnn/SKILL.md``。不接受绝对路径也不接受 ``..``：
-    这是唯一一处会写进别人仓库的代码，路径一旦能逃出去就等于任意写。
+    工具问题不再生成修改方案：它写进按日期命名的文件
+    （``<数据根>/tool-issues/<YYYY-MM-DD>.md``），由用户每周用 minimax code
+    统一修一遍。
+
+    **这里不调模型、不写方案文件、不碰技能仓库、不提交 git。**
+    只把状态标成 failed 并写清原因——管理端那个「生成修改方案」的按钮
+    还在（删端点是主线的事），点下去会看到一条说得清原因的话，
+    而不是「转一圈什么也没发生」。
+
+    **不抛异常**：旧路由还挂在它上面，抛异常会让那些路由 500。
     """
-    rec = store.get_reflection(reflection_id)
-    if rec["kind"] != "tool_gap":
-        raise store.Invalid("这条还没被分类为「工具意见」，生成什么方案？")
-    rel = (target or "").strip().replace("\\", "/")
-    if not rel.startswith("skills/"):
-        raise store.Invalid("要改的必须是 skills/ 下的文件")
-    root = plugin_root().resolve()
-    abs_target = (root / rel).resolve()
-    if not str(abs_target).startswith(str(root) + "\\") and \
-            not str(abs_target).startswith(str(root) + "/"):
-        raise store.Invalid("要改的路径跑出技能仓库了")
-    if not abs_target.is_file():
-        raise store.Invalid(f"技能仓库里没有这个文件：{rel}")
-
-    before = abs_target.read_text(encoding="utf-8")
-    body = read_body(rec["path"])
-    feedback = _tool_gap_section(body)
-
-    prompt = (
-        f"技能仓库：{root}\n要改的文件：{rel}\n\n"
-        f"## 这条反馈\n{feedback}\n\n"
-        f"## 文件现在的内容\n```\n{before}\n```\n\n"
-        "请输出修改后的完整文件内容。")
-    # 先标「正在生成」再调模型：这一次可能要一两分钟，管理员那边看到的是
-    # 「正在生成」而不是一个转不出来的按钮。
-    store.set_proposal_state(reflection_id, "running")
+    msg = ("工具意见不再生成修改方案：工具问题请写进 "
+           f"{memory.tool_issue_path(db.now_iso()[:10])}"
+           "（按日期命名），由用户每周统一修。")
+    log.warning("build_proposal 已弃用：%s", msg)
     try:
-        # **思考档位 low + 预算 32k。** 这两项都不是"调优"，是"能不能跑通"：
-        # 默认档实测思考了 9,441 tokens（43k 字符）、花 165 秒，而 8192 的预算
-        # 正好被思考吃光 → finish_reason=length → 正文一个字都没有 →
-        # 「模型回的不是预期的 chat 结构」。改档位还顺带把改动收住了：
-        # 同一份反馈，默认档改出 246 行（把 46 行的文件重写了一遍），
-        # low 档 79 行——提示词里「不要顺手重构」那条守住了。
-        raw = llm.chat_completion(prompt, system=PROPOSE_SYSTEM,
-                                  max_completion_tokens=32768,
-                                  reasoning_effort="low")
-    except Exception as exc:
-        # **失败原因必须留下来**：原来只把状态标成 failed，原因只进日志。
-        # 界面上管理员看到的是「生成失败」四个字，没有别的——他连
-        # 「模型调不通」还是「路径写错了」都分不出来。
-        store.set_proposal_state(reflection_id, "failed", str(exc))
-        raise
-    after = strip_fence(raw)
-    if not after.strip():
-        store.set_proposal_state(reflection_id, "failed", "模型回了空的修改后内容")
-        raise ReflectionError("模型回了空的修改后内容")
-    # **纯折行的片段还原回原文**（见 repair_reflow）。模型要输出完整新文件，
-    # 于是顺手把没提到的段落也重新排了一遍——那些改动与这次反馈无关，却会
-    # 整段出现在 diff 里，而管理员看 diff 的前提是「diff 里只有这次反馈
-    # 真正要的改动」。
-    after = repair_reflow(before, after)
-    # **末尾换行跟着原文走。** 模型吐出来的正文常常没有结尾换行，而原文有。
-    # 直接落盘就把文件末尾的换行弄丢了：git 会把最后一行报成改动
-    # （"\ No newline at end of file"），而那条改动跟反馈**毫无关系**——
-    # 管理员看着 diff 里多出来的一行要猜这是不是模型想改什么。
-    # 补上之后，diff 里剩下的就全是这次反馈真正要的改动。
-    if before.endswith("\n") and not after.endswith("\n"):
-        after += "\n"
-    if after == before:
-        # 两种「没改动」要分开说：模型真的说不用改，和模型只做了纯排版。
-        # 后者不是「该否决」，是「自动落地不了，得人工来」。
-        reason = ("模型只把没提到的段落重新折了行，没有实质改动——这条反馈得人工改"
-                  if strip_fence(raw) != before else
-                  "模型说不用改——那这条就不是「工具不够用」，该否决")
-        store.set_proposal_state(reflection_id, "failed", reason)
-        raise ReflectionError(reason)
-
-    patch = diff_for(rel, before, after)
-    try:
-        proposals_dir().mkdir(parents=True, exist_ok=True)
-        pf = proposals_dir() / f"refl-{int(reflection_id)}.patch"
-        body_out = proposals_dir() / f"refl-{int(reflection_id)}.new"
-        pf.write_text(patch, encoding="utf-8")
-        body_out.write_text(after, encoding="utf-8")
-    except OSError as exc:
-        store.set_proposal_state(reflection_id, "failed")
-        raise ReflectionError(f"写方案文件失败：{exc}") from exc
-
-    store.set_reflection_proposal(reflection_id, str(pf), rel, sha256_text(before))
-    return {"diff": patch, "patch_path": str(pf), "target": rel,
-            "base": sha256_text(before), "new_path": str(body_out)}
+        store.set_proposal_state(reflection_id, "failed", msg)
+    except Exception:                                     # noqa: BLE001
+        log.exception("把反思 %s 的方案状态标成 failed 失败", reflection_id)
+    return {"ok": False, "deprecated": True, "message": msg,
+            "patch_path": "", "target": target, "diff": ""}
 
 
 def _tool_gap_section(body: str) -> str:
     """从反思正文里抠出「工具意见」那一节。抠不到就把全文给模型看——
-    总比让它对着空字符串编一个方案强。"""
+    总比让它对着空字符串编一个方案强。
+
+    **只给迁移用**（把旧正文里的工具意见搬进按日期命名的文件）。
+    """
     lines = body.splitlines()
     out, on = [], False
     for ln in lines:
@@ -757,63 +606,34 @@ def _tool_gap_section(body: str) -> str:
 
 
 def apply_proposal(reflection_id: int) -> dict:
-    """把方案落进技能仓库，并 git 提交。
+    """**已弃用：什么都不做。**
 
-    **落盘前校验原文哈希**：方案是基于某一版原文生成的，管理员看diff到点确认
-    中间技能文件可能被人改过。不校验就写，等于拿一份旧方案覆盖掉别人的新改动，
-    而 git 里看不出来是谁干的。
+    不写技能仓库、不提交 git、不改记录状态。工具问题改由用户每周用
+    minimax code 统一修（见 :func:`build_proposal` 的说明）。
+
+    **不抛异常**：旧路由还挂在它上面，抛异常会让那些路由 500。
     """
-    rec = store.get_reflection(reflection_id)
-    if rec["kind"] != "tool_gap":
-        raise store.Invalid("只有「工具意见」才有修改方案可应用")
-    if not rec["proposal"]:
-        raise store.Invalid("还没有生成修改方案")
-    if rec["status"] == "applied":
-        raise store.Invalid("这条已经应用过了")
-
-    root = plugin_root()
-    abs_target = (root / rec["proposal_target"]).resolve()
-    if not str(abs_target).startswith(str(root) + "\\") and \
-            not str(abs_target).startswith(str(root) + "/"):
-        raise store.Invalid("方案的目标路径跑出技能仓库了")
-
-    before = abs_target.read_text(encoding="utf-8")
-    if sha256_text(before) != rec["proposal_base"]:
-        raise store.Invalid(
-            "技能文件在方案生成之后被改过了。方案是基于旧版本生成的，"
-            "直接应用会把别人的改动覆盖掉——请重新生成方案。")
-    after = Path(
-        Path(rec["proposal"]).with_suffix(".new")).read_text(encoding="utf-8")
-
-    before_text = before
-    abs_target.write_text(after, encoding="utf-8")
+    msg = ("工具意见不再有「应用方案」这一步：平台不生成 diff、不改技能仓库、"
+           "不提交 git。请把问题写进按日期命名的工具问题文件，"
+           "由用户每周统一修。")
+    log.warning("apply_proposal 已弃用：%s", msg)
+    status = ""
     try:
-        commit = _git_commit(root, rec["proposal_target"], int(reflection_id))
-    except Exception:
-        abs_target.write_text(before_text, encoding="utf-8")   # 提交失败要还原
-        raise
-    out = store.mark_reflection_applied(reflection_id)
-    out["commit"] = commit
-    return out
+        status = str(store.get_reflection(reflection_id).get("status") or "")
+    except Exception:                                     # noqa: BLE001
+        log.exception("读反思 %s 的状态失败", reflection_id)
+    return {"ok": False, "deprecated": True, "message": msg,
+            "status": status, "commit": ""}
 
 
-def _git_commit(root: Path, rel: str, reflection_id: int) -> str:
-    """在技能仓库里提交这一处改动。**不是仓库就明说失败**，不假装提交过了。
+def migrate_legacy_memory(*, dry_run: bool = False) -> dict:
+    """把旧布局里的东西搬进新布局（幂等）。**入口在这里，实际活儿在
+    :func:`memory.migrate_legacy`。**
 
-    ``encoding="utf-8"`` 不能省：commit message 是中文，而 ``text=True`` 不给
-    encoding 时走的是本机 ANSI 码页（这台机是 gbk），git 那边的 UTF-8 字节会在
-    解码线程里抛 UnicodeDecodeError——而那个异常发生在 reader 线程里，
-    提交命令本身的返回码照样是 0，于是**提交失败被报成提交成功**。
+    搬两样：旧的全局经验文件 ``<数据根>/lessons.md`` → 长期记忆
+    ``<数据根>/memory/long-term.md``；旧反思正文里的「工具意见」一节 →
+    工具问题文件 ``<数据根>/tool-issues/<收工日期>.md``。
+
+    **不会在 import 时偷偷跑**：迁移要人明确调用一次（管理端或者命令行）。
     """
-    if not (root / ".git").exists():
-        raise store.Invalid(f"{root} 不是 git 仓库，应用了改动但没法提交——"
-                            "请手工确认并提交")
-    run_git = dict(cwd=str(root), capture_output=True, text=True,
-                   encoding="utf-8", errors="replace", timeout=120)
-    subprocess.run(["git", "add", "--", rel], **run_git)
-    msg = f"反思 #{reflection_id}：按工具意见修改 {rel}"
-    p = subprocess.run(["git", "commit", "-m", msg], **run_git)
-    if p.returncode != 0:
-        raise store.Invalid(f"git 提交失败：{(p.stderr or p.stdout or '').strip()[:300]}")
-    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **run_git)
-    return (head.stdout or "").strip()
+    return memory.migrate_legacy(dry_run=dry_run)

@@ -59,6 +59,8 @@ from pathlib import Path
 import db
 import guards
 import llm
+import memory
+import recovery
 import reflection
 import sse
 import store
@@ -89,6 +91,11 @@ REFLECTION_SWEEP_LIMIT = 3
 # 后台反思线程数。比归档少：归档是本地磁盘 IO，这里每一次都是一次**要花钱的**
 # 模型调用，堆线程只会更快地把 token 花掉，不会更快地拿到结果。
 REFLECTION_WORKERS = 2
+
+# --- 自动恢复调参 -------------------------------------------------------------
+# 后台恢复线程数。给 1 就够：每次评估都是一次**要花钱的**模型调用，
+# 堆线程只会更快地把 token 花掉，不会更快地拿到结论。
+RECOVERY_WORKERS = 1
 READER_JOIN_TIMEOUT = 5.0
 #: agent 报完 finish 之后，给它自己收尾（关 stdin → runRpcMode 返回 → 进程退出）
 #: 的宽限。逾时就杀进程树——宁可强杀也不能让任务永远停在「计算中」。
@@ -496,6 +503,10 @@ class AgentProc:
     reader: threading.Thread = field(default=None, repr=False)
 
     aborted: bool = False                    # 管理员明确中止过
+    #: 进程是**平台在 wind_down 里杀的**（它报完收口却赖着不走）。
+    #: 这跟「它自己崩了」必须分开：两者退出码都非零，但前者是
+    #: 平台的正常收尾动作，后者才是失败。
+    wind_down_killed: bool = False
     abort_reason: str = ""                   # 为什么中止；收尾时用它当失败原因
     settled: bool = False                    # 已被收尾（幂等闸）
     exit_code: int | None = None
@@ -785,6 +796,25 @@ class Dispatcher:
         self._refl_thread: threading.Thread | None = None
         self._refl_threads: list[threading.Thread] = []
         self._refl_stopped = False
+
+        # --- 自动恢复工作线程 -----------------------------------------------------
+        # 评估一次失败要调模型（几十秒到几分钟），同样不能放在 tick 主路径上：
+        # 那里放的是「接单 + 收尾」，卡住它等于整个批次停摆。
+        self._recov_lock = threading.Lock()
+        self._recov_q: queue.Queue = queue.Queue()
+        #: 已入队或正在评估的任务。防止两次 tick 把同一条投两遍——
+        #: 真投两遍就是两次模型调用，而 token 是要花钱的。
+        self._recov_inflight: set[int] = set()
+        self._recov_thread: threading.Thread | None = None
+        self._recov_threads: list[threading.Thread] = []
+        self._recov_stopped = False
+
+        # --- 长期记忆整理 -------------------------------------------------------
+        # 每天一次。**判定不靠这个进程的内存**（public/admin/internal 三个
+        # 进程各有一份），靠 memory.review-state.json 落盘。
+        self._mem_lock = threading.Lock()
+        self._mem_thread: threading.Thread | None = None
+        self._mem_stopped = False
 
     # --- 并发上限 ---------------------------------------------------------------
 
@@ -1094,6 +1124,10 @@ class Dispatcher:
         self._archive_stop()
         # 反思同理：没做完的那条没建记录，下次启动巡检会重新扫到。
         self._reflection_stop()
+        # 自动恢复也一样：评估没做完的，下次启动会重新扫到。
+        self._recovery_stop()
+        # 长期记忆整理：不打断正在跑的那一次（见 _memory_review_stop）。
+        self._memory_review_stop()
 
     def _loop(self) -> None:
         while not self._stopping:
@@ -1123,6 +1157,18 @@ class Dispatcher:
             self._workflow_archive_pass()
         except Exception:                          # noqa: BLE001
             log.exception("工作流归档巡检出错")
+        # 长期记忆整理每天一次，**每轮巡检都试一下**——判定在
+        # memory.run_daily_review 内部（今天整理过就 skip，什么都不做）。
+        try:
+            self._memory_review_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("长期记忆整理出错")
+        # 自动恢复排在反思前面：它关系到「这一行到底算不算跑完」，
+        # 而反思只关系到经验沉淀，晚一轮无所谓。
+        try:
+            self._recovery_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("自动恢复巡检出错")
         # 反思排在最后：它最慢也最不紧急（反馈闭环晚一轮无所谓，
         # 而它排在前面会让一次模型调用慢的巡检拖住整轮调度）。
         try:
@@ -1139,6 +1185,126 @@ class Dispatcher:
     # 再由打包改成 done，用户中止、打包超时、janitor 清理写的都是 failed。
     # 只盯一个入口的后果很安静——另外几条路径收工的任务永远没有反思，
     # 而界面上看不出任何异常。
+
+    # --- 自动恢复 -----------------------------------------------------------
+
+    def _recovery_pass(self) -> int:
+        """扫一轮：把失败的任务排进评估队列。**这里不调模型**。
+
+        评估是一次完整的模型调用（几十秒到几分钟），放在调度器的主循环里
+        会把整轮调度卡住——那正是「行与行之间空转很久」的一个来源。
+        所以这里只做筛选与入队，真正的评估丢给后台线程。
+        """
+        if self._stopping:
+            return 0
+        try:
+            rows = recovery.candidates()
+        except Exception:                          # noqa: BLE001
+            log.exception("读取待恢复任务失败")
+            return 0
+        queued = 0
+        for row in rows:
+            tid = int(row["id"])
+            if tid in self._recov_inflight:
+                continue
+            self._recov_inflight.add(tid)
+            self._recov_q.put(tid)
+            queued += 1
+        if queued:
+            self._recovery_ensure_thread()
+        return queued
+
+    def _recovery_ensure_thread(self) -> None:
+        with self._recov_lock:
+            if self._recov_stopped:
+                return
+            alive = [t for t in self._recov_threads if t.is_alive()]
+            for i in range(len(alive), RECOVERY_WORKERS):
+                t = threading.Thread(target=self._recovery_loop,
+                                     name=f"recover-{i}", daemon=True)
+                t.start()
+                alive.append(t)
+            self._recov_threads = alive
+            self._recov_thread = alive[0] if alive else None
+
+    def _recovery_loop(self) -> None:
+        """后台恢复线程。**任何异常都不许逃出去**——同 _reflection_loop 的理由。"""
+        while True:
+            try:
+                task_id = self._recov_q.get(timeout=1.0)
+            except queue.Empty:
+                if self._stopping or self._recov_stopped:
+                    return
+                continue
+            if task_id is None:                    # stop() 投的结束哨兵
+                return
+            try:
+                outcome = recovery.process(task_id)
+                log.info("任务 %s 的自动恢复：%s", task_id, outcome)
+            except Exception:                      # noqa: BLE001
+                log.exception("任务 %s 的自动恢复出错", task_id)
+            finally:
+                with self._recov_lock:
+                    self._recov_inflight.discard(task_id)
+
+    def _recovery_stop(self) -> None:
+        """停机：投哨兵。**不等模型调用返回**——同 _reflection_stop 的理由。"""
+        with self._recov_lock:
+            self._recov_stopped = True
+            n = len(self._recov_threads)
+        for _ in range(n + 1):
+            try:
+                self._recov_q.put_nowait(None)
+            except queue.Full:
+                break
+
+    # --- 长期记忆整理 -------------------------------------------------------
+
+    def _memory_review_pass(self) -> int:
+        """整理一次长期记忆。**本身不阻塞**——真正的活儿在后台线程里。
+
+        这里的动作只是「起一个线程」，因为整理要 spawn 一个计算进程
+        并等它跑完（最长半小时）。放主循环里等于整个调度器停半小时。
+        """
+        if self._stopping or self._mem_stopped:
+            return 0
+        with self._mem_lock:
+            if self._mem_stopped:
+                return 0
+            if self._mem_thread is not None and self._mem_thread.is_alive():
+                return 0
+            t = threading.Thread(target=self._memory_review_loop,
+                                 name="memory-review", daemon=True)
+            t.start()
+            self._mem_thread = t
+        return 1
+
+    def _memory_review_loop(self) -> None:
+        """后台整理线程。**任何异常都不许逃出去。**
+
+        睡醒的间隔是半小时：判定「今天整理过没有」在 memory 那边落盘，
+        所以醒来时如果今天已经整理过，它会自己 skip，什么都不做。
+        """
+        while True:
+            try:
+                res = memory.run_daily_review()
+                if res.get('ok') and not res.get('skipped'):
+                    log.info('长期记忆已整理：%s', res.get('date'))
+                elif not res.get('ok'):
+                    log.warning('长期记忆没整理成功：%s', res.get('reason'))
+            except Exception:                     # noqa: BLE001
+                log.exception('长期记忆整理出错')
+            for _ in range(30):                   # 半小时后再看一次
+                if self._stopping or self._mem_stopped:
+                    return
+                time.sleep(60)
+
+    def _memory_review_stop(self) -> None:
+        """停机。**不打断正在跑的整理**——它最多半小时，而它写的是
+        长期记忆文件，中途杀掉可能留下半截内容。
+        """
+        with self._mem_lock:
+            self._mem_stopped = True
 
     def _reflection_pass(self) -> int:
         """扫一轮：找进终态但还没反思的任务，入队。返回入队条数。"""
@@ -1921,6 +2087,12 @@ class Dispatcher:
         if not text:
             text = "请阅读工作目录下的 brief.md，按里面的要求完成计算。"
 
+        # 上一轮失败留下的提示（如果有）：**放在需求后面**。它是这一轮的
+        # 附加约束，不是背景条件——agent 先看到要做什么，再看到上次栽在哪。
+        hint = recovery.read_hint(ap.task_id)
+        if hint:
+            text = text + ("\n\n## 上一轮失败留下的提示\n" + hint)
+
         # 经验块放在**需求前面**：它是背景条件，不是补充说明。放在后面的话，
         # 长需求会把前面的内容挤出注意力——而这批经验正是为了在长需求里被想起。
         # 一条都没有时**不加这段**：给模型一个「## 已沉淀的经验（暂无）」的空壳，
@@ -2255,6 +2427,9 @@ class Dispatcher:
             except subprocess.TimeoutExpired:
                 log.warning("任务 %s 报完收口后进程 %s 仍在运行，杀掉",
                             ap.task_id, ap.pid)
+                # **先记，再杀**：收尾分流要靠它把「平台杀的」和
+                # 「它自己崩的」分开——两者退出码都非零。
+                ap.wind_down_killed = True
                 kill_tree(ap.proc)
                 try:
                     ap.proc.wait(timeout=KILL_TIMEOUT)
@@ -2342,6 +2517,35 @@ class Dispatcher:
         # 「任务不存在」，跟真正的原因（任务确实被删了）不相干，而收尾线程
         # 就此死掉，后面该做的事全落空。所以每条写库的路都自己兜住。
         if has_finished and not already_terminal:
+            # **平台补的收口标记 + 非零退出 = 它自己崩了。**
+            # 2026-10-22 真机：任务 30 的 agent OOM 死掉（退出码 1），
+            # 它没调 finish，于是「自行收口」那条路替它补了收口标记；
+            # 而这里只看标记不看退出码，于是「计算进程正常退出（退出码 1）」
+            # 被写进时间线，223 个文件被打成包，这一行在结果表里是绿的——
+            # 而 deliverables/ 是空的。
+            #
+            # 只在「标记是平台补的」时才这么判：agent 主动报过收口，
+            # 说明它认为活干完了，进程最后非零退出多半是收尾的毛病，
+            # 不该把已经交出来的产物判成失败。
+            #
+            # 「平台 wind_down 杀的」也要排除：那种非零退出码是平台自己
+            # 收拾僵尸留下的（agent 报完收口却赖着不走，平台等宽限期后
+            # 把它杀掉），不是 agent 崩了。
+            if (code != 0
+                    and store.finished_actor(ap.task_id) == "system"
+                    and not ap.wind_down_killed):
+                self._mark_failed(
+                    ap.task_id,
+                    f"计算进程异常结束（退出码 {code}），未收到收口标记；"
+                    f"stderr 见 {ap.stderr_path.name}")
+                try:
+                    store.add_event(ap.task_id, "log", "system",
+                                    f"计算进程异常结束（退出码 {code}），"
+                                    f"这一轮的产物不可信")
+                except store.NotFound:
+                    return code
+                _notify()
+                return code
             try:
                 store.set_status(ap.task_id, "packaging", actor="agent",
                                  message="计算进程已收口，开始打包产物")

@@ -15,15 +15,22 @@
  * 可选：
  *   PROTFORGE_SKILLS_DIR    技能目录（也认 PROTFORGE_WEB_SKILLS_DIR；
  *                          默认指到旁边那个技能仓的 skills/）
+ *   PROTFORGE_WEB_DATA_ROOT 平台数据根。长期记忆与工具问题文件都在它下面。
  *   MINIMAX_API_KEY / MINIMAX_API_HOST   联网检索能力；缺失时降级但仍能跑
  *   PROTORGE_AGENT_DIR     pi 的模型配置目录，由调度器在任务工作目录里物化。
  *                          不设就退回 getAgentDir()（用户全局），而本机那份是
  *                          空的 {}——症状是「agent 一直不吭声」而不是报错。
  *   PROTORGE_LLM_PROVIDER / PROTORGE_LLM_MODEL   显式指定模型。不指定就由 pi 自己
  *                          挑「第一个可用模型」，空配置下等于没有模型。
+ *
+ * 复核模式（PROTFORGE_WEB_REVIEW_MODE=1）：
+ *   整理长期记忆的**常规计算进程**。它不是管理员，也不属于任何任务：
+ *   没有 agent 令牌、没有任务号，因此碰不到平台的任何管理能力
+ *   （管理端点、改技能仓库、删任务）。它能做的就是文件工具、命令和联网检索。
+ *   需求写在 PROTFORGE_WEB_REVIEW_BRIEF_PATH 指的那个文件里，跑完一轮就退出。
  */
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -67,13 +74,44 @@ function required(name) {
   return v;
 }
 
-const INTERNAL = required('PROTFORGE_WEB_INTERNAL');
-const TASK_ID = required('PROTFORGE_TASK_ID');
-const TOKEN = required('PROTFORGE_AGENT_TOKEN');
+/**
+ * 复核模式：整理长期记忆的**常规计算进程**。
+ *
+ * 它不是管理员，也不属于任何任务：没有 agent 令牌、没有任务号，
+ * 因此碰不到平台的任何管理能力（管理端点、改技能仓库、删任务）。
+ * 它能做的就是文件工具 + 命令 + 联网检索。
+ */
+const REVIEW_MODE = process.env.PROTFORGE_WEB_REVIEW_MODE === '1';
+
+const INTERNAL = REVIEW_MODE
+  ? (process.env.PROTFORGE_WEB_INTERNAL || '')
+  : required('PROTFORGE_WEB_INTERNAL');
+const TASK_ID = REVIEW_MODE
+  ? (process.env.PROTFORGE_TASK_ID || 'review')
+  : required('PROTFORGE_TASK_ID');
+const TOKEN = REVIEW_MODE
+  ? (process.env.PROTFORGE_AGENT_TOKEN || '')
+  : required('PROTFORGE_AGENT_TOKEN');
 const WORK_DIR = path.resolve(required('PROTFORGE_WORK_DIR'));
 const SKILLS_DIR = process.env.PROTFORGE_SKILLS_DIR
   || process.env.PROTFORGE_WEB_SKILLS_DIR
   || DEFAULT_SKILLS_DIR;
+
+/**
+ * 平台数据根。**从环境变量推出来，不写死本机路径**：
+ * 服务端 spawn 时注入 PROTFORGE_WEB_DATA_ROOT；没注入就退回仓库旁边的
+ * data/（与 server/db.py 的默认值一致）。
+ */
+const DATA_ROOT = path.resolve(
+  process.env.PROTFORGE_WEB_DATA_ROOT
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'data'));
+
+/** 长期记忆：可复用做法的落点。经验的第一手写入对象就是干活的那个进程。 */
+const LONG_TERM_FILE = path.join(DATA_ROOT, 'memory', 'long-term.md');
+/** 工具问题：按日期攒文件，等用户每周统一修。 */
+const TOOL_ISSUES_DIR = path.join(DATA_ROOT, 'tool-issues');
+/** 这两个目录是平台自己的地盘，明确列进守卫的允许根，写工具才合法。 */
+const MEMORY_ROOTS = [path.join(DATA_ROOT, 'memory'), TOOL_ISSUES_DIR];
 
 // ---------------------------------------------------------------- 日志
 
@@ -112,8 +150,56 @@ const PLATFORM_RULES = `
   没跑完就调 finish 会让后端直接去打包一堆半成品。
 - **工作流任务（第 N 行）的产物落点**：这类任务的产物同样必须落在工作目录，也就是你启动时所在的那个目录。确实需要写共享目录时，文件名**必须**以 t{你的任务号}_ 开头（例如 t17_hit.csv）。
   - 落在共享目录根部又没带这个前缀的文件会被判成「归属不明」：产物发现只能靠时间窗兜底命中它，而时间窗命中的产物**未经确认、打包时会被拒**——这一行于是算成 failed，而表里**只有一个 failed、没有任何原因**。
-  - 工作流是「一行失败不阻断整批」地往下跑的，所以这不是一行的问题：批量场景下它会一行接一行地全失败。写进工作目录就没有这个放大效应。`;
+  - 工作流是「一行失败不阻断整批」地往下跑的，所以这不是一行的问题：批量场景下它会一行接一行地全失败。写进工作目录就没有这个放大效应。
+
+## 收工前：把可复用的东西沉淀下来
+
+- **长期记忆**（别的任务能照抄的做法）：${LONG_TERM_FILE}
+  - 这次任务如果做对了什么**有复用价值**的事（参数怎么给、哪个口径要先定标、
+    某个坑在哪儿、某条命令要加什么参数才不出错），**收工前**用 \`write\` / \`edit\`
+    工具直接写进这个文件。**不要等谁来批准**——你就是那个第一手写入者。
+  - 一条一行，格式固定：
+    \`- [技能 技能名] 具体做法，别的任务能照抄。（来源：任务 #N；时效性：稳定）\`
+  - \`[技能 技能名]\`：填实际用到的 protforge-* 技能名；跨技能的做法写「通用」。
+  - \`来源\`：写清来自哪个任务、哪次计算。
+  - \`时效性\`：做法本身不会随时间变就写 \`稳定\`；**依赖当下的环境、版本、路径、
+    外部服务**（过一阵可能就不成立了）就写 \`可能有时效性\`。写了这句的，
+    平台每天会安排一次复核去查证它现在还成不成立。
+  - **要具体到别的任务能照抄**：写清楚参数、命令、判据。不要写套话
+    （「要注意环境配置」这种话对下一个任务一点用都没有）。
+  - **不要写只跟这一次有关的东西**：这次的输入文件名、这次的中间结果、
+    只有这一次成立的数字。写它们等于把长期记忆变成日志。
+  - **追加，不要覆盖**：\`write\` 会把整个文件冲掉，而 \`edit\` 是「把某一段替换成
+    另一段」。正确姿势：先 \`read\` 一遍拿到最后一行，再用 \`edit\` 把最后一行替换成
+    「最后一行 + 换行 + 你要追加的那一条」。文件还不存在时才用 \`write\` 写整份。
+- **工具问题**（工具本身不够用）：写进 ${TOOL_ISSUES_DIR} 下的 \`<YYYY-MM-DD>.md\`，
+  文件名用**当天日期**。什么时候写：发现某个工具缺了个参数、某一步只能靠猜、
+  某个工具的输出会让人误解成别的意思。
+  - 同样一条一行：\`- [技能 技能名] 哪个工具缺了什么 / 会导致什么后果。\`
+  - **只写问题，不要自己去改技能仓库**：这些条目由用户每周统一修一遍。
+  - 同一天可能撞见好几个问题，**追加**到当天那个文件里（做法同上：
+    先 \`read\` 再 \`edit\` 追加，别用 \`write\` 覆盖）。
+- 这两件事都在**收工前**做（在 \`finish\` 之前）。没有值得沉淀的就什么都不写——
+  宁可不写，也不要写一条没用的。`;
 console.log = console.error; // stdout 归 RPC 独占
+
+/**
+ * 复核模式的系统规则。**只讲边界，不讲任务**——
+ * 具体要做什么写在 brief 里（服务端生成，见 server/memory.py 的
+ * ``build_review_brief``）。边界必须在这里说死：这个进程是常规权限，
+ * 它碰到的每一条「顺手把技能仓库改了」的冲动都要被挡住。
+ */
+const REVIEW_RULES = `
+
+## 你的身份与边界
+
+- 你是「自动化计算平台」的**长期记忆复核进程**，权限是**常规权限**：
+  你没有管理员令牌，碰不到管理端点，不许改技能仓库、不许删任务、不许提交 git。
+- 你要做的**只有一件事**：按 brief 里写的要求整理长期记忆。
+- 你可以用 read / write / edit / bash 这些工具，也可以联网检索。
+- **不要往长期记忆里新增经验**：经验的第一手来源是干活的计算进程，不是你。
+  你的活是整理（查证、删掉失效的、改写过时的），不是积累。
+- 整理完按 brief 里说的写复核记录，然后结束。`;
 
 // ---------------------------------------------------------------- 组装
 
@@ -131,13 +217,31 @@ async function main() {
   }
   for (const d of diagnostics || []) log(`技能诊断：${d.type} ${d.message}`);
 
-  const reporter = createReporter({ internal: INTERNAL, taskId: TASK_ID, token: TOKEN });
-  reporter.startHeartbeat();
-  await reporter.step('计算进程已启动，正在准备环境');
+  // 复核模式没有任务、没有令牌，也就**没有回传对象**：
+  // report_step / finish 往哪儿报？无处可报。所以这条路上用一个什么都不做的
+  // 回传器占位——守卫的审计接线保持同一套形状（那段接线有测试钉着，
+  // 改成两行三元表达式就会让它认不出来）。
+  const reporter = REVIEW_MODE
+    ? {
+        step: async () => ({ ok: false, error: '复核模式没有回传对象' }),
+        finish: async () => ({ ok: false, error: '复核模式没有回传对象' }),
+        audit: async () => ({ ok: false, error: '复核模式没有回传对象' }),
+        startHeartbeat: () => {},
+      }
+    : createReporter({ internal: INTERNAL, taskId: TASK_ID, token: TOKEN });
+  if (!REVIEW_MODE) {
+    reporter.startHeartbeat();
+    await reporter.step('计算进程已启动，正在准备环境');
+  }
 
   // ---- 命令守卫 ----
   const guardOpts = {
     workDir: WORK_DIR,
+    // **长期记忆与工具问题目录**：计算进程要把可复用的做法写进长期记忆、
+    // 把工具问题写进当天的日期文件。这两个目录是平台自己的地盘，
+    // 明确列进允许根，写工具才合法（守卫默认只放行工作目录、
+    // ProtForge 数据区与几个固定路径，而平台数据根不在其中）。
+    fileRoots: MEMORY_ROOTS,
     // 每条命令（含被守卫拦下的）都上报审计，落 audit_log。
     // 这是规格 §14「所有 bash 调用全量记入审计日志」在 agent 侧的一半；
     // 另一半是 server/app.py 的 POST /api/internal/agent/{id}/audit。
@@ -163,7 +267,10 @@ async function main() {
   });
   // createCodingTools 只产出 read/bash/edit/write，PowerShell 要单独挂一个。
   codingTools.push(createPowerShellTool(WORK_DIR, { operations: guard.powershell }));
-  const customTools = [...codingTools, ...createReporterTools(reporter)];
+  // 复核模式没有任务，也就没有 report_step / finish 可报。
+  const customTools = REVIEW_MODE
+    ? [...codingTools]
+    : [...codingTools, ...createReporterTools(reporter)];
 
   /**
    * 关键接线：会话只接受工具**名字**（tools: string[]），不接受工具**实例**。
@@ -270,6 +377,29 @@ async function main() {
     const m = runtime.session?.model;
     if (m) log(`当前模型：${m.provider ?? '?'}/${m.id ?? '?'}（api=${m.api ?? '?'}）`);
   } catch { /* 拿不到就跳过：诊断信息不该反过来把 agent 弄挂 */ }
+
+  // ---- 复核模式：跑一轮就退出 ----
+  //
+  // 复核不是任务：没有任务号、没有令牌、没有回传对象，也没有人在等一个
+  // 「完成」信号。它就是「把 brief 交给模型跑一轮，跑完把结果写进文件」。
+  if (REVIEW_MODE) {
+    const briefPath = process.env.PROTFORGE_WEB_REVIEW_BRIEF_PATH || '';
+    let brief = '';
+    try {
+      brief = briefPath ? readFileSync(briefPath, 'utf-8') : '';
+    } catch (e) {
+      log(`读不到复核提示词 ${briefPath}：${e?.message ?? e}`);
+    }
+    if (!brief.trim()) {
+      log('复核提示词是空的，没什么可整理，退出');
+      process.exit(2);
+    }
+    log(`进入复核模式，提示词 ${briefPath}，工作目录 ${WORK_DIR}`);
+    await runtime.session.prompt(brief);
+    log('复核跑完一轮，退出');
+    return;
+  }
+
   log(`进入 RPC 模式，任务 ${TASK_ID}，工作目录 ${WORK_DIR}`);
 
   await runRpcMode(runtime);
@@ -293,7 +423,7 @@ function platformRulesExtension() {
   return (pi) => {
     pi.on('before_agent_start', async (event) => {
       const base = event?.systemPrompt ?? '';
-      return { systemPrompt: `${base}${PLATFORM_RULES}` };
+      return { systemPrompt: `${base}${REVIEW_MODE ? REVIEW_RULES : PLATFORM_RULES}` };
     });
   };
 }

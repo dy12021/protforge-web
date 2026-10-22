@@ -4,10 +4,18 @@
 桩：要验的是顺序、幂等与边界，不是模型答得好不好。真正调模型的路径一旦进了
 测试套件，全量就会在离线机器上红，而且红的原因与被测代码无关。
 
+**这里测的现在只剩两件事**：
+
+1. **复盘留档**：任务进终态 → 生成一份正文文件 + 一行库记录。
+   它不再喂给任何自动流程——注入提示词的是长期记忆（``server/memory.py``）。
+2. **旧接口废得干净**：分类、落地、修改方案那几组函数保留着签名，
+   但它们**什么都不做**：不写文件、不调模型、不碰技能仓库、不提交 git，
+   而且**不抛异常**（管理端还有路由挂着它们）。
+
 **技能目录必须隔离。** ``conftest.py`` 只把数据库指向 tmp_path，没有动
-``PROTFORGE_WEB_SKILLS_DIR``——而落地经验与应用方案都写那个目录。用默认值的话，
-跑一次测试就在真实的 ``<技能仓>`` 里留下 ``references/lessons.md``，
-技能文件也可能被改掉。所以下面 ``_skills`` 夹具先建一个临时技能仓库再指过去。
+``PROTFORGE_WEB_SKILLS_DIR``——用默认值的话，跑一次测试就在真实的
+``<技能仓>`` 里留下 ``references/lessons.md``，技能文件也可能被改掉。
+所以下面 ``_skills`` 夹具先建一个临时技能仓库再指过去。
 
 规则本身是断言，行为本身是事实。改 ``server/reflection.py`` 请连这个文件一起读。
 """
@@ -27,6 +35,7 @@ if str(ADMIN_DIR) not in sys.path:
 import auth        # noqa: E402
 import db          # noqa: E402
 import llm         # noqa: E402
+import memory      # noqa: E402
 import reflection  # noqa: E402
 import store       # noqa: E402
 
@@ -44,15 +53,21 @@ GOOD_REPLY = """\
 ## 卡住的地方
 - 中途换过两次参数口径
 
-## 经验
-- [技能 protforge-demo] 先跑一条野生型对照定标，再批量跑，口径才可比
-- [技能 通用] 批量跑之前先把参数口径写下来
-
 ## 工具意见
 - [技能 protforge-demo] 没有只改指定位点的开关，只能整链重跑
+"""
 
-## 建议分类
-lesson
+#: 旧流程留下的那种正文：**带「经验」一节**。
+#: 落地那条路（虽然已经废了）是从正文里读经验条目的，所以还留着它。
+LESSON_REPLY = """\
+## 这次实际做了什么
+x
+
+## 经验
+- [技能 protforge-demo] 先跑一条野生型对照定标，再批量跑
+
+## 工具意见
+无
 """
 
 
@@ -167,12 +182,13 @@ def test_generate_writes_a_standalone_file_and_keeps_the_raw_reply(
     rec = reflection.generate(tid)
 
     assert rec["status"] == "draft"
-    assert rec["suggested"] == "lesson"
+    # **不再有「建议分类」**：那份复盘只是存档，没有人再按它二选一。
+    assert rec["suggested"] == "", "复盘记录里还带着一个分类决定"
     p = Path(rec["path"])
     assert p.is_file(), "反思正文没落成文件"
     assert p.parent == reflection.reflections_dir()
     body = p.read_text(encoding="utf-8")
-    assert "先跑一条野生型对照定标" in body
+    assert "先跑野生型对照定标" in body
     assert "## 模型原始输出" in body and "模型说的一段话" in body
 
 
@@ -332,11 +348,12 @@ def test_parser_normalizes_an_unknown_verdict_to_empty():
 # --- 分类 ---------------------------------------------------------------------
 
 
-def test_classification_is_a_separate_step_from_landing(users, fake_llm, skills):
-    """分类只推状态，**不落地任何东西**。
+def test_classification_no_longer_lands_anything(users, fake_llm, skills):
+    """分类**不再落地任何东西**——它连「二选一」这道关口都不是了。
 
-    合成一步的话，管理员「看着像就点」会把未经细看的内容写进记忆，
-    而那份记忆会喂给后面每一个任务。中间必须有一次停顿。
+    以前分类只推状态（不写文件），落地是另一步。现在两步都没了：
+    经验由干活的计算进程自己写进长期记忆，工具问题写进当天的日期文件。
+    所以分类这一步既不该写长期记忆，也不该写工具问题文件。
     """
     owner, admin = users
     tid = _finished_task(owner["id"])
@@ -346,8 +363,10 @@ def test_classification_is_a_separate_step_from_landing(users, fake_llm, skills)
 
     assert out["status"] == "reviewed"
     assert out["kind"] == "lesson"
-    assert not reflection.lessons_path().exists(), \
-        "分类这一步就把经验写出去了——落地和分类被合成了一步"
+    assert not memory.long_term_path().exists(), \
+        "分类这一步就把经验写出去了：经验的第一手写入者该是计算进程"
+    assert not memory.tool_issues_dir().exists(), \
+        "分类这一步把工具问题写进日期文件了"
 
 
 def test_an_applied_reflection_cannot_be_reclassified(users, fake_llm, skills):
@@ -355,6 +374,7 @@ def test_an_applied_reflection_cannot_be_reclassified(users, fake_llm, skills):
     而没人去撤掉那一条。"""
     owner, admin = users
     tid = _finished_task(owner["id"])
+    fake_llm["text"] = LESSON_REPLY
     rec = reflection.generate(tid)
     rec = store.classify_reflection(rec["id"], "lesson", SKILL, admin["username"])
     import app_admin
@@ -378,29 +398,29 @@ def test_reject_is_available_before_landing(users, fake_llm, skills):
 # --- 落地 ---------------------------------------------------------------------
 
 
-def test_landing_a_lesson_writes_both_the_global_file_and_the_skill(
-        users, fake_llm, skills):
-    """两层都要写：全局经验文件是**每任务都注入**的那一层，
-    技能的 references 是「知识待在离工具最近的地方」的那一层。"""
+def test_landing_a_lesson_writes_nothing_any_more(users, fake_llm, skills):
+    """落地这条路**整个废了**：既不写长期记忆，也不写技能的 references。
+
+    经验的第一手写入者现在是干活的计算进程（它收工前用 write/edit 工具
+    直接写）。这条旧接口还挂在管理端的路由上，所以它必须是**安全的空操作**：
+    不抛异常（否则那些路由 500），但一个字都不写。
+    """
     owner, admin = users
     import app_admin
     tid = _finished_task(owner["id"])
+    fake_llm["text"] = LESSON_REPLY
     rec = reflection.generate(tid)
     rec = store.classify_reflection(rec["id"], "lesson", SKILL, admin["username"])
 
     out = app_admin._land_lesson(rec, admin["username"])
 
-    assert out["landed"] == 2, out
-    assert out["landed_into_skill"] == 1, \
-        "「通用」那条不该算进技能，只有 protforge-demo 那条算"
-    global_text = reflection.lessons_path().read_text(encoding="utf-8")
-    assert "先跑一条野生型对照定标" in global_text
-    assert "把参数口径写下来" in global_text
-    # 带来源：将来有人觉得某条不对，能顺着找到当时的复盘
-    assert f"任务 #{tid}" in global_text
+    assert not memory.long_term_path().exists(), \
+        "落地把经验写进长期记忆了：这条路的权限被留下来了"
     skill_ref = skills / "skills" / SKILL / "references" / "lessons.md"
-    assert skill_ref.is_file(), "没有沉淀进技能的 references"
-    assert "先跑一条野生型对照定标" in skill_ref.read_text(encoding="utf-8")
+    assert not skill_ref.exists(), "落地还往技能目录里写东西"
+    assert not reflection.lessons_path().exists(), "落地还在写旧的经验文件"
+    # **空操作也要给个说法**：返回体里得有「这条已经不落地了」的痕迹。
+    assert out.get("landed") is not None
 
 
 def test_landing_refuses_when_the_review_has_no_lessons(users, fake_llm, skills):
@@ -412,7 +432,7 @@ def test_landing_refuses_when_the_review_has_no_lessons(users, fake_llm, skills)
     import app_admin
     tid = _finished_task(owner["id"])
     fake_llm["text"] = (
-        "## 这次实际做了什么\nx\n\n## 经验\n无\n\n## 建议分类\nlesson")
+        "## 这次实际做了什么\nx\n\n## 工具意见\n无")
     rec = reflection.generate(tid)
     rec = store.classify_reflection(rec["id"], "lesson", SKILL, admin["username"])
 
@@ -428,11 +448,11 @@ def test_the_lessons_block_is_capped_and_empty_when_there_are_none(skills):
     """
     assert reflection.lessons_block() == ""
     for i in range(40):
-        reflection.append_lesson("", f"第 {i} 条经验，内容要足够长才能被上限砍掉" * 6,
-                                  task_id=i, decided_by="admin")
+        memory.append_memory(f"第 {i} 条经验，内容要足够长才能被上限砍掉" * 6,
+                             skill=SKILL, source=f"任务 #{i}")
     block = reflection.lessons_block()
     assert block.strip()
-    assert len(block) <= reflection.LESSONS_BLOCK_MAX
+    assert len(block) <= memory.MEMORY_BLOCK_MAX
 
 
 def test_the_lessons_block_only_carries_the_most_recent_entries(skills):
@@ -441,11 +461,11 @@ def test_the_lessons_block_only_carries_the_most_recent_entries(skills):
     一份塞满几百条旧经验的提示词会把真正的需求挤出注意力，
     而那条路是从**所有**任务身上收的税。
     """
-    for i in range(reflection.LESSONS_BLOCK_ITEMS + 6):
-        reflection.append_lesson("", f"经验-{i}", task_id=i, decided_by="admin")
+    for i in range(memory.MEMORY_BLOCK_ITEMS + 6):
+        memory.append_memory(f"经验-{i}", source=f"任务 #{i}")
     block = reflection.lessons_block()
     assert "经验-0" not in block
-    assert f"经验-{reflection.LESSONS_BLOCK_ITEMS + 5}" in block
+    assert f"经验-{memory.MEMORY_BLOCK_ITEMS + 5}" in block
 
 
 def test_dispatcher_injects_the_lessons_before_the_brief(skills):
@@ -465,21 +485,27 @@ def test_dispatcher_injects_the_lessons_before_the_brief(skills):
         "没有经验时也会拼一个空壳，那会让模型以为本来就没什么经验"
 
 
-# --- 工具意见 → 修改方案 ------------------------------------------------------
+# --- 工具意见 → 当日日期文件 --------------------------------------------------
+#
+# 以前这里是「工具意见 → 生成修改方案 → 看 diff → 应用 + git 提交」。
+# 现在这条路**整个没了**：工具问题只按日期攒进
+# ``<数据根>/tool-issues/<YYYY-MM-DD>.md``，由用户每周用 minimax code 统一修。
+# 平台不生成 diff、不自动改技能仓库、不提交 git。
 
 
-def test_a_tool_gap_cannot_be_landed_in_one_step(users, fake_llm, skills):
-    """工具意见的落地是**改代码 + git 提交**，必须走 propose/apply 两步，
-    中间有一双眼睛看过 diff。一步落地等于系统自己改自己。"""
+def test_a_tool_gap_is_not_landed_anywhere(users, fake_llm, skills):
+    """工具意见**不再落地**：既不写进经验，也不改技能文件。"""
     owner, admin = users
     tid = _finished_task(owner["id"], status="failed")
-    fake_llm["text"] = GOOD_REPLY.replace("建议分类\nlesson", "建议分类\ntool_gap")
     rec = reflection.generate(tid)
-    assert rec["suggested"] == "tool_gap"
     store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
 
-    with pytest.raises(store.Invalid):
-        reflection.apply_proposal(rec["id"])          # 还没生成方案
+    out = reflection.apply_proposal(rec["id"])
+
+    assert out["ok"] is False and out["deprecated"] is True
+    assert not memory.long_term_path().exists(), "工具意见被写进长期记忆了"
+    assert not memory.tool_issues_dir().exists(), \
+        "复盘这条路不该写工具问题文件：那是干活的计算进程自己写的"
     import app_admin
     fresh = store.get_reflection(rec["id"])
     with pytest.raises(store.Invalid):
@@ -490,108 +516,107 @@ def test_a_tool_gap_cannot_be_landed_in_one_step(users, fake_llm, skills):
     "../outside.md", "/etc/passwd", "C:/Windows/x.md", "notskills/x.md",
     "skills/../../escape.md", "",
 ])
-def test_proposal_targets_cannot_escape_the_plugin_repo(users, fake_llm, skills,
-                                                        target):
-    """这是唯一一处会写进别人仓库的代码，路径一旦能逃出去就等于任意写。"""
-    owner, admin = users
-    tid = _finished_task(owner["id"], status="failed")
-    fake_llm["text"] = GOOD_REPLY.replace("建议分类\nlesson", "建议分类\ntool_gap")
-    rec = reflection.generate(tid)
-    store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
+def test_no_proposal_target_can_reach_the_plugin_repo(users, fake_llm, skills,
+                                                     target):
+    """**没有方案可生成**：不管传什么路径，都不碰技能仓库。
 
-    with pytest.raises(store.Invalid):
-        reflection.build_proposal(rec["id"], target)
-
-
-def test_the_diff_is_computed_by_us_not_written_by_the_model(
-        users, fake_llm, skills):
-    """模型只产出**完整新内容**，diff 由 difflib 算。
-
-    让模型自己写 unified diff，它几乎总会漏 hunk 头或对错行号，而那种 diff
-    打补丁时的表现是「部分应用、剩下几块静默不动」。
+    以前这里是一处会写进别人仓库的代码，路径一旦能逃出去就等于任意写。
+    现在这条路整个没了，所以传什么都是同一个结果：什么都不做。
     """
     owner, admin = users
     tid = _finished_task(owner["id"], status="failed")
-    fake_llm["text"] = GOOD_REPLY.replace("建议分类\nlesson", "建议分类\ntool_gap")
     rec = reflection.generate(tid)
     store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
 
-    target = skills / "skills" / SKILL / "SKILL.md"
-    before = target.read_text(encoding="utf-8")
-    fake_llm["text"] = before.replace("跑一下。", "跑之前先做野生型对照定标。")
-    out = reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")
+    before = (skills / "skills" / SKILL / "SKILL.md").read_text(encoding="utf-8")
+    out = reflection.build_proposal(rec["id"], target)
 
-    assert out["diff"].startswith("--- a/")
-    assert "@@" in out["diff"]
-    assert "野生型对照定标" in out["diff"]
-    # difflib 的删除/新增行是「-内容」「+内容」，**不带** git diff 那种前导空格
-    assert "-跑一下。" in out["diff"], out["diff"]
-    assert "+跑之前先做野生型对照定标。" in out["diff"], out["diff"]
-    assert target.read_text(encoding="utf-8") == before, \
-        "生成方案这一步就把技能文件改了——它只该产出方案，不该动文件"
-    assert store.get_reflection(rec["id"])["proposal_state"] == "ready"
+    assert out["ok"] is False and out["deprecated"] is True
+    assert (skills / "skills" / SKILL / "SKILL.md").read_text(
+        encoding="utf-8") == before, "生成方案这一步动了技能文件"
+    assert not reflection.proposals_dir().exists() or \
+        not list(reflection.proposals_dir().glob("*.patch")), \
+        "生成方案这一步写了方案文件"
 
 
-def test_a_proposal_that_changes_nothing_is_not_a_proposal(
+def test_generating_a_proposal_does_not_call_the_model(users, fake_llm, skills):
+    """生成方案**不调模型**：这条路上一次模型调用都不该发生。
+
+    以前这里要改预算、改思考档，就为了让它吐出一份完整的技能文件。
+    现在工具问题只是「攒起来等用户统一修」，没什么要模型生成的。
+    """
+    owner, admin = users
+    tid = _finished_task(owner["id"], status="failed")
+    rec = reflection.generate(tid)
+    store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
+    calls_after_generate = fake_llm["calls"]
+
+    reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")
+
+    assert fake_llm["calls"] == calls_after_generate, "生成方案还在调模型"
+
+
+def test_a_failed_proposal_says_where_the_problems_go_now(users, fake_llm, skills):
+    """失败原因要**说清新的去处**：去当天的工具问题文件。
+
+    管理端那个按钮还在（删端点是主线的事），点下去要看到一条说得清原因的话，
+    而不是「转一圈什么也没发生」。
+    """
+    owner, admin = users
+    tid = _finished_task(owner["id"], status="failed")
+    rec = reflection.generate(tid)
+    store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
+
+    reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")
+
+    got = store.get_reflection(rec["id"])
+    assert got["proposal_state"] == "failed", got
+    assert "工具问题" in got["proposal_error"], got
+    assert str(memory.tool_issues_dir()) in got["proposal_error"], got
+
+
+def test_applying_a_proposal_writes_nothing_and_commits_nothing(
         users, fake_llm, skills):
-    """模型说不用改时如实失败，让管理员去否决，而不是记一笔"已生成方案"。"""
+    """应用是**安全的空操作**：不改技能文件、不提交 git。
+
+    平台不碰别人的仓库——这条边界现在由「什么都不做」来保证。
+    """
     owner, admin = users
     tid = _finished_task(owner["id"], status="failed")
-    fake_llm["text"] = GOOD_REPLY.replace("建议分类\nlesson", "建议分类\ntool_gap")
-    rec = reflection.generate(tid)
-    store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
-
-    same = (skills / "skills" / SKILL / "SKILL.md").read_text(encoding="utf-8")
-    fake_llm["text"] = "```\n" + same + "\n```"
-    with pytest.raises(reflection.ReflectionError):
-        reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")
-    assert store.get_reflection(rec["id"])["proposal_state"] == "failed"
-
-
-def test_applying_writes_the_file_and_commits(users, fake_llm, skills):
-    owner, admin = users
-    tid = _finished_task(owner["id"], status="failed")
-    fake_llm["text"] = GOOD_REPLY.replace("建议分类\nlesson", "建议分类\ntool_gap")
     rec = reflection.generate(tid)
     store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
     before = (skills / "skills" / SKILL / "SKILL.md").read_text(encoding="utf-8")
-    fake_llm["text"] = before.replace("跑一下。", "跑之前先做野生型对照定标。")
-    reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")
+    commits_before = _git_log(skills)
 
     out = reflection.apply_proposal(rec["id"])
 
-    assert out["status"] == "applied"
-    assert out["applied_at"]
-    assert "野生型对照定标" in (skills / "skills" / SKILL / "SKILL.md").read_text(
-        encoding="utf-8")
-    log = _git_log(skills)
-    assert f"反思 #{rec['id']}" in log, f"改了技能文件却没有提交：{log}"
+    assert out["ok"] is False and out["deprecated"] is True
+    assert (skills / "skills" / SKILL / "SKILL.md").read_text(
+        encoding="utf-8") == before, "应用方案这一步改了技能文件"
+    assert _git_log(skills) == commits_before, "应用方案竟然提交了 git"
+    assert store.get_reflection(rec["id"])["status"] != "applied"
 
 
-def test_a_stale_proposal_is_refused_instead_of_clobbering_newer_changes(
+def test_the_retired_landing_and_proposal_helpers_are_safe_no_ops(
         users, fake_llm, skills):
-    """方案是基于某一版原文生成的，看 diff 到点确认之间文件可能被人改过。
+    """旧接口被调用时**不抛异常**：管理端还有路由挂在它们上面。
 
-    不比对哈希就写，等于拿旧方案覆盖掉别人的新改动，而 git 里看不出来是谁干的。
+    抛异常会让那些路由 500；留一个什么都不做的空壳，旧路由最多是
+    「什么都没发生」，不会把整条链路带崩。
     """
     owner, admin = users
     tid = _finished_task(owner["id"], status="failed")
-    fake_llm["text"] = GOOD_REPLY.replace("建议分类\nlesson", "建议分类\ntool_gap")
     rec = reflection.generate(tid)
     store.classify_reflection(rec["id"], "tool_gap", SKILL, admin["username"])
-    before = (skills / "skills" / SKILL / "SKILL.md").read_text(encoding="utf-8")
-    fake_llm["text"] = before.replace("跑一下。", "跑之前先做野生型对照定标。")
-    reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")
 
-    # 有人在管理员看 diff 的同时改了同一个文件
-    target = skills / "skills" / SKILL / "SKILL.md"
-    target.write_text(before + "\n别人新加的一行。\n", encoding="utf-8")
+    assert reflection.append_lesson(SKILL, "一条经验", tid, admin["username"]) == ""
+    assert reflection.append_skill_lesson(SKILL, "一条经验", tid) == ""
+    assert reflection.build_proposal(rec["id"], f"skills/{SKILL}/SKILL.md")["ok"] is False
+    assert reflection.apply_proposal(rec["id"])["ok"] is False
 
-    with pytest.raises(store.Invalid):
-        reflection.apply_proposal(rec["id"])
-    assert "别人新加的一行" in target.read_text(encoding="utf-8"), \
-        "方案过期时竟然还是写下去了"
-    assert store.get_reflection(rec["id"])["status"] != "applied"
+    assert not memory.long_term_path().exists(), "旧接口还在写长期记忆"
+    assert not (skills / "skills" / SKILL / "references").exists(), \
+        "旧接口还在往技能目录里写"
 
 
 def test_an_unknown_skill_name_does_not_create_a_stray_directory(skills):
