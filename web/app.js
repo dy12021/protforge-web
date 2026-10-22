@@ -1306,10 +1306,17 @@ function paintWorkflowCard(card, w) {
   const total = Number(w.total_rows) || 0;
   const done = Number(w.cursor) || 0;
 
-  card.querySelector(".wfc-chip").className = "wfc-chip";
+  /* **这里必须留着 "wfc-chip" 这个类**：它是下面 querySelector(".wfc-chip")
+   * 的选择器。原先这里写的是 chip.className = "chip " + ...，把 wfc-chip
+   * 整个换掉了——于是**第二次**重绘（轮询十分钟一次的那种）时
+   * querySelector 返回 null，这行直接抛 TypeError，整个工作流区跟着
+   * 渲染中断：统计、进度条、按钮状态全停在第一次的样子，展开也点不动。
+   * 真机抓到过：控制台里一条 "Uncaught (in promise)"，每轮重绘报一次。 */
   const chip = card.querySelector(".wfc-chip");
-  chip.className = "chip " + (WF_CHIP[w.status] || "chip-none");
-  chip.textContent = WF_STATUS_LABEL[w.status] || w.status;
+  if (chip) {
+    chip.className = "wfc-chip chip " + (WF_CHIP[w.status] || "chip-none");
+    chip.textContent = WF_STATUS_LABEL[w.status] || w.status;
+  }
 
   card.querySelector(".wfc-id").textContent = "#" + id;
   card.querySelector(".wfc-count").textContent = done + " / " + total + " 行";

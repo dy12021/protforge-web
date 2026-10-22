@@ -1067,3 +1067,28 @@ def test_rendered_prompt_uses_the_same_container_as_the_summary():
                 f"{sel} 缺{what}：这两块是同一件事的两个半边，"
                 "长得不一样就像漏了容器"
             )
+
+def test_the_workflow_chip_keeps_the_class_its_selector_uses():
+    """工作流卡片的状态标签必须**留着 wfc-chip 这个类**。
+
+    它是 paintWorkflowCard 里 querySelector(".wfc-chip") 的选择器。
+    原先那里写的是 chip.className = "chip " + ...，把 wfc-chip 整个换掉
+    了——于是**第二次**重绘（轮询十分钟一次的那种）时 querySelector 返回
+    null，那一行直接抛 TypeError，整个工作流区跟着渲染中断：统计、进度条、
+    按钮状态全停在第一次的样子，**展开也点不动**。
+
+    2026-10-22 真机抓到：控制台里每轮一条 Uncaught (in promise)，
+    堆栈落在 paintWorkflowCard。这条围栏钉住它。
+    """
+    js = _js("app.js")
+    # 行首匹配：**注释里也会出现 chip.className**（那正是讲这个坑的地方），
+    # 不加 ^\s* 就会匹配到注释里那句，围栏自己先红了。
+    m = re.search(r'^\s*chip\.className\s*=\s*"([^"]*)"', js, re.M)
+    assert m, "app.js 里找不到 chip.className 的赋值"
+    assert "wfc-chip" in m.group(1), (
+        "chip 的 className 把 wfc-chip 换掉了：%r —— 它正是 querySelector 的选择器，"
+        "换掉之后第二次重绘就会抛 TypeError，工作流区就废了" % m.group(1))
+
+    # 选择器拿到 null 时也要有保护，不能直接解引用
+    assert re.search(r'const chip = card\.querySelector\("\.wfc-chip"\);\s*\n\s*if \(chip\)', js), (
+        "取 chip 之后没有 null 保护——元素不在时这一行会抛，整个工作流区跟着中断")
