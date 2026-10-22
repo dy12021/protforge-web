@@ -1648,6 +1648,10 @@ function setComposerMode(mode) {
   document.querySelectorAll("#mode-switch .seg-btn").forEach(b =>
     b.classList.toggle("is-on", b.dataset.mode === mode));
   const isTask = mode === "task";
+  /* 工作流那一侧要塞一张表（列的用途 + 提示词模板），32rem 宽根本转不开——
+   * 列名下拉框被挤成两列，看着就还是「毛坯」。给它宽一点。 */
+  const dlg = document.getElementById("composer");
+  if (dlg) dlg.classList.toggle("is-wide", !isTask);
   document.getElementById("c-task-fields").hidden = !isTask;
   document.getElementById("c-wf-fields").hidden = isTask;
   document.getElementById("c-title-h").textContent =
@@ -1711,7 +1715,24 @@ async function openComposerForWorkflow(id) {
 }
 
 /* 列的角色：每一列一个下拉（忽略 / 标识列 / 输入列 / 上下文 / 结果列），
- * 选了输入列或上下文再给一个变量名，结果列给一个结果字段。 */
+ * 选了输入列或上下文再给一个变量名，结果列给一个结果字段。
+ *
+ * **按角色分组摆**：三组各有各的目的，平铺在一起时用户得逐行读下拉框
+ * 才知道这一列要干什么——那正是「毛坯」的样子。
+ *   不参与提示词：ignore / key
+ *   写进提示词　：input / context（还要一个变量名）
+ *   写回结果表　：output（还要一个结果字段）
+ * 每一行用**同一套三列网格**（列名 / 角色 / 附加字段），于是所有行天然对齐。
+ */
+const WF_COL_GROUPS = [
+  { key: "plain", roles: ["ignore", "key"], title: "不参与提示词",
+    hint: "这些列只是给人看的，运行时不会写进任务描述。" },
+  { key: "prompt", roles: ["input", "context"], title: "写进提示词",
+    hint: "这些列的内容会进到每一行的任务描述里，变量名要跟提示词模板对得上。" },
+  { key: "out", roles: ["output"], title: "写回结果表",
+    hint: "这些列留空，跑完由平台把结果填回去。" },
+];
+
 function renderWfCols() {
   const host = document.getElementById("c-wf-cols");
   host.textContent = "";
@@ -1719,39 +1740,76 @@ function renderWfCols() {
     host.append(el("p", "who", "先上传一张表格，表头出来之后在这里选每一列的用途。"));
     return;
   }
-  state.wfCols.forEach((c, i) => {
-    const row = el("div", "wf-col-row");
-    row.append(el("span", "wf-col-name", c.header || ("列" + (c.col_index + 1))));
-    const sel = el("select", "wf-col-role");
-    sel.setAttribute("aria-label", "这一列的用途");
-    WF_ROLES.forEach(r => sel.append(new Option(WF_ROLE_LABEL[r], r)));
-    sel.value = c.role;
-    sel.onchange = () => {
-      const role = sel.value;
-      c.role = role;
-      if (role !== "input" && role !== "context") c.slot = "";
-      if (role !== "output") c.field = "";
-      if (role === "output" && !c.field) c.field = WF_OUTPUT_FIELDS[1];
-      renderWfCols();
-    };
-    row.append(sel);
-    if (c.role === "input" || c.role === "context") {
-      const slot = el("input", "wf-col-slot");
-      slot.type = "text";
-      slot.placeholder = "变量名，例如 seq";
-      slot.value = c.slot || "";
-      slot.oninput = () => { c.slot = slot.value; };
-      row.append(slot);
-    } else if (c.role === "output") {
-      const f = el("select", "wf-col-field");
-      f.setAttribute("aria-label", "结果字段");
-      WF_OUTPUT_FIELDS.forEach(k => f.append(new Option(WF_OUTPUT_LABEL[k], k)));
-      f.value = c.field || WF_OUTPUT_FIELDS[1];
-      f.onchange = () => { c.field = f.value; };
-      row.append(f);
-    }
-    host.append(row);
+  const bound = new Set();
+  state.wfCols.forEach(c => {
+    if ((c.role === "input" || c.role === "context") && c.slot) bound.add(c.slot);
   });
+
+  for (const g of WF_COL_GROUPS) {
+    const cols = state.wfCols.filter(c => g.roles.indexOf(c.role) !== -1);
+    if (!cols.length) continue;
+    /* 每组按**自己那一列的宽度**排：三列的组（写进提示词）留出变量名，
+     * 只有两列的组（不参与提示词 / 写回结果表）让角色下拉吃掉剩余宽度，
+     * 否则右边空一大块，看着还是没收拾利索。 */
+    const box = el("section", "wf-col-group wf-col-group--" + g.key);
+    const head = el("div", "wf-col-group-head");
+    head.append(el("h3", "wf-col-group-title", g.title));
+    head.append(el("span", "wf-col-group-n", cols.length + " 列"));
+    box.append(head);
+    box.append(el("p", "wf-col-group-hint", g.hint));
+    const list = el("div", "wf-col-list");
+    for (const c of cols) list.append(wfColRow(c, bound));
+    box.append(list);
+    host.append(box);
+  }
+
+  /* 模板里用到、却还没绑到列上的变量——直接点名，省得用户自己数。 */
+  const tpl = (document.getElementById("c-wf-template") || {}).value || "";
+  const used = templateSlots(tpl);
+  if (used.length) {
+    const missing = used.filter(v => !bound.has(v));
+    const p = el("p", "wf-col-warn" + (missing.length ? " is-bad" : ""));
+    p.textContent = missing.length
+      ? ("模板里的变量还没有对应的列：" + missing.join("、"))
+      : ("模板用到的 " + used.length + " 个变量都已绑到列上。");
+    host.append(p);
+  }
+}
+
+/* 一行：列名 / 角色 / 附加字段（变量名或结果字段）。 */
+function wfColRow(c, bound) {
+  const row = el("div", "wf-col-row");
+  row.append(el("span", "wf-col-name", c.header || ("列" + (c.col_index + 1))));
+  const sel = el("select", "wf-col-role");
+  sel.setAttribute("aria-label", "这一列的用途");
+  WF_ROLES.forEach(r => sel.append(new Option(WF_ROLE_LABEL[r], r)));
+  sel.value = c.role;
+  sel.onchange = () => {
+    const role = sel.value;
+    c.role = role;
+    if (role !== "input" && role !== "context") c.slot = "";
+    if (role !== "output") c.field = "";
+    if (role === "output" && !c.field) c.field = WF_OUTPUT_FIELDS[1];
+    renderWfCols();
+  };
+  row.append(sel);
+  if (c.role === "input" || c.role === "context") {
+    const slot = el("input", "wf-col-slot");
+    slot.type = "text";
+    slot.placeholder = "变量名，例如 seq";
+    slot.value = c.slot || "";
+    slot.oninput = () => { c.slot = slot.value; };
+    row.append(slot);
+    if (c.slot) row.classList.add("is-bound");
+  } else if (c.role === "output") {
+    const f = el("select", "wf-col-field");
+    f.setAttribute("aria-label", "结果字段");
+    WF_OUTPUT_FIELDS.forEach(k => f.append(new Option(WF_OUTPUT_LABEL[k], k)));
+    f.value = c.field || WF_OUTPUT_FIELDS[1];
+    f.onchange = () => { c.field = f.value; };
+    row.append(f);
+  }
+  return row;
 }
 
 /* 模板里的变量名，按出现顺序去重。 */

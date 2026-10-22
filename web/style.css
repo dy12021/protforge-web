@@ -227,10 +227,14 @@ button { cursor: pointer; }
 /* ------------------------------------------------- 表单（提交 / 登录 / 编辑） */
 
 .composer, .login {
+
   border: 1px solid var(--border); border-radius: 14px; padding: 0;
   width: min(32rem, 92vw); background: var(--card); color: var(--fg);
   box-shadow: 0 24px 64px rgba(21,32,51,.22);
 }
+/* 工作流模式更宽：列的用途是一张表，32rem 转不开，列名下拉会被挤成两列。 */
+.composer.is-wide { width: min(52rem, 94vw); }
+
 .composer::backdrop, .login::backdrop { background: rgba(23,32,45,.34); }
 .composer-inner, .login-inner { padding: 1.1rem 1.2rem 1.2rem; }
 .composer-title, .login-title { font-family: var(--display); font-size: 1.05rem; margin: 0 0 .5rem; }
@@ -908,3 +912,62 @@ button { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* --- 工作流：列的用途 ---------------------------------------------------
+   三组（不参与提示词 / 写进提示词 / 写回结果表）各有各的目的，混在一起
+   平铺时用户得逐行读下拉框才知道这一列要干什么——那正是「毛坯」的样子。
+   每一行用**同一套三列网格**，于是所有行天然对齐。 */
+.wf-col-group {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--lift);
+  padding: .7rem .8rem .8rem;
+  margin: 0 0 .7rem;
+}
+.wf-col-group-head { display: flex; align-items: baseline; gap: .5rem; }
+.wf-col-group-title { margin: 0; font-size: .88rem; font-weight: 600; }
+.wf-col-group-n { color: var(--fg-dim); font-size: .76rem; }
+.wf-col-group-hint {
+  margin: .2rem 0 .55rem;
+  color: var(--fg-dim);
+  font-size: .78rem;
+  line-height: 1.55;
+}
+.wf-col-list { display: grid; gap: .35rem; }
+.wf-col-row {
+  display: grid;
+  grid-template-columns: minmax(3.5rem, 6rem) 9rem minmax(6rem, 1fr);
+}
+/* 只有两列的组：角色下拉吃掉剩余宽度，右边不留空 */
+.wf-col-group--plain .wf-col-row,
+.wf-col-group--out .wf-col-row {
+  grid-template-columns: minmax(3.5rem, 6rem) minmax(8rem, 1fr);
+  align-items: center;
+  gap: .5rem;
+}
+.wf-col-name {
+  font-size: .84rem;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-col-row.is-bound .wf-col-name { color: var(--fg); }
+.wf-col-role, .wf-col-slot, .wf-col-field {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+  font-size: .82rem;
+  padding: .32rem .45rem;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--card);
+  color: var(--fg);
+}
+.wf-col-role:focus-visible, .wf-col-slot:focus-visible, .wf-col-field:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.wf-col-slot { font-family: var(--mono); }
+.wf-col-warn { margin: .1rem 0 0; font-size: .78rem; color: var(--fg-dim); }
+.wf-col-warn.is-bad { color: var(--st-failed); }
