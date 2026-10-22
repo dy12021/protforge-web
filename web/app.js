@@ -1478,6 +1478,21 @@ function paintWorkflowRows(host, id) {
   }
   rows.forEach(row => {
     const tr = el("tr");
+    /* **整行可点**，跟看板上的任务卡一个动作：点开右侧抽屉看详情。
+     * 抽屉自己会去拉 GET /api/tasks/{id}，而那个端点把工作流行任务也一起
+     * 给了（行任务属于发起人），所以这里不用另外取数据。
+     * 下面那个「下载产物包」按钮早就在 stopPropagation，不会误触发。 */
+    tr.classList.add("is-clickable");
+    tr.tabIndex = 0;
+    tr.setAttribute("role", "button");
+    tr.setAttribute("aria-label",
+      "第 " + (Number(row.workflow_row) + 1) + " 行，"
+      + (ROW_STATUS_LABEL[rowStatus(row, skips)] || row.status || "")
+      + "，查看详情");
+    tr.onclick = () => openDrawer(row.id);
+    tr.onkeydown = e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDrawer(row.id); }
+    };
     tr.append(el("td", "wf-rownum", String(Number(row.workflow_row) + 1)));
     const st = el("td");
     const dot = el("span", "wf-dot");
