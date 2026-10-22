@@ -9,7 +9,9 @@
      不设 user-scalable=no。 -->
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>自动化计算平台 · 值班台</title>
-<link rel="icon" href="data:,">
+<!-- 图标由服务端 /favicon.ico 给（204）。原来这里写 data: 空图标，
+     * 但这个面板的 CSP 是 default-src 'self'（令牌在 localStorage，不能放宽），
+     * data: 会被 img-src 回退规则拦掉，控制台每次都报一条 CSP 错。 -->
 <link rel="stylesheet" href="style.css">
 </head>
 <body>

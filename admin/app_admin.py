@@ -1018,6 +1018,15 @@ CSP = "default-src 'self'; base-uri 'none'; form-action 'self'"
 
 
 def _mount_ui(app: FastAPI) -> None:
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        """回一个空的图标。**不给 404**：浏览器每次开面板都会问一次，
+        404 会在控制台留一条噪音，掩盖真正的报错。
+        用 data: 空图标也不行——这个面板的 CSP 是 default-src 'self'，
+        data: 会被 img-src 的回退规则拦掉。
+        """
+        return Response(status_code=204)
+
     """把 admin-ui 三件套挂到根路径。
 
     手工读文件而不是挂 StaticFiles：面板只有三个文件，且**必须**在同一份
