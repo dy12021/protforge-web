@@ -344,6 +344,11 @@ function slideRail(rail, toStatus, failed, step) {
 function makeCard(t) {
   const c = el("article", "card");
   c.tabIndex = 0;
+  /* **它是个按钮，就得说它是按钮。** 原来只挂了 click 和 Enter，
+   * 缺 role="button"：读屏软件只会念出一段文字，读不出「点它能打开
+   * 详情」；键盘用户按 Space 没反应；可访问性树里它干脆不算可点元素
+   * （自动化按文本找它也找不到）。 */
+  c.setAttribute("role", "button");
   c.dataset.id = t.id;
   c.append(buildRail(t.status, t.status === "failed", t.id, t.step));
   const body = el("div", "card-body");
@@ -360,7 +365,10 @@ function makeCard(t) {
   fail.append(el("span", "card-fail-k", "失败原因"), el("span", "card-fail-t"));
   c.append(body, step, fail);
   c.addEventListener("click", () => openDrawer(t.id));
-  c.addEventListener("keydown", e => { if (e.key === "Enter") openDrawer(t.id); });
+  /* Space 也是 button 的标准键——只认 Enter 的话，键盘用户按空格没反应。 */
+  c.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDrawer(t.id); }
+  });
   return c;
 }
 
@@ -375,6 +383,8 @@ function paintCard(c, t) {
   c.dataset.status = t.status;
   c.classList.toggle("is-failed", failed);
   c.querySelector(".card-title").textContent = t.title || "";
+  /* 标签跟着标题走：读屏软件先念这个。 */
+  c.setAttribute("aria-label", (t.title || ("任务 " + t.id)) + "，查看详情");
   c.querySelector(".card-time").textContent = fmtTime(t.updated_at || t.created_at);
   const step = c.querySelector(".card-step");
   const st = failed ? "" : (t.step || "");
