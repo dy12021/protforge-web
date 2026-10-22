@@ -33,6 +33,16 @@
     <button class="tab" data-tab="audit" role="tab" type="button">审计日志</button>
     <button class="tab" data-tab="users" role="tab" type="button">用户</button>
   </nav>
+  <!-- 状态面板：管理员看得到系统指标与全局速度。**默认只读**——
+       它是给人看现状的，不是给人填的。 -->
+  <section class="status-panel" id="status-panel" aria-label="平台状态">
+    <div class="sp-head">
+      <h2 class="sp-title">平台状态</h2>
+      <span class="sp-note" id="sp-note"></span>
+    </div>
+    <div class="sp-metrics" id="sp-metrics"></div>
+    <div class="sp-system" id="sp-system" hidden></div>
+  </section>
 
   <!-- 全局提示条。值班台的这块比用户面板宽：内部通道连不上、登录过期
        这类问题必须一眼可见，否则下面四个区域全部静默失效。 -->

@@ -36,7 +36,10 @@ import store
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/status", tags=["status"])
+#: **router 本身不带 prefix**：同一个 router 要挂在两个前缀下——
+#: 常规面板用 /api/status/*，管理端用 /api/admin/status/*
+#: （管理端前端的 apiBase() 会拼上 /api/admin）。
+router = APIRouter(tags=["status"])
 
 #: 统计用的取数上限。一次拉太多会把「打开面板」变成一次全表扫描。
 STATS_LIMIT = 5000

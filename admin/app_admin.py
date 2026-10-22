@@ -518,7 +518,12 @@ def create_admin_app() -> FastAPI:
     # （/api/status/*）。管理员面板是 8474，前端在 8474 上取数，
     # 跨端口没有 CORS，所以这套端点必须在它自己的源上也有。
     # 权限仍由 router 自己把关：/api/status/system 只对管理员开放。
-    app.include_router(status_api.router)
+    app.include_router(status_api.router, prefix="/api/status")
+    # **同一个 router 再挂一份到 /api/admin 下**：管理端前端的 apiBase() 会
+    # 拼上 /api/admin 前缀，它调 /api/status/overview 实际打到的是
+    # /api/admin/api/status/overview——那当然没有。挂第二份，前端就照旧
+    # 用同一个相对路径，权限仍由 router 自己把关（system 只对管理员）。
+    app.include_router(status_api.router, prefix="/api/admin/status")
 
     @app.exception_handler(store.NotFound)
     async def _not_found(request, exc):

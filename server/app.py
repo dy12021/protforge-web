@@ -160,7 +160,7 @@ def _install_common(app: FastAPI) -> None:
     # 状态面板的三个端点。**public 与 internal 都挂**：常规面板走 8473，
     # 而管理员面板那一份由 admin/app_admin.py 单独挂（同一个 router）。
     # 三处路径一致，前端不用管自己连的是哪个端口。
-    app.include_router(status_api.router)
+    app.include_router(status_api.router, prefix="/api/status")
 
     @app.exception_handler(store.NotFound)
     async def _not_found(request, exc):

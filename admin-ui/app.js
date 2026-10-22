@@ -1428,7 +1428,76 @@ Object.assign(window, {
 /* 登录与否问服务端，不问 localStorage —— 理由同用户面板那边：令牌只说明
  * "上次点过登录"。旁路下压根没有令牌，/me 却是通的，早先那句
  * if (!token()) return showLogin() 会让面板永远停在登录框。 */
+
+
+/* ---------------------------------------------------------------- 状态面板
+ *
+ * 管理员看得到**系统指标与全局速度**；这一段是这一层特有的，
+ * 常规用户那边（web/）只渲染自己那一部分。
+ *
+ * 系统指标是**单独一个请求**：普通用户拿到的是 403，所以那边根本不会发。
+ * 这里是管理员，看得见，所以发。
+ */
+
+function spHours(sec) {
+  const n = Number(sec) || 0;
+  if (n <= 0) return "—";
+  if (n < 3600) return Math.round(n / 60) + " 分钟";
+  return (n / 3600).toFixed(1) + " 小时";
+}
+
+function spBox(cls, label, value) {
+  const b = el("div", cls);
+  b.append(el("div", "sp-k", label), el("div", "sp-v", value));
+  return b;
+}
+
+async function loadStatus() {
+  const host = document.getElementById("sp-metrics");
+  const sys = document.getElementById("sp-system");
+  const note = document.getElementById("sp-note");
+  if (!host) return;
+  try {
+    const o = await api("GET", "/status/overview");
+    const t = o.tasks || {};
+    const d = o.duration || {};
+    host.textContent = "";
+    host.append(spBox("sp-metric", "任务总数", String(t.total || 0)));
+    host.append(spBox("sp-metric", "进行中", String(t.running || 0)));
+    host.append(spBox("sp-metric", "已完成", String(t.done || 0)));
+    host.append(spBox("sp-metric", "失败", String(t.failed || 0)));
+    host.append(spBox("sp-metric", "成功率",
+      Math.round((Number(o.success_rate) || 0) * 100) + "%"));
+    host.append(spBox("sp-metric", "平均单时", spHours(d.avg_seconds)));
+    if (note) note.textContent = o.scope === "admin" ? "全局" : "我的任务";
+  } catch (e) {
+    host.textContent = "";
+    if (note) note.textContent = "状态暂时取不到";
+    return;
+  }
+  try {
+    const s = await api("GET", "/status/system");
+    sys.textContent = "";
+    sys.hidden = false;
+    sys.append(el("div", "sp-sys-title", "系统"));
+    const cpu = s.cpu || {};
+    const mem = s.memory || {};
+    const gpu = s.gpu || {};
+    const disk = s.disk || {};
+    sys.append(spBox("sp-sys", "CPU", (cpu.percent || 0) + "%"));
+    sys.append(spBox("sp-sys", "内存", (mem.percent || 0) + "%"));
+    sys.append(spBox("sp-sys", "GPU",
+      gpu.available ? (gpu.util_percent || 0) + "%" : "无 GPU"));
+    sys.append(spBox("sp-sys", "数据盘剩余",
+      (disk.free_gb || 0) + " GB"));
+  } catch (e) {
+    sys.hidden = true;
+  }
+}
+
 async function boot() {
+  // 状态面板：先画它，别让它拖住别的。取不到也不该让面板整个空着。
+  loadStatus().catch(() => {});
   try {
     state.me = await api("GET", "/me");
     document.getElementById("who").textContent =

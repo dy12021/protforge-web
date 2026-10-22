@@ -516,3 +516,37 @@ button:disabled { opacity: .45; cursor: default; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* --- 状态面板（与管理面板同一套规则，从 web/style.css 复制） --- */
+.status-panel {
+  margin: .7rem 1.1rem 0;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r);
+  padding: .55rem .7rem .6rem;
+}
+.sp-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .45rem; }
+.sp-title { font-family: var(--display); font-size: .8rem; margin: 0; letter-spacing: .04em; }
+.sp-note { color: var(--fg-dim); font-size: .72rem; margin-left: auto; }
+.sp-metrics { display: flex; flex-wrap: wrap; gap: .4rem 1.1rem; }
+.sp-metric { min-width: 4.6rem; }
+.sp-m-label { font-size: .7rem; color: var(--fg-dim); }
+.sp-m-value {
+  font-family: var(--display); font-size: 1.25rem; line-height: 1.15;
+  color: var(--fg); font-weight: 600;
+}
+.sp-m-sub { font-size: .68rem; color: var(--fg-dim); }
+.sp-metric.is-bad .sp-m-value { color: var(--st-failed); }
+.sp-metric.is-warn .sp-m-value { color: var(--st-running); }
+.sp-metric.is-accent .sp-m-value { color: var(--accent); }
+.sp-empty { color: var(--fg-dim); font-size: .78rem; margin: 0; }
+.sp-system {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: .4rem .9rem;
+  margin-top: .55rem; padding-top: .5rem; border-top: 1px solid var(--line);
+}
+.sp-system[hidden] { display: none; }
+.sp-bar-head { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem; }
+.sp-bar-label { font-size: .72rem; color: var(--fg-dim); }
+.sp-bar-val { font-size: .72rem; color: var(--fg); font-family: var(--mono); }
+.sp-bar { height: 5px; border-radius: 999px; background: var(--line); overflow: hidden; margin-top: .18rem; }
+.sp-bar-fill { height: 100%; background: var(--st-running); border-radius: 999px; }
+.sp-note-line { font-size: .74rem; color: var(--fg-dim); }
