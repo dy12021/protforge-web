@@ -1489,8 +1489,10 @@ async function loadStatus() {
     host.append(spBox("sp-metric", "进行中", String(t.running || 0)));
     host.append(spBox("sp-metric", "已完成", String(t.done || 0)));
     host.append(spBox("sp-metric", "失败", String(t.failed || 0)));
+    /* **null 就是「没测到」，不能写成 0%** —— 0% 是在对着没发生过的事报平安。 */
+    const rate = o.success_rate;
     host.append(spBox("sp-metric", "成功率",
-      Math.round((Number(o.success_rate) || 0) * 100) + "%"));
+      rate == null ? "—" : Math.round(rate * 100) + "%"));
     host.append(spBox("sp-metric", "平均单时", spHours(d.avg_seconds)));
     /* 口径写清楚：这个「任务总数」是独立计算任务 + 工作流行任务加在一起的，
      * 而下面的列表只列独立任务。两个数字对不上时，读者要能一眼看出为什么。 */
@@ -1511,15 +1513,16 @@ async function loadStatus() {
     const mem = s.memory || {};
     const gpu = s.gpu || {};
     const disk = s.disk || {};
-    sys.append(spBar("CPU", cpu.percent, (cpu.percent || 0) + "%"));
-    sys.append(spBar("内存", mem.percent, (mem.percent || 0) + "%"));
+    const pctText = v => (v == null ? "—" : v + "%");
+    sys.append(spBar("CPU", cpu.percent, pctText(cpu.percent)));
+    sys.append(spBar("内存", mem.percent, pctText(mem.percent)));
     sys.append(spBar("GPU", gpu.available ? gpu.util_percent : 0,
-      gpu.available ? (gpu.util_percent || 0) + "%" : "无 GPU"));
+      gpu.available ? pctText(gpu.util_percent) : "无 GPU"));
     const diskUsed = Number(disk.used_gb) || 0;
     const diskTotal = Number(disk.total_gb) || 0;
     sys.append(spBar("数据盘",
       diskTotal ? (diskUsed * 100) / diskTotal : 0,
-      "剩 " + (disk.free_gb || 0) + " GB"));
+      disk.free_gb == null ? "—" : "剩 " + disk.free_gb + " GB"));
   } catch (e) {
     sys.hidden = true;
   }
