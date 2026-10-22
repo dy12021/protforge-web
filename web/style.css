@@ -323,6 +323,7 @@ button { cursor: pointer; }
 .drawer-title { font-size: 1.15rem; margin: 0 0 .25rem; font-weight: 650; overflow-wrap: anywhere; letter-spacing: -.01em; }
 .drawer-sub { display: flex; gap: .5rem; align-items: center; color: var(--fg-dim); margin-bottom: .2rem; flex-wrap: wrap; }
 .drawer-id { font-family: var(--mono); font-size: .75rem; }
+.drawer-time { color: var(--fg-dim); font-size: .75rem; }
 .drawer-status { font-weight: 600; font-size: .78rem; padding: .1rem .45rem; border-radius: 999px; }
 /* 抽屉顶部的流转轨：和卡片上同一条线，只是宽一点。 */
 .drawer-rail { margin: .55rem 0 .2rem; }
@@ -742,6 +743,10 @@ button { cursor: pointer; }
   margin-top: .55rem; padding-top: .5rem; border-top: 1px solid var(--line);
 }
 .sp-system[hidden] { display: none; }
+/* 一条系统指标的容器。**web 这边原来也缺这一条**——
+   * 用户面板把系统指标藏给普通账号，所以它从没在这边渲染过；
+   * 管理员切到用户面板看系统指标时，那四块是四个没样式的裸 div。 */
+.sp-bar-item { min-width: 0; }
 .sp-bar-head { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem; }
 .sp-bar-label { font-size: .72rem; color: var(--fg-dim); }
 .sp-bar-val { font-size: .72rem; color: var(--fg); font-family: var(--mono); }
@@ -781,6 +786,7 @@ button { cursor: pointer; }
   margin-top: .2rem; font-size: .74rem; color: var(--fg-dim);
 }
 .wfc-id { font-family: var(--mono); }
+.wfc-count { color: var(--fg-dim); font-size: .78rem; }
 .wfc-failed { color: var(--fg-dim); }
 .wfc-failed.is-bad { color: var(--st-failed); font-weight: 700; }
 .bar {

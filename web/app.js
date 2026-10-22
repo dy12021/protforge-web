@@ -1566,11 +1566,21 @@ function renderStatusOverview(ov, admin) {
   /* scope 写到面板上：管理员视角与本人视角不是同一件事，
    * CSS 可以据此把「全局」那几格标出来。 */
   document.getElementById("status-panel").dataset.scope = ov.scope || "";
+  /* 口径写清楚：这个「任务总数」是独立计算任务 + 工作流行任务加在一起的，
+   * 而下面的列表只列独立任务。两个数字对不上时，读者要能一眼看出为什么。 */
+  const bd = ov.breakdown || {};
+  note.textContent = (ov.scope === "admin" ? "全局" : "我的任务")
+    + " · 计算任务 " + (bd.regular || 0)
+    + " · 工作流行 " + (bd.workflow || 0);
   const total = Number(t.total) || 0;
   const running = (Number(t.queued) || 0) + (Number(t.running) || 0) + (Number(t.packaging) || 0);
   const failed = Number(t.failed) || 0;
 
-  host.append(metric("任务总数", String(total), null));
+  /* 口径写在这一格的副标题里：数字是「独立计算任务 + 工作流行任务」
+   * 加起来的，而下面的列表只列独立任务。**写在这里而不是面板标题上**——
+   * 标题那行要留给「管理员视角 / 我的任务」，那是另一件事。 */
+  host.append(metric("任务总数", String(total),
+    "计算 " + (bd.regular || 0) + " · 工作流行 " + (bd.workflow || 0)));
   host.append(metric("进行中", String(running),
     "排队 " + (Number(t.queued) || 0) + " · 计算 " + (Number(t.running) || 0)
     + " · 打包 " + (Number(t.packaging) || 0)));

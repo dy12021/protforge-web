@@ -1446,10 +1446,29 @@ function spHours(sec) {
   return (n / 3600).toFixed(1) + " 小时";
 }
 
-function spBox(cls, label, value) {
+function spBox(cls, label, value, sub) {
   const b = el("div", cls);
-  b.append(el("div", "sp-k", label), el("div", "sp-v", value));
+  /* 类名要用**样式表里真有的那套**（sp-m-label / sp-m-value）。
+   * 原来这里写的是 sp-k / sp-v —— 那两个类哪张样式表里都没有，
+   * 于是管理端这一块的指标名和值全是裸 div。 */
+  b.append(el("div", "sp-m-label", label), el("div", "sp-m-value", value));
+  if (sub) b.append(el("div", "sp-m-sub", sub));
   return b;
+}
+
+/* 一条系统指标的进度条：名字 + 数值 + 条。**和用户面板同一套类**，
+ * 免得两边长成两个样。 */
+function spBar(label, pct, text) {
+  const item = el("div", "sp-bar-item");
+  const head = el("div", "sp-bar-head");
+  head.append(el("span", "sp-bar-label", label));
+  head.append(el("span", "sp-bar-val", text));
+  const bar = el("div", "sp-bar");
+  const fill = el("div", "sp-bar-fill");
+  fill.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + "%";
+  bar.append(fill);
+  item.append(head, bar);
+  return item;
 }
 
 async function loadStatus() {
@@ -1462,14 +1481,22 @@ async function loadStatus() {
     const t = o.tasks || {};
     const d = o.duration || {};
     host.textContent = "";
-    host.append(spBox("sp-metric", "任务总数", String(t.total || 0)));
+    /* 口径写在这一格的副标题里：数字是「独立计算任务 + 工作流行任务」
+     * 加起来的，而下面的列表只列独立任务。 */
+    const bd = o.breakdown || {};
+    host.append(spBox("sp-metric", "任务总数", String(t.total || 0),
+      "计算 " + (bd.regular || 0) + " · 工作流行 " + (bd.workflow || 0)));
     host.append(spBox("sp-metric", "进行中", String(t.running || 0)));
     host.append(spBox("sp-metric", "已完成", String(t.done || 0)));
     host.append(spBox("sp-metric", "失败", String(t.failed || 0)));
     host.append(spBox("sp-metric", "成功率",
       Math.round((Number(o.success_rate) || 0) * 100) + "%"));
     host.append(spBox("sp-metric", "平均单时", spHours(d.avg_seconds)));
-    if (note) note.textContent = o.scope === "admin" ? "全局" : "我的任务";
+    /* 口径写清楚：这个「任务总数」是独立计算任务 + 工作流行任务加在一起的，
+     * 而下面的列表只列独立任务。两个数字对不上时，读者要能一眼看出为什么。 */
+    if (note) note.textContent = (o.scope === "admin" ? "全局" : "我的任务")
+      + " · 计算任务 " + ((o.breakdown || {}).regular || 0)
+      + " · 工作流行 " + ((o.breakdown || {}).workflow || 0);
   } catch (e) {
     host.textContent = "";
     if (note) note.textContent = "状态暂时取不到";
@@ -1479,17 +1506,20 @@ async function loadStatus() {
     const s = await api("GET", "/status/system");
     sys.textContent = "";
     sys.hidden = false;
-    sys.append(el("div", "sp-sys-title", "系统"));
+    sys.append(el("div", "sp-note-line", "系统"));
     const cpu = s.cpu || {};
     const mem = s.memory || {};
     const gpu = s.gpu || {};
     const disk = s.disk || {};
-    sys.append(spBox("sp-sys", "CPU", (cpu.percent || 0) + "%"));
-    sys.append(spBox("sp-sys", "内存", (mem.percent || 0) + "%"));
-    sys.append(spBox("sp-sys", "GPU",
+    sys.append(spBar("CPU", cpu.percent, (cpu.percent || 0) + "%"));
+    sys.append(spBar("内存", mem.percent, (mem.percent || 0) + "%"));
+    sys.append(spBar("GPU", gpu.available ? gpu.util_percent : 0,
       gpu.available ? (gpu.util_percent || 0) + "%" : "无 GPU"));
-    sys.append(spBox("sp-sys", "数据盘剩余",
-      (disk.free_gb || 0) + " GB"));
+    const diskUsed = Number(disk.used_gb) || 0;
+    const diskTotal = Number(disk.total_gb) || 0;
+    sys.append(spBar("数据盘",
+      diskTotal ? (diskUsed * 100) / diskTotal : 0,
+      "剩 " + (disk.free_gb || 0) + " GB"));
   } catch (e) {
     sys.hidden = true;
   }

@@ -124,6 +124,18 @@ def _counts(tasks: list[dict]) -> dict:
     return counts
 
 
+def _split(tasks: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把「独立计算任务」和「工作流行任务」分开。
+
+    两者混在一起算一个「任务总数」是没法对账的：看板列表只列独立任务，
+    而批量作业的活全在工作流行任务里（一个批次 61 行 = 61 个任务）。
+    面板要两个口径都说清楚，别让读者自己猜。
+    """
+    regular = [t for t in tasks if t.get("workflow_id") is None]
+    rows = [t for t in tasks if t.get("workflow_id") is not None]
+    return regular, rows
+
+
 def _duration_block(values: list[float]) -> dict:
     if not values:
         return {"count": 0, "avg_seconds": 0.0, "median_seconds": 0.0,
@@ -288,13 +300,17 @@ def overview(user: dict = Depends(auth.current_user)):
     is_admin = (user or {}).get("role") == "admin"
     tasks = store.list_tasks(None if is_admin else int(user["id"]),
                              is_admin=is_admin, limit=STATS_LIMIT)
+    regular, rows = _split(tasks)
     counts = _counts(tasks)
+    row_counts = _counts(rows)
     durations = _durations(tasks)
     done = counts["done"]
     failed = counts["failed"]
     out = {
         "scope": "admin" if is_admin else "user",
         "tasks": counts,
+        "breakdown": {"regular": len(regular), "workflow": len(rows)},
+        "workflow_rows": row_counts,
         "duration": _duration_block(durations),
         "success_rate": round(done / (done + failed), 4) if (done + failed) else 0.0,
     }

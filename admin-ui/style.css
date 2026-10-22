@@ -544,6 +544,7 @@ button:disabled { opacity: .45; cursor: default; }
   margin-top: .55rem; padding-top: .5rem; border-top: 1px solid var(--line);
 }
 .sp-system[hidden] { display: none; }
+.sp-bar-item { min-width: 0; }
 .sp-bar-head { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem; }
 .sp-bar-label { font-size: .72rem; color: var(--fg-dim); }
 .sp-bar-val { font-size: .72rem; color: var(--fg); font-family: var(--mono); }
