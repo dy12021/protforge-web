@@ -1465,14 +1465,14 @@ function paintWorkflowRows(host, id) {
   const table = el("table", "wf-rows-table");
   const head = el("thead");
   const htr = el("tr");
-  ["行", "状态", "当前步骤", "产物", "耗时"].forEach(t => htr.append(el("th", null, t)));
+  ["行", "状态", "当前步骤", "产物", "耗时", "操作"].forEach(t => htr.append(el("th", null, t)));
   head.append(htr);
   table.append(head);
   const body = el("tbody");
   if (!rows.length) {
     const tr = el("tr");
     const td = el("td", "wf-rows-empty", "还没有跑起来的行");
-    td.colSpan = 5;
+    td.colSpan = 6;
     tr.append(td);
     body.append(tr);
   }
@@ -1517,12 +1517,48 @@ function paintWorkflowRows(host, id) {
     tr.append(art);
     const dur = spanSec(row.created_at, row.done_at || row.updated_at);
     tr.append(el("td", "wf-row-dur", dur == null ? "—" : fmtDur(dur)));
+    /* 重跑这一行。**整行已经能点开详情了**，这个按钮是另一个动作，
+     * 所以它自己 stopPropagation，不跟整行的点击抢。 */
+    const act = el("td", "wf-row-act");
+    const rb = el("button", "mini", "重跑");
+    rb.type = "button";
+    rb.onclick = (e) => {
+      e.stopPropagation();
+      retryTask(row.id, Number(row.workflow_row) + 1, id);
+    };
+    act.append(rb);
+    tr.append(act);
     body.append(tr);
   });
   table.append(body);
   host.append(table);
 }
 
+
+/* 重跑一个任务（工作流行任务也行）。**重跑要等当前这行跑完**——工作流是串行的，
+ * 调度器会自己排队，所以这里提交完就完事，不用等它跑完。 */
+async function retryTask(taskId, rowNo, wfId) {
+  const ok = await confirmAction({
+    title: "重跑第 " + rowNo + " 行？",
+    lead: "这一行会从头再算一遍，几小时不等。",
+    items: [
+      "这一行的旧结果会被新结果覆盖",
+      "工作流会等当前正在跑的那行跑完，再轮到它",
+      "产物包会重新生成（旧的留在工作目录里）",
+    ],
+    okLabel: "确认重跑",
+  });
+  if (!ok) return;
+  try {
+    await api("POST", "/api/tasks/" + taskId + "/retry");
+    setMsg(document.getElementById("board-msg"),
+      "第 " + rowNo + " 行已重新排队，它会等当前这行跑完再开始", "good");
+    if (wfId != null) refreshOpenWorkflow(wfId);
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"),
+      "重跑失败：" + (e.message || ""), "bad");
+  }
+}
 /* 单独下某一行的产物包。走 fetch + blob：令牌在请求头里，<a> 带不了。 */
 async function downloadTaskPackage(taskId, rowNo) {
   const r = await fetch(apiBase() + "/api/tasks/" + taskId + "/package", { headers: authHeaders() });

@@ -816,6 +816,31 @@ def create_public_app() -> FastAPI:
         # 任务行已经没了，这条"删除"事件无处可写，也不假装记了日志
         return {"ok": True}
 
+    @app.post("/api/tasks/{task_id}/retry")
+    def retry_task(task_id: int, user=Depends(auth.current_user)):
+        """把一个结束掉的任务放回队列，重跑一遍。**工作流行任务也适用。**
+
+        调度器认得出「重跑产生的既有行任务」
+        （dispatcher._spawn_workflow_row 的 existing_task_id），所以工作流的
+        那一行是**复用同一个任务 id** 重跑的，结果表那一格会被新结果覆盖，
+        不会出现两行打架。
+
+        **本轮的结果、收口标记、归档标记都要清**：不清的话第二轮的 finish
+        会被 422 拒掉（收口标记还在），而归档标记不清的话这一行的新结果
+        永远写不回结果表。和管理员点「重跑」是同一套语义。
+        """
+        task = store.get_task(task_id, owner_id=user["id"],
+                               is_admin=user["role"] == "admin")
+        if task["status"] not in db.TERMINAL_STATUSES:
+            raise PreciseHTTPException(422, "任务还在进行中，不需要重跑")
+        store.update_task(task_id, done_at=None, step="", error="",
+                          package_path="", summary="")
+        store.clear_finished(task_id)
+        store.update_task(task_id, workflow_archived=0)
+        updated = store.set_status(task_id, "queued", actor="human",
+                                   message="重新排队，重跑这一遍")
+        return {"task": _task_view(updated)}
+
     @app.post("/api/tasks/{task_id}/abort")
     def abort(task_id: int, user=Depends(auth.current_user)):
         task = store.get_task(task_id, owner_id=user["id"],
