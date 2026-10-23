@@ -152,11 +152,12 @@ def test_the_scanner_actually_finds_the_detail_fetches():
     少一个是扫描器漏扫了（形同虚设），多一个通常是有新的取详情信封的
     调用点进来了（那要确认它经没经 detailTask）。
 
-    10 个：建任务、打开抽屉、实时刷新、改需求说明、改标题、中止、重跑，
-    加上 2026-10-23 验收那轮的**验收通过 / 打回 / 续跑**三处。
+    12 个：建任务、打开抽屉、实时刷新、改需求说明、改标题、中止、重跑，
+    加上 2026-10-23 验收那轮的**验收通过 / 打回 / 续跑**三处，
+    再加上同一天的机器审核那轮的**改验收方式 / 让机器审一下**两处。
     """
     found = _detail_fetches()
-    assert len(found) == 10, f"预期 10 个取详情信封的调用点，实际 {len(found)}：{found}"
+    assert len(found) == 12, f"预期 12 个取详情信封的调用点，实际 {len(found)}：{found}"
 
 
 def test_the_scanner_does_not_swallow_the_list_endpoint():

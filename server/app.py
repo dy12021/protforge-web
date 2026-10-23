@@ -206,6 +206,10 @@ def _task_view(task: dict) -> dict:
 
 def _detail(task: dict) -> dict:
     arts = store.artifacts.list(task["id"])
+    # **这一轮实际用哪种方式验收**（任务 > 工作流 > 全局默认）。
+    # 来源要一起给：界面上得让人知道「这一行是跟着全局的」还是
+    # 「这一行单独设过」——不然他改不动一个看不见来源的设置。
+    mode, mode_source = store.resolve_review_mode(task)
     return {"task": _task_view(task),
             "events": store.list_events(task["id"]),
             "artifacts": arts,
@@ -214,7 +218,12 @@ def _detail(task: dict) -> dict:
             # 而他正要做的决定（认不认、续不续跑）就在验收区里做。
             # artifacts 传进去复用，别为这个再查一遍库。
             "review": {"acceptance": task.get("acceptance") or db.ACCEPTANCE_NONE,
-                       "failures": review.hard_check_failures(task, arts)}}
+                       "failures": review.hard_check_failures(task, arts),
+                       "mode": mode,
+                       "mode_source": mode_source,
+                       "mode_override": task.get("review_mode") or "",
+                       # 最近一次机器审核结论。没有就是 None（还没审过）。
+                       "llm": store.latest_task_review(task["id"])}}
 
 
 def _delete_task_row(task_id: int) -> None:
@@ -364,6 +373,11 @@ def _wf_view(wf: dict, stats: dict | None = None) -> dict:
     out = dict(wf)
     raw = (out.get("result_path") or "").strip()
     out["result_ready"] = bool(raw) and Path(raw).is_file()
+    # **这一批用哪种方式验收**（没设就跟着全局默认）。
+    # 几十行的批量场景里，「这批我全要机器审」比逐行去任务里点现实得多。
+    wmode, wsource = store.resolve_workflow_review_mode(wf)
+    out["review_mode_effective"] = wmode
+    out["review_mode_source"] = wsource
     # 行级统计**只在列表端点挂上来**（_row_stats 那条 SQL 已经是一次 GROUP BY，
     # 别的端点拿不到聚合值就不给这个键）。不给键比给一个默认 0 强：前端区分
     # 「真的 0 行失败」和「这里没有这个数」，后者不能显示成「没有失败行」。
@@ -573,7 +587,7 @@ class TaskIn(BaseModel):
 
 
 class TaskPatch(BaseModel):
-    """只允许改标题与需求正文。
+    """允许改标题、需求正文，以及**这一轮用哪种方式验收**。
 
     **没有 status**：用户侧没有状态推进权（也没有 /advance），多传的 status
     由 pydantic 默认忽略——既不是 400（前端不该为一个非法字段整次失败），
@@ -581,10 +595,23 @@ class TaskPatch(BaseModel):
 
     `None`（不传 / 显式 null）一律当"这个字段不动"，所以模型里全是可空：
     要清空需求正文传 `""`，不传就是保持原样。
+
+    `review_mode` 传 `""` 的意思是**回到继承**（跟着工作流，再往上是全局默认）。
     """
 
     title: str | None = Field(default=None, max_length=store.TITLE_MAX)
     brief: str | None = Field(default=None, max_length=store.BRIEF_MAX)
+    review_mode: str | None = Field(default=None, max_length=16)
+
+
+class ReviewModeIn(BaseModel):
+    """验收方式。取值 human（人工 + 条件判定）/ llm（机器审核）。"""
+    review_mode: str = Field(default="", max_length=16)
+
+
+class WorkflowPatch(BaseModel):
+    """工作流设置。**目前只有验收方式**。"""
+    review_mode: str | None = Field(default=None, max_length=16)
 
 
 class StepIn(BaseModel):
@@ -932,6 +959,9 @@ def create_public_app() -> FastAPI:
             if len(body.brief) > store.BRIEF_MAX:
                 raise store.Invalid(f"需求描述过长，最多 {store.BRIEF_MAX} 个字符")
             fields["brief"] = body.brief
+        if body.review_mode is not None:
+            # 空串 = 回到继承（跟着工作流，再往上是全局默认）。
+            fields["review_mode"] = store.normalize_review_mode(body.review_mode)
         if not fields:
             raise store.Invalid("没有要修改的字段")
         for k, v in fields.items():
@@ -988,6 +1018,80 @@ def create_public_app() -> FastAPI:
         # 不用再补一次请求；顺带避免「详情信封」这个形状在两个端点里各说各话。
         sse.notify()
         return _detail(updated)
+
+    # --- 验收方式 ------------------------------------------------------------
+    #
+    # 「这一轮过不过」由谁来判，三级：**任务 > 工作流 > 全局默认**。
+    # 空串 = 继承上一层。所以「全局默认 + 每个任务可覆盖」这句话在数据层
+    # 就是三列各自可空，解析在 store.resolve_review_mode 一处做。
+
+    @app.get("/api/review-settings")
+    def review_settings(user=Depends(auth.current_user)):
+        """平台级的默认验收方式。**谁来看这一轮过不过**的默认值。"""
+        return {"review_mode": store.get_global_review_mode(), "source": "global"}
+
+    @app.put("/api/review-settings")
+    def put_review_settings(body: ReviewModeIn, user=Depends(auth.current_user)):
+        """改全局默认。**只给管理员**——这是平台级设置，
+        一个用户改了会连别人的批次一起变。"""
+        if user["role"] != "admin":
+            raise PreciseHTTPException(403, "全局默认只有管理员能改")
+        mode = store.normalize_review_mode(body.review_mode)
+        if not mode:
+            raise PreciseHTTPException(422, "全局默认不能为空")
+        store.set_setting(store.REVIEW_MODE_KEY, mode)
+        sse.notify()
+        return {"review_mode": mode, "source": "global"}
+
+    @app.patch("/api/workflows/{workflow_id}")
+    def patch_workflow(workflow_id: int, body: WorkflowPatch,
+                       user=Depends(auth.current_user)):
+        """改工作流设置。**目前只有验收方式**。
+
+        越权走 store.get_workflow_for → NotFound → 404（不返 403，
+        不承认这个 id 存在）。
+        """
+        wf = store.get_workflow_for(workflow_id, user["id"],
+                                    is_admin=user["role"] == "admin")
+        mode = store.normalize_review_mode(body.review_mode)
+        updated = store.update_workflow(workflow_id, review_mode=mode)
+        sse.notify()
+        return {"workflow": _wf_view(updated)}
+
+    @app.post("/api/tasks/{task_id}/llm-review")
+    def llm_review(task_id: int, user=Depends(auth.current_user)):
+        """让机器审这一轮。
+
+        **不在这里同步跑**：审核要 spawn 一个独立进程跑几分钟，
+        放在请求里就是让页面转圈几分钟。做法是——
+
+        ① 把这一轮切到「机器审」；
+        ② 清掉上一次的机器结论；
+        ③ 把验收状态放回「待验收」。
+
+        然后后台巡检会在下一秒接手（它扫的是「算完了、等人验收、
+        该走机器审、还没审过」的任务）。
+
+        ③ 是有意的：重新判一次 = 把决定重新打开。机器判完再改成通过/不通过。
+        """
+        task = store.get_task_for(task_id, user["id"],
+                                  is_admin=user["role"] == "admin")
+        if str(task.get("status")) != "done":
+            raise PreciseHTTPException(422, "任务还没算完，审不了")
+        store.update_task(task_id, review_mode=db.REVIEW_MODE_LLM)
+        cleared = store.clear_task_reviews(task_id)
+        if str(task.get("acceptance")) in (db.ACCEPTANCE_ACCEPTED,
+                                          db.ACCEPTANCE_REJECTED):
+            store.set_acceptance(task_id, db.ACCEPTANCE_PENDING)
+        store.add_event(task_id, "note", "human", "要求机器重新审核这一轮")
+        sse.notify()
+        # **返回详情信封**：动作端点一律这么返（abort / accept / reject /
+        # continue 都是），前端也一律经 detailTask 拆。多一种形状就多一处
+        # 「前端猜错了但不报错」的地方——那是这个洞的成因。
+        body = _detail(store.get_task(task_id, is_admin=True))
+        body["queued"] = True
+        body["cleared"] = cleared
+        return body
 
     # --- 验收 / 续跑 ------------------------------------------------------------
     #

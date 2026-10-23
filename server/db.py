@@ -58,6 +58,21 @@ ACCEPTANCE_ACCEPTED = "accepted"
 ACCEPTANCE_REJECTED = "rejected"
 ACCEPTANCE_NONE = "none"
 
+#: **验收方式**（2026-10-23）。这一轮谁来判「过不过」：
+#:
+#: - ``human``：人工 + 条件判定。平台只做机械硬条件的判定，剩下的交给人。
+#: - ``llm``  ：开一轮新的独立审核进程（subagent）去核这一轮满不满足需求。
+#:
+#: **空串 = 继承**（跟着工作流走，再往上是全局默认）。解析顺序在
+#: :func:`store.resolve_review_mode`，别在别处自己拼。
+REVIEW_MODES = ("human", "llm")
+REVIEW_MODE_HUMAN = "human"
+REVIEW_MODE_LLM = "llm"
+
+#: 机器审核给出的结论。``error`` = 审核没跑成（超时/起不来/没写结论），
+#: 它**不改变验收状态**——机器挂了不该把任务算成不通过。
+REVIEW_VERDICTS = ("pass", "fail", "error")
+
 # 反思的处理阶段。与任务状态**无关**，别混用。
 #   draft     模型已写出反思，等管理员分类（刚生成就是这一档）
 #   reviewed  管理员已分类，等落地（写经验 / 应用修改方案）
@@ -98,10 +113,41 @@ CREATE TABLE IF NOT EXISTS workflows (
   abort_requested INTEGER NOT NULL DEFAULT 0,
   result_path TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'draft',
+  review_mode TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   CHECK (status IN ('draft','running','paused','finished'))
 );
 CREATE INDEX IF NOT EXISTS idx_workflows_owner ON workflows(owner_id, status);
+--: **平台级的设置**（键值对）。目前只有「验收方式」这一项，但**先有这张表**：
+--: 每加一项就往 settings 里塞一行，而不是每加一项就改一次表结构——
+--: 表结构改了要迁移，键值对不用。
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+--: **机器审核给出的结论**（2026-10-23）。
+--:
+--: 它与 tasks.acceptance 是**两件事**：这一列记的是「机器说了什么」，
+--: 那一列记的是「这一轮算不算交付完成」。分开记才能分清
+--: 「这轮是机器放行的」和「这轮是人放行的」，人也才能事后推翻机器的结论。
+--:
+--: 为什么单独一张表而不把结论塞进 acceptance：
+--: ① 「机器说通过、人还没点」和「人点了通过」是两件事，混在一列里
+--:    就分不出「这轮是机器放行的还是人放行的」；
+--: ② 机器的结论要能**反复看**（人可能过一会儿才去看），也要能留档。
+CREATE TABLE IF NOT EXISTS task_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  verdict TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  reviewer TEXT NOT NULL DEFAULT '',
+  --: 这次结论**有没有被自动写进 acceptance**（1=写了，0=只留档）。
+  --: 人手动推翻机器结论后，这一列不会回改——它是「当时发生了什么」的历史。
+  auto_applied INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_reviews_task ON task_reviews(task_id);
 CREATE TABLE IF NOT EXISTS workflow_columns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
@@ -152,6 +198,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   acceptance TEXT NOT NULL DEFAULT 'none',
   declared TEXT NOT NULL DEFAULT '',
   followup TEXT NOT NULL DEFAULT '',
+  -- **这一轮用哪种方式验收**（2026-10-23）。空串 = 跟着上层走
+  -- （工作流的设置，再往上是值班台里的全局默认）。
+  review_mode TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, done_at TEXT,
   CHECK (status IN ('queued','running','packaging','done','failed'))
 );
@@ -312,6 +361,15 @@ _MISSING_TASK_COLUMNS = (
     # （dispatcher._spawn_workflow_row），改在 brief 上的补充要求会被覆盖掉。
     # 单独一列才活得下来。
     "followup TEXT NOT NULL DEFAULT ''",
+    # **这一轮用哪种方式验收**（2026-10-23）。空串 = 跟着上层走。
+    # 取值见 REVIEW_MODES；解析顺序是 任务 > 工作流 > 全局默认。
+    "review_mode TEXT NOT NULL DEFAULT ''",
+)
+
+# 工作流表补列。**工作流自己也能定审核方式**：一批几十行时，
+# 「这批我全要机器审」比逐行去任务里点一遍现实得多。
+_MISSING_WORKFLOW_COLUMNS = (
+    "review_mode TEXT NOT NULL DEFAULT ''",
 )
 
 # 反思表补列。**方案失败的原因要单独一列**：reflections.error 是「这次反思
@@ -358,6 +416,10 @@ def _add_missing_columns(c: sqlite3.Connection) -> None:
     for spec in _MISSING_REFLECTION_COLUMNS:
         if spec.split()[0] not in have_r:
             _add_column(c, spec, "reflections")
+    have_w = {r[1] for r in c.execute("PRAGMA table_info(workflows)")}
+    for spec in _MISSING_WORKFLOW_COLUMNS:
+        if spec.split()[0] not in have_w:
+            _add_column(c, spec, "workflows")
 
 
 def init_db() -> None:

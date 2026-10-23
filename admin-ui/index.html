@@ -44,6 +44,17 @@
       <span class="sp-note" id="sp-note"></span>
     </div>
     <div class="sp-metrics" id="sp-metrics"></div>
+    <!-- 验收方式默认。**这是平台级设置**，所以入口在值班台（管理员）：
+         没单独设过的任务都按它来，任务与工作流可以各自覆盖。
+         放在状态面板里是因为它本来就是「平台现状」的一部分。 -->
+    <div class="sp-setting">
+      <span class="sp-setting-k">验收方式默认</span>
+      <select id="review-mode-default" class="review-mode-select">
+        <option value="human">人工 + 条件判定</option>
+        <option value="llm">机器审核</option>
+      </select>
+      <span class="sp-note" id="review-mode-note"></span>
+    </div>
     <div class="sp-system" id="sp-system" hidden></div>
   </section>
 
@@ -155,6 +166,7 @@
               <th class="c-id">#</th><th class="c-title">名称</th>
               <th class="c-owner">创建者</th><th class="c-state">共享</th>
               <th class="c-state">验收</th>
+              <th class="c-state">验收方式</th>
               <th class="c-time">行数</th><th class="c-act">操作</th>
             </tr>
           </thead>

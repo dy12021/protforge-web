@@ -177,6 +177,9 @@ def _update(task_id: int, **fields) -> dict:
         # 验收状态的每一次变化都该留一条事件（谁在什么时候认了/打回了），
         # 走 store.set_acceptance()，那里会一并记账。
         "acceptance", "followup",
+        # **这一轮用哪种方式验收**（空串 = 继承上层）。取值见 db.REVIEW_MODES。
+        # 它是「验收方式」，不是「验收结论」——结论在 acceptance 上。
+        "review_mode",
         # 计算进程自报的产物清单（JSON 数组）。验收时拿它核对「模型说有、
         # 盘上没有」，所以它得像产物表那样是**一份独立的记录**，
         # 不能只活在事件文本里（事件是给人读的，不是给机器查的）。
@@ -304,6 +307,190 @@ def count_awaiting_acceptance(owner_id=None, *, is_admin: bool = False) -> int:
     try:
         row = c.execute(sql, args).fetchone()
         return int(row[0] or 0)
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------- 验收方式
+#
+# 「这一轮过不过」由谁来判，有三级：**任务 > 工作流 > 全局默认**。
+# 空串 = 继承上一层，所以「全局默认 + 每任务可覆盖」这句话在数据层
+# 就是三列各自可空，解析在 :func:`resolve_review_mode` 一处做。
+#
+# **别在别处自己拼解析**：优先级一旦散开，「为什么这行是人工审的」
+# 就再也答不上来了。
+
+#: 全局默认存在 settings 表里的键名。
+REVIEW_MODE_KEY = "review_mode"
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """读平台设置。键不存在 = 用默认值（不是报错）。"""
+    c = db.connect()
+    try:
+        row = c.execute("SELECT value FROM settings WHERE key = ?",
+                        (str(key),)).fetchone()
+    finally:
+        c.close()
+    if row is None:
+        return default
+    return str(row[0] or default)
+
+
+def set_setting(key: str, value: str) -> str:
+    """写平台设置（upsert）。返回写入后的值。"""
+    v = "" if value is None else str(value)
+    c = db.connect()
+    try:
+        with c:
+            c.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+                " updated_at=excluded.updated_at",
+                (str(key), v, db.now_iso()))
+    finally:
+        c.close()
+    return v
+
+
+def normalize_review_mode(value) -> str:
+    """校验外部传来的验收方式。**空串合法**——它的意思是「继承上层」。"""
+    v = ("" if value is None else str(value)).strip()
+    if v == "":
+        return ""
+    if v not in db.REVIEW_MODES:
+        raise Invalid(f"未知的验收方式：{value}")
+    return v
+
+
+def get_global_review_mode() -> str:
+    """全局默认的验收方式。没设过 = 人工 + 条件判定。"""
+    v = get_setting(REVIEW_MODE_KEY, "").strip()
+    return v if v in db.REVIEW_MODES else db.REVIEW_MODE_HUMAN
+
+
+def resolve_review_mode(task: dict) -> tuple[str, str]:
+    """算出这条任务**实际**用哪种方式验收。
+
+    返回 ``(方式, 来源)``，来源取 ``task`` / ``workflow`` / ``global``。
+    来源要一起返回：界面上得让人知道「这一行是跟着全局的」还是
+    「这一行单独设过」——不然他改不动一个看不见来源的设置。
+    """
+    m = normalize_review_mode(task.get("review_mode"))
+    if m:
+        return m, "task"
+    wid = task.get("workflow_id")
+    if wid is not None:
+        try:
+            wf = get_workflow(int(wid), is_admin=True)
+        except NotFound:
+            wf = None
+        if wf:
+            wm = normalize_review_mode(wf.get("review_mode"))
+            if wm:
+                return wm, "workflow"
+    return get_global_review_mode(), "global"
+
+
+def resolve_workflow_review_mode(wf: dict) -> tuple[str, str]:
+    """工作流自己的验收方式（没设就跟着全局）。"""
+    wm = normalize_review_mode(wf.get("review_mode"))
+    if wm:
+        return wm, "workflow"
+    return get_global_review_mode(), "global"
+
+
+# ---------------------------------------------------------------- 机器审核结论
+#
+# 「机器说了什么」与「这一轮算不算交付完成」是两件事，各记各的。
+# 机器的结论留档，人事后可以看、也可以推翻。
+
+
+def add_task_review(task_id: int, verdict: str, reason: str = "",
+                    reviewer: str = "llm", auto_applied: int = 0) -> dict:
+    """记一条机器审核结论。"""
+    if verdict not in db.REVIEW_VERDICTS:
+        raise Invalid(f"未知的审核结论：{verdict}")
+    c = db.connect()
+    try:
+        with c:
+            cur = c.execute(
+                "INSERT INTO task_reviews(task_id, verdict, reason, reviewer,"
+                " auto_applied, created_at) VALUES(?,?,?,?,?,?)",
+                (int(task_id), verdict, str(reason or "")[:4000],
+                 str(reviewer or ""), 1 if auto_applied else 0, db.now_iso()))
+            rid = int(cur.lastrowid)
+    finally:
+        c.close()
+    return latest_task_review(task_id) or {"id": rid}
+
+
+def list_task_reviews(task_id: int) -> list[dict]:
+    """这个任务的全部机器审核结论。**最新在前**。"""
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM task_reviews WHERE task_id = ? ORDER BY id DESC",
+            (int(task_id),))]
+    finally:
+        c.close()
+
+
+def latest_task_review(task_id: int) -> dict | None:
+    """最近一条机器审核结论。没有则 None。"""
+    rows = list_task_reviews(task_id)
+    return rows[0] if rows else None
+
+
+def clear_task_reviews(task_id: int) -> int:
+    """清掉这个任务的机器审核结论。返回删掉了几条。
+
+    **只删结论，不删历史**：历史在事件流里（「机器审核通过：…」那条 note），
+    那里是永久的。这一张表只回答「这一轮当前机器说了什么」，
+    「重新审一次」就是把这里的旧结论清掉，让巡检重新接手。
+    """
+    c = db.connect()
+    try:
+        with c:
+            cur = c.execute("DELETE FROM task_reviews WHERE task_id = ?",
+                             (int(task_id),))
+            return int(cur.rowcount or 0)
+    finally:
+        c.close()
+
+
+def list_tasks_needing_llm_review(limit: int = 20) -> list[dict]:
+    """还没被机器审过的「算完了、等人验收、且这一轮该走机器审」的任务。
+
+    判据全部写在一条 SQL 里：
+
+    * ``status='done' AND acceptance='pending'`` —— 硬条件已经先判过了，
+      能落到 pending 的都是机械条件过的，机器才需要去看「满不满足需求」；
+    * 有效方式是 llm —— 三级解析在 SQL 里就地展开（任务 > 工作流 > 全局）；
+    * ``NOT EXISTS task_reviews`` —— **审过一次就不再自动重审**。
+      审挂了（verdict=error）也不自动重试：一直重试会把一台机器拖住，
+      人可以在界面上手动再点一次。
+
+    老任务在前（id ASC）：审核是从早到晚排队的，先排队的先审。
+    """
+    sql = (
+        "SELECT t.* FROM tasks t"
+        " LEFT JOIN workflows w ON w.id = t.workflow_id"
+        " WHERE t.status = 'done' AND t.acceptance = ?"
+        " AND (CASE"
+        "   WHEN t.review_mode != '' THEN t.review_mode"
+        "   WHEN COALESCE(w.review_mode,'') != '' THEN w.review_mode"
+        "   ELSE COALESCE((SELECT value FROM settings WHERE key = ?),'')"
+        " END) = ?"
+        " AND NOT EXISTS (SELECT 1 FROM task_reviews r WHERE r.task_id = t.id)"
+        " ORDER BY t.id ASC LIMIT ?")
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in c.execute(
+            sql, (db.ACCEPTANCE_PENDING, REVIEW_MODE_KEY,
+                  db.REVIEW_MODE_LLM, int(limit)))]
     finally:
         c.close()
 
@@ -796,6 +983,8 @@ _WORKFLOW_FIELDS = {
     "name", "sheet", "source_path", "prompt_template", "header_row", "key_col",
     "total_rows", "cursor", "writeback", "writeback_pending",
     "abort_requested", "result_path", "status",
+    # 这一批用哪种方式验收（空串 = 继承全局默认）。
+    "review_mode",
 }
 _ROLES = ("key", "input", "context", "output", "ignore")
 
@@ -803,7 +992,7 @@ _ROLES = ("key", "input", "context", "output", "ignore")
 def create_workflow(owner_id: int, name: str, prompt_template: str, *,
                     sheet: str = "", source_path: str = "", header_row: int = 1,
                     key_col: int = 0, total_rows: int = 0,
-                    writeback: int = 0) -> dict:
+                    writeback: int = 0, review_mode: str = "") -> dict:
     """建工作流。**不设 status**——它恒为表默认值 'draft'。
 
     cursor 恒从 0 起：它表示「下一个尚未放行的数据行序号」，建工作流时还没有任何
@@ -824,11 +1013,12 @@ def create_workflow(owner_id: int, name: str, prompt_template: str, *,
                 """INSERT INTO workflows
                    (owner_id, name, sheet, source_path, prompt_template,
                     header_row, key_col, total_rows, cursor, writeback,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                    review_mode, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
                 (int(owner_id), name, sheet, source_path, prompt_template,
                  int(header_row), int(key_col), int(total_rows),
-                 1 if writeback else 0, now, now))
+                 1 if writeback else 0, normalize_review_mode(review_mode),
+                 now, now))
             wid = cur.lastrowid
         row = c.execute("SELECT * FROM workflows WHERE id = ?", (wid,)).fetchone()
     finally:

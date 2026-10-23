@@ -47,7 +47,21 @@ const ACTOR_LABEL = {
 };
 const FIELD_CN = {
   title: "标题", brief: "需求说明", step: "当前步骤", status: "状态",
-  summary: "结果说明", error: "失败原因",
+  summary: "结果说明", error: "失败原因", review_mode: "验收方式",
+};
+
+/* 验收方式。三级：任务 > 工作流 > 全局默认；**空串 = 继承上层**。
+ *
+ * 词面上与这个界面其余部分保持一致：跑计算的是「计算进程」，
+ * 审计算结果的那个也是平台的一部分——它是「审核进程」。 */
+const REVIEW_MODE_LABEL = {
+  human: "人工 + 条件判定",
+  llm: "机器审核",
+};
+const REVIEW_MODE_SOURCE = {
+  task: "这一轮单独设的",
+  workflow: "跟着这一批",
+  global: "跟着平台默认",
 };
 
 /* ---------------------------------------------- 工作流的词表
@@ -784,6 +798,93 @@ function scheduleRefresh(id) {
  * 续跑是**同一个任务接着干**，不是重开一个：工作流是「一行一个任务」，
  * 另起一轮会让那一行分裂成两个，归档进结果表时该写谁的结果就说不清了。 */
 
+/* --- 验收方式 -------------------------------------------------------------
+ *
+ * 三级：任务 > 工作流 > 全局默认，空串 = 继承。
+ *
+ * **来源必须一起显示**：只给一个「现在生效：机器审核」而不说是跟着谁来的，
+ * 用户就改不动一个看不见来路的设置——而改法恰恰是「我要自己设一个」。 */
+
+/* 下拉控件。三个选项：继承上层 / 人工 + 条件判定 / 机器审核。 */
+function reviewModeSelect(current, onPick) {
+  const sel = el("select", "review-mode-select");
+  [["", "继承上层"], ["human", "人工 + 条件判定"], ["llm", "机器审核"]]
+    .forEach(([v, label]) => {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = label;
+      if ((current || "") === v) o.selected = true;
+      sel.append(o);
+    });
+  sel.onchange = () => onPick(sel.value);
+  return sel;
+}
+
+/* 改一个任务的验收方式。改完要重画抽屉：下拉框自己不会变回去。 */
+async function setTaskReviewMode(t, mode) {
+  try {
+    const got = await api("PATCH", "/api/tasks/" + t.id, { review_mode: mode });
+    state.byId.set(t.id, detailTask(got, "改验收方式"));
+    rememberReview(t.id, got);
+    drawDrawer(t.id, state.byId.get(t.id));
+    setDrawerMsg("验收方式已改", "ok");
+  } catch (e) {
+    setDrawerMsg(e.message || "改不动验收方式", "bad");
+    drawDrawer(t.id, state.byId.get(t.id));
+  }
+}
+
+/* 改一批的验收方式。**不弹对话框**：它是一个明确的设置控件，
+ * 点一下就生效，跟改筛选条件是同一类动作。 */
+async function setWorkflowReviewMode(w, mode) {
+  try {
+    const got = await api("PATCH", "/api/workflows/" + w.id, { review_mode: mode });
+    const wf = got && got.workflow;
+    if (wf && wf.id) {
+      const i = state.workflows.findIndex(x => Number(x.id) === Number(wf.id));
+      if (i >= 0) state.workflows[i] = wf;
+    }
+    await load();
+  } catch (e) {
+    setDrawerMsg(e.message || "改不动这一批的验收方式", "bad");
+  }
+}
+
+/* 让机器审这一轮。**异步**：审核要另起一个独立进程跑几分钟，
+ * 所以请求立刻就回，后台审完再回来刷新。
+ *
+ * **已经定了结论的要先说清影响面**：重新打开 = 回到「待验收」，
+ * 机器判完直接改结论——**人打回过的意见也会被机器的结论盖掉**。
+ * 这一步不是不可撤销（人还能再推翻），但它会让人之前点过的「打回」白点，
+ * 所以要确认一次。 */
+async function requestLlmReview(t) {
+  const a = t.acceptance || "none";
+  if (a === "accepted" || a === "rejected") {
+    const ok = await confirmAction({
+      title: "让机器重新审这一轮？",
+      lead: "这一轮已经有结论了。重新审会把它放回「待验收」，机器判完直接改结论。",
+      items: [
+        a === "accepted" ? "当前的「已验收」会被撤掉" : "当前的「验收没通过」会被撤掉",
+        "机器判完直接改成通过或不通过",
+        "你之前打回时写的意见不会再影响这一轮的结论",
+      ],
+      okLabel: "确认重新审",
+    });
+    if (!ok) return;
+  }
+  try {
+    const got = await api("POST", "/api/tasks/" + t.id + "/llm-review", {});
+    state.byId.set(t.id, detailTask(got, "让机器审一下"));
+    rememberReview(t.id, got);
+    setDrawerMsg("已交给审核进程，过一会儿刷新看结论", "ok");
+    await load();
+    const nt = state.byId.get(t.id);
+    if (nt && state.openId === t.id) drawDrawer(t.id, nt);
+  } catch (e) {
+    setDrawerMsg(e.message || "机器审核没排上", "bad");
+  }
+}
+
 /* 验收通过。**不用两步确认**：它是把「已经算好的东西」标成「已交付」，
  * 没有不可撤销的后果——万一点错了，再打回一次就行。 */
 async function doAccept(t) {
@@ -1205,10 +1306,25 @@ function drawDrawer(id, t) {
     }
     slot.append(head);
 
+    /* **这一轮用哪种方式验收**，以及**它跟着谁来的**。
+     * 放在验收区最上面：方式决定了「谁来判」，是做出决定之前的前提。 */
+    const rev0 = state.taskReview.get(Number(id));
+    const modeRow = el("div", "review-mode-row");
+    modeRow.append(el("span", "review-mode-k", "验收方式"));
+    modeRow.append(reviewModeSelect(t.review_mode || "", (v) => {
+      setTaskReviewMode(t, v);
+    }));
+    const eff = (rev0 && rev0.mode) || "human";
+    const src = (rev0 && rev0.mode_source) || "global";
+    modeRow.append(el("span", "review-mode-note",
+      "现在生效：" + (REVIEW_MODE_LABEL[eff] || eff)
+      + "（" + (REVIEW_MODE_SOURCE[src] || src) + "）"));
+    slot.append(modeRow);
+
     /* **没过的原因要摆在验收区里**，不能只躺在时间线最下面：用户正要
      * 在这一屏做决定（认不认、续不续跑），却要翻到最下面才知道自己
      * 为什么被拒。 */
-    const rev = state.taskReview.get(Number(id));
+    const rev = rev0;
     const fails = (rev && rev.failures) || [];
     if (fails.length) {
       const why = el("ul", "review-fails");
@@ -1233,6 +1349,20 @@ function drawDrawer(id, t) {
       slot.append(el("p", "field-empty", "这一轮没有登记任何产物。"));
     }
 
+    /* **机器审核的结论**：机器说了什么，与「人认没认」是**两件事**。
+     * 结论单独列出来，是因为它带着依据（理由），而依据是复核时唯一
+     * 用得上的东西。 */
+    const llm = rev && rev.llm;
+    if (llm) {
+      const box = el("div", "review-llm");
+      const tag = llm.verdict === "pass" ? "机器判定通过"
+        : (llm.verdict === "fail" ? "机器判定没通过" : "机器审核没跑成");
+      box.append(el("span", "review-llm-k", tag));
+      if (llm.reason) box.append(el("span", "review-llm-t", llm.reason));
+      box.append(el("span", "review-llm-time", fmtTime(llm.created_at)));
+      slot.append(box);
+    }
+
     const acts2 = el("div", "action-row");
     if (a !== "accepted") {
       const ok = el("button", "btn btn-primary", "验收通过");
@@ -1244,6 +1374,12 @@ function drawDrawer(id, t) {
       bad.onclick = () => doReview(t, "reject");
       acts2.append(bad);
     }
+    /* 「让机器审一下」：把这一轮交给审核进程重判一遍。
+     * 机器判完直接改验收状态，**人可以再推翻**——上面那两颗按钮还在。 */
+    const llmBtn = el("button", "btn", llm ? "让机器重审一次" : "让机器审一下");
+    llmBtn.type = "button";
+    llmBtn.onclick = () => requestLlmReview(t);
+    acts2.append(llmBtn);
     const cont = el("button", "btn", "续跑并补充要求");
     cont.type = "button";
     cont.onclick = () => doReview(t, "continue");
@@ -1621,6 +1757,11 @@ function makeWorkflowCard(w) {
   const stats = el("div", "wfc-stats");
   card.append(stats);
 
+  /* 这一批用哪种方式验收。几十行的批量场景里，「这批我全要机器审」
+   * 比逐行去任务里点现实得多。 */
+  const wrev = el("div", "wfc-review");
+  card.append(wrev);
+
   const acts = el("div", "wfc-acts");
   const toggle = el("button", "btn wfc-toggle", "展开");
   toggle.type = "button";
@@ -1630,6 +1771,18 @@ function makeWorkflowCard(w) {
   edit.type = "button";
   edit.onclick = () => openComposerForWorkflow(Number(w.id));
   acts.append(edit);
+  /* 「提交新任务」：**从这张卡片直接开提交框**。
+   *
+   * 场景是「暂停这一批，先去干别的」——用户点了暂停，接着要交新任务，
+   * 而新任务的入口原来只在页面顶部那一栏。绕回去找「＋」在批量场景下
+   * 很难注意到（页面一滚，卡片就看不见了）。
+   *
+   * 它开的仍然是**单个任务**的提交框（setComposerMode("task") 由
+   * openComposer 负责），不是又开一个工作流。 */
+  const newTask = el("button", "btn", "提交新任务");
+  newTask.type = "button";
+  newTask.onclick = () => openComposer();
+  acts.append(newTask);
   /* 「共享」按钮。**能不能看见由 paintWorkflowCard 决定**（owner 或管理员），
    * 这里只是先把节点建出来——卡片是复用的，重建会丢滚动位置与展开状态。 */
   const share = el("button", "btn wfc-share-btn", "共享");
@@ -1702,6 +1855,20 @@ function paintWorkflowCard(card, w) {
     stats.textContent = bits.join(" · ");
   } else {
     stats.textContent = "";
+  }
+
+  /* 验收方式（工作流级）。**跟着谁来的也要写出来**：不写的话，
+   * 「这一批到底走的哪条路」就成了一件猜的事。 */
+  const rv = card.querySelector(".wfc-review");
+  if (rv) {
+    rv.textContent = "";
+    rv.append(el("span", "wfc-review-k", "验收方式"));
+    rv.append(reviewModeSelect(w.review_mode || "", (v) => {
+      setWorkflowReviewMode(w, v);
+    }));
+    const weff = w.review_mode_effective || "human";
+    rv.append(el("span", "wfc-review-n",
+      "现在生效：" + (REVIEW_MODE_LABEL[weff] || weff)));
   }
 
   /* 控制按钮按状态开关：跑完了再点开始没有意义，别的状态下点暂停是空转。 */

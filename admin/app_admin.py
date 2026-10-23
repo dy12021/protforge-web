@@ -292,6 +292,11 @@ class VerifyIn(BaseModel):
     ok: bool = True
 
 
+class ReviewModeIn(BaseModel):
+    """验收方式。human（人工 + 条件判定）/ llm（机器审核）；空串 = 继承。"""
+    review_mode: str = Field(default="", max_length=16)
+
+
 class UserIn(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=200)
@@ -628,8 +633,18 @@ def create_admin_app() -> FastAPI:
     def get_task(task_id: int, user: dict = Depends(require_admin)):
         t = _task_view(store.get_task(task_id, is_admin=True))
         t["pending_artifacts"] = _pending_artifacts(task_id)
+        # **验收方式与机器结论**。值班台是管理员处理「这一批到底算不算过」
+        # 的地方：不给他看机器说了什么，他只能自己逐个产物翻。
+        mode, mode_source = store.resolve_review_mode(t)
         return {"task": t, "events": store.list_events(task_id),
-                "artifacts": store.artifacts.list(task_id)}
+                "artifacts": store.artifacts.list(task_id),
+                "review": {"acceptance": t.get("acceptance") or db.ACCEPTANCE_NONE,
+                           "failures": svc.review.hard_check_failures(
+                               t, store.artifacts.list(task_id)),
+                           "mode": mode,
+                           "mode_source": mode_source,
+                           "mode_override": t.get("review_mode") or "",
+                           "llm": store.latest_task_review(task_id)}}
 
     @app.post("/api/admin/tasks/{task_id}/abort")
     def abort(task_id: int, who: tuple[dict, str] = Depends(require_admin_token)):
@@ -730,6 +745,50 @@ def create_admin_app() -> FastAPI:
         except svc.review.ReviewError as exc:
             raise PanelError(422, str(exc)) from exc
         return _task_view(updated)
+
+    # --- 验收方式 ------------------------------------------------------------
+    #
+    # 「这一轮过不过」由谁来判，三级：任务 > 工作流 > 全局默认。
+    # 全局默认是**平台级**设置，所以改它的入口在值班台（管理员），
+    # 用户面板只能看。
+
+    @app.get("/api/admin/review-settings")
+    def review_settings(user: dict = Depends(require_admin)):
+        return {"review_mode": store.get_global_review_mode(), "source": "global"}
+
+    @app.put("/api/admin/review-settings")
+    def put_review_settings(body: ReviewModeIn, user: dict = Depends(require_admin)):
+        mode = store.normalize_review_mode(body.review_mode)
+        if not mode:
+            raise PanelError(422, "全局默认不能为空")
+        store.set_setting(store.REVIEW_MODE_KEY, mode)
+        return {"review_mode": mode, "source": "global"}
+
+    @app.patch("/api/admin/tasks/{task_id}/review-mode")
+    def patch_task_review_mode(task_id: int, body: ReviewModeIn,
+                               user: dict = Depends(require_admin)):
+        """改这一轮的验收方式。空串 = 回到继承。"""
+        store.get_task(task_id, is_admin=True)
+        mode = store.normalize_review_mode(body.review_mode)
+        updated = store.update_task(task_id, review_mode=mode)
+        store.add_event(task_id, "edited", "admin",
+                        "修改了：review_mode")
+        return _task_view(updated)
+
+    @app.post("/api/admin/tasks/{task_id}/llm-review")
+    def llm_review(task_id: int, user: dict = Depends(require_admin)):
+        """让机器审这一轮。**异步**：巡检接手，请求立刻返回。"""
+        task = store.get_task(task_id, is_admin=True)
+        if str(task.get("status")) != "done":
+            raise PanelError(422, "任务还没算完，审不了")
+        store.update_task(task_id, review_mode=db.REVIEW_MODE_LLM)
+        cleared = store.clear_task_reviews(task_id)
+        if str(task.get("acceptance")) in (db.ACCEPTANCE_ACCEPTED,
+                                          db.ACCEPTANCE_REJECTED):
+            store.set_acceptance(task_id, db.ACCEPTANCE_PENDING)
+        store.add_event(task_id, "note", "admin", "要求机器重新审核这一轮")
+        return {"queued": True, "cleared": cleared,
+                "task": _task_view(store.get_task(task_id, is_admin=True))}
 
     @app.get("/api/admin/tasks/{task_id}/audit")
     def audit_of_task(task_id: int,

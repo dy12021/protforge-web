@@ -64,6 +64,7 @@ import recovery
 import reflection
 import sse
 import store
+import task_reviewer
 import workflow as workflow_mod
 
 log = logging.getLogger(__name__)
@@ -91,6 +92,16 @@ REFLECTION_SWEEP_LIMIT = 3
 # 后台反思线程数。比归档少：归档是本地磁盘 IO，这里每一次都是一次**要花钱的**
 # 模型调用，堆线程只会更快地把 token 花掉，不会更快地拿到结果。
 REFLECTION_WORKERS = 2
+
+# --- 机器审核调参 -------------------------------------------------------------
+# 一轮巡检最多入队几条。审核是**要花钱的**（一次完整的模型调用），
+# 而巡检跑在 tick 主路径上（POLL_INTERVAL=1s）：入队多了不会更快，
+# 只会让排队的审核更、让队列更长。
+REVIEW_SWEEP_LIMIT = 2
+# 后台审核线程数。给 1 就够：一个审核进程就是一台机器上的一份模型调用，
+# 堆线程只会更快地把 token 花掉，不会更快地拿到结论。
+# 刻意**不与计算任务抢并发槽**：审核是事后看结果，不该挡住正在排队的计算。
+REVIEW_WORKERS = 1
 
 # --- 自动恢复调参 -------------------------------------------------------------
 # 后台恢复线程数。给 1 就够：每次评估都是一次**要花钱的**模型调用，
@@ -816,6 +827,20 @@ class Dispatcher:
         self._mem_thread: threading.Thread | None = None
         self._mem_stopped = False
 
+        # --- 机器审核 -----------------------------------------------------------
+        # 审核要 spawn 一个独立的审核进程（agent/run.mjs 的 task 复核模式），
+        # 跑一轮要几分钟。**它不能占调度器的并发槽**——那几条槽是给真正的
+        # 计算任务用的；审核是「事后看结果」，不该把正在排队的计算挡住。
+        # 所以审核单开一条后台线程，与计算完全解耦。
+        self._rev_lock = threading.Lock()
+        self._rev_q: queue.Queue = queue.Queue()
+        #: 已入队或正在审的任务。防止两次 tick 把同一条投两遍——
+        #: 真投两遍就是两个审核进程，而审核是要花钱的。
+        self._rev_inflight: set[int] = set()
+        self._rev_thread: threading.Thread | None = None
+        self._rev_threads: list[threading.Thread] = []
+        self._rev_stopped = False
+
     # --- 并发上限 ---------------------------------------------------------------
 
     def _resolve_limit(self, manual) -> int:
@@ -1128,6 +1153,9 @@ class Dispatcher:
         self._recovery_stop()
         # 长期记忆整理：不打断正在跑的那一次（见 _memory_review_stop）。
         self._memory_review_stop()
+        # 机器审核：同样不打断。审核没做完的那条，任务还停在 pending，
+        # 下次启动巡检会重新扫到它（它还没有 task_reviews 记录）。
+        self._review_stop()
 
     def _loop(self) -> None:
         while not self._stopping:
@@ -1175,6 +1203,12 @@ class Dispatcher:
             self._reflection_pass()
         except Exception:                          # noqa: BLE001
             log.exception("反思巡检出错")
+        # 机器审核排在最后：它只在「这一轮该走机器审」时才有活，
+        # 而且审核本身是**完全后台**的（巡检只入队），放哪儿都不挡路。
+        try:
+            self._review_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("机器审核巡检出错")
         return admitted
 
     # --- 反思 ---------------------------------------------------------------------
@@ -1305,6 +1339,82 @@ class Dispatcher:
         """
         with self._mem_lock:
             self._mem_stopped = True
+
+    # --- 机器审核 -----------------------------------------------------------
+    #
+    # 巡检只做两件事：**查库**、**入队**。审核进程一个都不在这里起。
+    #
+    # 为什么不挂在 _settle 上：终态不止一处会写（正常收口、用户中止、
+    # 打包超时、janitor 清理），只盯一个入口的后果很安静——另外几条路径
+    # 收工的任务永远不会被审。
+
+    def _review_pass(self) -> int:
+        """扫一轮：找「该走机器审、还没审过」的任务，入队。返回入队条数。"""
+        if self._stopping or self._rev_stopped:
+            return 0
+        try:
+            rows = store.list_tasks_needing_llm_review(limit=REVIEW_SWEEP_LIMIT)
+        except Exception:                          # noqa: BLE001
+            log.exception("读取待审核任务失败")
+            return 0
+        queued = 0
+        for row in rows:
+            tid = int(row["id"])
+            with self._rev_lock:
+                if tid in self._rev_inflight:
+                    continue
+                self._rev_inflight.add(tid)
+                self._rev_q.put(tid)
+            queued += 1
+        if queued:
+            self._review_ensure_thread()
+        return queued
+
+    def _review_ensure_thread(self) -> None:
+        with self._rev_lock:
+            if self._rev_stopped:
+                return
+            alive = [t for t in self._rev_threads if t.is_alive()]
+            for i in range(len(alive), REVIEW_WORKERS):
+                t = threading.Thread(target=self._review_loop,
+                                     name=f"review-{i}", daemon=True)
+                t.start()
+                alive.append(t)
+            self._rev_threads = alive
+            self._rev_thread = alive[0] if alive else None
+
+    def _review_loop(self) -> None:
+        """后台审核线程。**任何异常都不许逃出去**——同 _recovery_loop 的理由。"""
+        while True:
+            try:
+                task_id = self._rev_q.get(timeout=1.0)
+            except queue.Empty:
+                if self._stopping or self._rev_stopped:
+                    return
+                continue
+            if task_id is None:                    # stop() 投的结束哨兵
+                return
+            try:
+                res = task_reviewer.run_llm_review(task_id)
+                log.info("任务 %s 的机器审核：%s", task_id, res.get("verdict"))
+            except Exception:                      # noqa: BLE001
+                log.exception("任务 %s 的机器审核出错", task_id)
+            finally:
+                with self._rev_lock:
+                    self._rev_inflight.discard(task_id)
+
+    def _review_stop(self) -> None:
+        """停机：投哨兵。**不等审核跑完**——它最长十几分钟，
+        而停机时在跑的审核会在下次启动后重新扫到（还没写 task_reviews 记录）。
+        """
+        with self._rev_lock:
+            self._rev_stopped = True
+            n = len(self._rev_threads)
+        for _ in range(n + 1):
+            try:
+                self._rev_q.put_nowait(None)
+            except queue.Full:
+                break
 
     def _reflection_pass(self) -> int:
         """扫一轮：找进终态但还没反思的任务，入队。返回入队条数。"""

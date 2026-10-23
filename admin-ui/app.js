@@ -592,6 +592,12 @@ function ownerName(id) {
   return u ? u.username : ("#" + id);
 }
 
+/* 验收方式。三级：任务 > 工作流 > 全局默认；**空串 = 继承上层**。 */
+const REVIEW_MODE_LABEL = {
+  human: "人工 + 条件判定",
+  llm: "机器审核",
+};
+
 /* 危险动作（中止 / 改状态 / 重跑）一律两步确认，与用户端的删除同理。 */
 function taskActs(t) {
   const box = el("div", "row-acts");
@@ -623,7 +629,45 @@ function taskActs(t) {
     accept.onclick = () => doAccept(t);
     box.append(accept);
   }
+  /* 「让机器审一下」：把这一轮交给审核进程重判一遍。
+   * 机器判完直接改验收状态，**人可以再推翻**——「验收通过」那颗按钮还在。 */
+  if (t.status === "done") {
+    const llm = el("button", "btn", "让机器审一下");
+    llm.type = "button";
+    llm.onclick = () => doLlmReview(t);
+    box.append(llm);
+  }
   return box;
+}
+
+/* 值班台让机器审这一轮。**异步**：审核要另起一个独立进程跑几分钟，
+ * 所以请求立刻就回，审完再刷新。
+ *
+ * **已经定了结论的要先说清影响面**：重新打开 = 回到「待验收」，
+ * 机器判完直接改结论——人打回过的意见也会被机器的结论盖掉。 */
+async function doLlmReview(t) {
+  const a = t.acceptance || "none";
+  if (a === "accepted" || a === "rejected") {
+    const yes = await confirmAction({
+      title: "让机器重新审这一轮？",
+      lead: "这一轮已经有结论了。重新审会把它放回「待验收」，机器判完直接改结论。",
+      items: [
+        a === "accepted" ? "当前的「已验收」会被撤掉" : "当前的「验收没通过」会被撤掉",
+        "机器判完直接改成通过或不通过",
+        "之前打回时写的意见不会再影响这一轮的结论",
+      ],
+      okLabel: "确认重新审",
+    });
+    if (!yes) return;
+  }
+  try {
+    await api("POST", "/tasks/" + t.id + "/llm-review", {});
+    setMsg(document.getElementById("board-msg"),
+      "任务 #" + t.id + " 已交给审核进程，过一会儿刷新看结论", "ok");
+    await load();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "机器审核没排上", "bad");
+  }
 }
 
 /* 值班台代替用户验收。**不做两步确认**：它只是把「算好了」标成「认了」，
@@ -1244,6 +1288,13 @@ function workflowRow(w) {
   pend.append(el("span", "chip " + (np ? "chip-review" : "chip-none"),
     np ? ("未验收 " + np + " 行") : "无待验收"));
   tr.append(pend);
+  /* **这一批用哪种方式验收**。几十行的批量场景里，「这批我全要机器审」
+   * 比逐行去任务里点现实得多。跟着谁来的也要写出来。 */
+  const rmode = el("td", "c-state");
+  const eff = w.review_mode_effective || "human";
+  rmode.append(el("span", "chip chip-none",
+    "验收：" + (REVIEW_MODE_LABEL[eff] || eff)));
+  tr.append(rmode);
   const total = Number(w.total_rows) || 0;
   const done = Number(w.cursor) || 0;
   tr.append(el("td", "c-time", done + " / " + total + " 行"));
@@ -1740,9 +1791,42 @@ async function loadStatus() {
   }
 }
 
+/* 全局默认验收方式。**这是平台级设置**，所以入口在值班台（管理员），
+ * 用户面板只能看。改完立刻生效：后面新算完的任务按新的方式判。 */
+async function loadReviewDefault() {
+  const sel = document.getElementById("review-mode-default");
+  const note = document.getElementById("review-mode-note");
+  if (!sel) return;
+  try {
+    const o = await api("GET", "/review-settings");
+    sel.value = o.review_mode || "human";
+    /* 监听每次都重挂：它只保留最后一个，重复挂不会叠加。 */
+    sel.onchange = () => setReviewDefault(sel.value);
+    if (note) {
+      note.textContent = "没单独设过的任务都按这个来；"
+        + "任务与工作流可以各自覆盖。";
+    }
+  } catch (e) {
+    if (note) note.textContent = "验收方式默认取不到";
+  }
+}
+
+async function setReviewDefault(mode) {
+  try {
+    await api("PUT", "/review-settings", { review_mode: mode });
+    setMsg(document.getElementById("board-msg"),
+      "默认验收方式已改：" + (REVIEW_MODE_LABEL[mode] || mode), "ok");
+    await load();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "改不动默认验收方式", "bad");
+    await loadReviewDefault();
+  }
+}
+
 async function boot() {
   // 状态面板：先画它，别让它拖住别的。取不到也不该让面板整个空着。
   loadStatus().catch(() => {});
+  loadReviewDefault().catch(() => {});
   try {
     state.me = await api("GET", "/me");
     document.getElementById("who").textContent =

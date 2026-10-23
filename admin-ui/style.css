@@ -557,3 +557,30 @@ button:disabled { opacity: .45; cursor: default; }
 .sp-bar { height: 5px; border-radius: 999px; background: var(--line); overflow: hidden; margin-top: .18rem; }
 .sp-bar-fill { height: 100%; background: var(--st-running); border-radius: 999px; }
 .sp-note-line { font-size: .74rem; color: var(--fg-dim); }
+
+/* 验收方式默认那一行。**放在状态面板里**：它是平台现状的一部分，
+ * 也是平台级设置的唯一入口（用户面板只能看）。 */
+.sp-setting {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-top: .5rem;
+  padding-top: .45rem;
+  border-top: 1px solid var(--line);
+}
+.sp-setting-k { font-size: .74rem; color: var(--fg-dim); flex: none; }
+.sp-setting .sp-note { margin-left: 0; }
+.review-mode-select {
+  font: inherit;
+  font-size: .78rem;
+  padding: .25rem .4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--card);
+  color: var(--fg);
+}
+.review-mode-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

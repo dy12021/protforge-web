@@ -1100,3 +1100,83 @@ button { cursor: pointer; }
 .wf-col-slot { font-family: var(--mono); }
 .wf-col-warn { margin: .1rem 0 0; font-size: .78rem; color: var(--fg-dim); }
 .wf-col-warn.is-bad { color: var(--st-failed); }
+
+/* --- 验收方式 -------------------------------------------------------------
+ * 一行三件：标签、下拉、说明。说明里带「现在生效 + 跟着谁来的」，
+ * 因为只给一个结果而不给来路，用户就改不动它。 */
+.review-mode-row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin: .45rem 0 .6rem;
+}
+.review-mode-k {
+  font-size: .8rem;
+  color: var(--fg-dim);
+  flex: none;
+}
+.review-mode-select {
+  font: inherit;
+  font-size: .82rem;
+  padding: .28rem .4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--card);
+  color: var(--fg);
+}
+.review-mode-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.review-mode-note {
+  font-size: .78rem;
+  color: var(--fg-dim);
+}
+
+/* 机器审核的结论。**与人的验收结论分开摆**：一个是机器的依据，
+ * 一个是这一轮算不算交付完成。 */
+.review-llm {
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
+  margin: .55rem 0;
+  padding: .5rem .65rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--st-packaging);
+  border-radius: var(--r-sm);
+  background: var(--lift);
+}
+.review-llm-k {
+  font-size: .82rem;
+  font-weight: 600;
+  color: var(--st-packaging);
+}
+.review-llm-t {
+  font-size: .82rem;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.review-llm-time {
+  font-size: .74rem;
+  color: var(--fg-dim);
+}
+
+/* 工作流卡片上的那一行。**放在进度条下面、按钮上面**：
+ * 它是这一批的设置，不是这一批的状态。 */
+.wfc-review {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-wrap: wrap;
+  margin: .3rem 0 .1rem;
+}
+.wfc-review-k {
+  font-size: .75rem;
+  color: var(--fg-dim);
+  flex: none;
+}
+.wfc-review-n {
+  font-size: .74rem;
+  color: var(--fg-dim);
+}
