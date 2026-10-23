@@ -530,7 +530,10 @@ function filteredTasks() {
   const q = state.filter.q.toLowerCase();
   return state.tasks.filter(t => {
     if (state.filter.activeOnly && !ACTIVE_STATUSES.has(t.status)) return false;
-    if (state.filter.status && t.status !== state.filter.status) return false;
+    if (state.filter.status === "pending") {
+      /* 「待验收」是**另一根轴**（acceptance），不是 status。单独判。 */
+      if (t.acceptance !== "pending") return false;
+    } else if (state.filter.status && t.status !== state.filter.status) return false;
     if (!q) return true;
     return ((t.title || "") + " " + (t.brief || "") + " " + (t.step || ""))
       .toLowerCase().includes(q);
@@ -1178,7 +1181,11 @@ function fillSelect(sel, items, current) {
 function syncAuditFilters() {
   fillSelect(document.getElementById("status-filter"),
     [{ value: "", label: "全部状态" }].concat(
-      Object.keys(STATUS_LABEL).map(k => ({ value: k, label: STATUS_LABEL[k] }))),
+      Object.keys(STATUS_LABEL).map(k => ({ value: k, label: STATUS_LABEL[k] })))
+      /* 「待验收」不是 status，是 acceptance 这根轴——**单独加**，
+       * 不能塞进 STATUS_LABEL：那张表是状态词表，statusChip 也在用它，
+       * 塞进去会造出一个不存在的状态。 */
+      .concat([{ value: "pending", label: "待验收" }]),
     state.filter.status);
   fillSelect(document.getElementById("audit-task"),
     [{ value: "", label: "全部任务" }].concat(

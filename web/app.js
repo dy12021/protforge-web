@@ -123,17 +123,25 @@ const FILTER_OPTIONS = [
   { key: "packaging", label: "打包中" },
   { key: "paused", label: "已暂停" },
   { key: "done", label: "已完成" },
+  { key: "pending", label: "待验收" },
   { key: "failed", label: "失败" },
 ];
 const FILTER_TASKS = {
   active: ["queued", "running", "packaging"],
   queued: ["queued"], running: ["running"], packaging: ["packaging"],
   paused: [], done: ["done"], failed: ["failed"],
+  /* 「待验收」**不是状态**，是另一根轴（acceptance）——不走这张表，
+   * 在 filtered() 里单独判。留个空数组是为了让「这一档不按 status 过滤」
+   * 这件事在表上看得见。 */
+  pending: [],
 };
 const FILTER_WORKFLOWS = {
   active: ["draft", "running", "paused"],
   queued: ["draft"], running: ["running"], packaging: [],
   paused: ["paused"], done: ["finished"], failed: [],
+  /* 工作流这边同理：「待验收」指的是**这一批里还有行没人认**，
+   * 不是工作流这个对象的状态。 */
+  pending: [],
 };
 /* 「只看在跑的」覆盖的那一档（与 active 同一口径）。 */
 const ACTIVE_TASKS = ["queued", "running", "packaging"];
@@ -500,7 +508,12 @@ function buildCols() {
 function filtered() {
   const q = state.filter.q.toLowerCase();
   return state.items.filter(t => {
-    if (state.filter.status) {
+    if (state.filter.status === "pending") {
+      /* 「待验收」是**另一根轴**（acceptance），不是 status。单独判：
+       * 算完了但没人认的结果，在这批跑完之后会攒下一堆，
+       * 没有这一档就找不到它们。 */
+      if (t.acceptance !== "pending") return false;
+    } else if (state.filter.status) {
       const allow = FILTER_TASKS[state.filter.status] || [];
       if (allow.indexOf(t.status) < 0) return false;
     }
@@ -1488,7 +1501,11 @@ function isFailedRow(row, skips) {
 function filteredWorkflows() {
   const q = state.filter.q.toLowerCase();
   return state.workflows.filter(w => {
-    if (state.filter.status) {
+    if (state.filter.status === "pending") {
+      /* 工作流这边：「待验收」指的是**这一批里还有行没人认**，
+       * 不是工作流这个对象的状态。 */
+      if (!(Number(w.pending_acceptance_rows) > 0)) return false;
+    } else if (state.filter.status) {
       const allow = FILTER_WORKFLOWS[state.filter.status] || [];
       if (allow.indexOf(w.status) < 0) return false;
     }
