@@ -23,11 +23,20 @@
  *   PROTORGE_LLM_PROVIDER / PROTORGE_LLM_MODEL   显式指定模型。不指定就由 pi 自己
  *                          挑「第一个可用模型」，空配置下等于没有模型。
  *
- * 复核模式（PROTFORGE_WEB_REVIEW_MODE=1）：
- *   整理长期记忆的**常规计算进程**。它不是管理员，也不属于任何任务：
- *   没有 agent 令牌、没有任务号，因此碰不到平台的任何管理能力
- *   （管理端点、改技能仓库、删任务）。它能做的就是文件工具、命令和联网检索。
+ * 复核模式（PROTFORGE_WEB_REVIEW_MODE）：
+ *   '1' 或 'memory' —— 整理长期记忆的**常规计算进程**。
+ *   'task'          —— **任务审核进程**：开一轮全新的上下文，去核某一个
+ *                      已完成任务的产物满不满足原始需求。
+ *   两者都不是管理员，也不属于任何任务：没有 agent 令牌、没有任务号，
+ *   因此碰不到平台的任何管理能力（管理端点、改技能仓库、删任务）。
+ *   它们能做的就是文件工具、命令和联网检索。
  *   需求写在 PROTFORGE_WEB_REVIEW_BRIEF_PATH 指的那个文件里，跑完一轮就退出。
+ *
+ *   'task' 模式另有一个环境变量：
+ *   PROTFORGE_WEB_REVIEW_READONLY_ROOTS  只读根（多个用 ';' 分隔）。
+ *                      审核进程**可以读**这些目录里的东西（例如被审任务的
+ *                      产物原件），但**不许写、不许改、不许删**——
+ *                      机器审核要是能改交付物，被审的就不是原来那份了。
  */
 
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -75,13 +84,28 @@ function required(name) {
 }
 
 /**
- * 复核模式：整理长期记忆的**常规计算进程**。
+ * 复核模式：两种身份，都是**常规计算进程**。
  *
- * 它不是管理员，也不属于任何任务：没有 agent 令牌、没有任务号，
+ * 'memory' —— 整理长期记忆。
+ * 'task'  —— 审核某一个已完成的任务。
+ *
+ * 两者都不是管理员，也不属于任何任务：没有 agent 令牌、没有任务号，
  * 因此碰不到平台的任何管理能力（管理端点、改技能仓库、删任务）。
- * 它能做的就是文件工具 + 命令 + 联网检索。
  */
-const REVIEW_MODE = process.env.PROTFORGE_WEB_REVIEW_MODE === '1';
+const REVIEW_MODE_RAW = (process.env.PROTFORGE_WEB_REVIEW_MODE || '').trim();
+const REVIEW_KIND = REVIEW_MODE_RAW === '1' ? 'memory'
+  : (REVIEW_MODE_RAW === 'memory' || REVIEW_MODE_RAW === 'task' ? REVIEW_MODE_RAW : '');
+if (REVIEW_MODE_RAW && !REVIEW_KIND) {
+  console.error(`[agent] 致命：未知的复核模式「${REVIEW_MODE_RAW}」（只能是 memory / task）`);
+  process.exit(2);
+}
+const REVIEW_MODE = !!REVIEW_KIND;
+
+/** 只读根：能读、不能写。多个用 ';' 分隔。 */
+const READONLY_ROOTS = (process.env.PROTFORGE_WEB_REVIEW_READONLY_ROOTS || '')
+  .split(';')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const INTERNAL = REVIEW_MODE
   ? (process.env.PROTFORGE_WEB_INTERNAL || '')
@@ -198,11 +222,15 @@ console.log = console.error; // stdout 归 RPC 独占
 
 /**
  * 复核模式的系统规则。**只讲边界，不讲任务**——
- * 具体要做什么写在 brief 里（服务端生成，见 server/memory.py 的
- * ``build_review_brief``）。边界必须在这里说死：这个进程是常规权限，
- * 它碰到的每一条「顺手把技能仓库改了」的冲动都要被挡住。
+ * 具体要做什么写在 brief 里（服务端生成）。边界必须在这里说死：
+ * 这个进程是常规权限，它碰到的每一条「顺手把顺手改了」的冲动都要被挡住。
+ *
+ * 两种身份两套规则，因为**它们被允许做的事根本不同**：
+ * 记忆复核要动长期记忆文件（那本来就是它的活），任务审核**什么都不许动**。
  */
-const REVIEW_RULES = `
+
+/** 长期记忆复核：整理知识，不碰交付物。 */
+const REVIEW_RULES_MEMORY = `
 
 ## 你的身份与边界
 
@@ -213,6 +241,26 @@ const REVIEW_RULES = `
 - **不要往长期记忆里新增经验**：经验的第一手来源是干活的计算进程，不是你。
   你的活是整理（查证、删掉失效的、改写过时的），不是积累。
 - 整理完按 brief 里说的写复核记录，然后结束。`;
+
+/** 任务审核：只读地看，独立地判。 */
+const REVIEW_RULES_TASK = `
+
+## 你的身份与边界
+
+- 你是「自动化计算平台」的**任务审核进程**，权限是**常规权限**：
+  你没有管理员令牌，碰不到管理端点，不许改技能仓库、不许删任务、不许提交 git。
+- 你是**独立的一轮**：你和当初干活的计算进程**不是同一个上下文**，
+  你没看过它怎么想的，只看它交出来的东西和你手里的需求。
+  这正是让你来审的原因——自己审自己不算审。
+- 你要做的**只有一件事**：按 brief 里写的要求，判断这一轮满不满足原始需求。
+- **只读**：brief 里指明的那个目录（被审任务的产物原件）**只许读，不许写、
+  不许改、不许删、不许移动**。守卫会挡；你要是在那里改了，被审的就不是原来那份了。
+- **不要重算**：不许跑 ProtForge 技能链去「自己算一遍看看对不对」。
+  那是干活的计算进程的活。你要看的是**它交出来的**东西。
+- 你可以用 read / bash 这些工具看文件，也可以联网检索查判据。
+- 写结论：按 brief 里说的路径写一个 JSON 文件，写完就结束。
+- **不要猜**：看不清就判 fail 并在 reason 里说清「哪里看不清」。
+  判错的代价是人再看一遍；瞎写一个 pass 的代价是坏结果被当成交付。`;
 
 // ---------------------------------------------------------------- 组装
 
@@ -254,7 +302,14 @@ async function main() {
     // 把工具问题写进当天的日期文件。这两个目录是平台自己的地盘，
     // 明确列进允许根，写工具才合法（守卫默认只放行工作目录、
     // ProtForge 数据区与几个固定路径，而平台数据根不在其中）。
-    fileRoots: MEMORY_ROOTS,
+    // 长期记忆与工具问题目录**只有记忆复核进程能写**。
+    // 任务审核进程只许写它自己的工作目录：它的活是出结论，不是沉淀经验——
+    // 往长期记忆里塞「审核经验」会把第一手来源搞脏。
+    fileRoots: REVIEW_KIND === 'memory' ? MEMORY_ROOTS : [],
+    // **只读根**（只在任务审核模式下有值）：能读、不能写。
+    // 没有这一层，审核进程理论上能改掉被审任务的产物——
+    // 那份产物就不再是被审的那份，审核结论也就没有意义了。
+    readOnlyRoots: READONLY_ROOTS,
     // 每条命令（含被守卫拦下的）都上报审计，落 audit_log。
     // 这是规格 §14「所有 bash 调用全量记入审计日志」在 agent 侧的一半；
     // 另一半是 server/app.py 的 POST /api/internal/agent/{id}/audit。
@@ -349,6 +404,15 @@ async function main() {
         extras.modelRuntime = mr;
         extras.model = found;
         log(`模型：${LLM_PROVIDER}/${LLM_MODEL}`);
+        // 密钥是不是真的在？模型配好了但没密钥的话，请求会 401，
+        // 而失败长得像成功——所以在这里就把它说清楚。
+        try {
+          if (typeof mr.hasConfiguredAuth === 'function'
+              && !mr.hasConfiguredAuth(LLM_PROVIDER)) {
+            log(`警告：${LLM_PROVIDER} 这个 provider 没有可用的凭据，`
+              + `模型请求大概率 401`);
+          }
+        } catch { /* 查不到就算了，不影响主流程 */ }
       } else {
         const have = mr.getModels(LLM_PROVIDER).map((m) => m.id);
         log(`模型配置里没有 ${LLM_PROVIDER}/${LLM_MODEL}；`
@@ -373,6 +437,11 @@ async function main() {
       sessionManager: sm,
       noTools: 'builtin',
       customTools,
+      // **模型必须显式交给会话**。少了这一行，会话会退回「挑第一个可用的
+      // 模型」——而内置的 minimax/MiniMax-M2.7 在默认表里排前面，
+      // 拿到的却是给 openai-completions 端点的密钥，每次请求 401，
+      // 而进程退出码还是 0：失败长得像成功。
+      ...(extras.model ? { model: extras.model } : {}),
     });
     return { session, extensionsResult, services, diagnostics: services.diagnostics };
   };
@@ -407,9 +476,50 @@ async function main() {
       log('复核提示词是空的，没什么可整理，退出');
       process.exit(2);
     }
-    log(`进入复核模式，提示词 ${briefPath}，工作目录 ${WORK_DIR}`);
-    await runtime.session.prompt(brief);
+    log(`进入复核模式（${REVIEW_KIND}），提示词 ${briefPath}，工作目录 ${WORK_DIR}`);
+    /* **把会话事件打出来**：复核进程是一次性的，跑完就退出——
+     * 它没有页面、没有流、也没有人盯着。所以「它到底干了什么」只剩日志这一条路。
+     * 不打的话，「模型请求失败」与「模型干完了」在日志里长得一模一样。 */
+    const unsubscribe = runtime.session.subscribe((ev) => {
+      try {
+        const type = ev && ev.type ? ev.type : '?';
+        // **message_update 是逐字增量**：每次模型吐字都来一次，打出来就是几百行。
+        // 只记它的类型，不记内容；真正要看的是 message_end 那一坨。
+        if (type === 'message_update') {
+          updateCount += 1;
+          if (updateCount % 50 === 0) log(`事件 message_update ×${updateCount}`);
+          return;
+        }
+        const body = JSON.stringify(ev, (k, v) => (k === 'content' ? undefined : v));
+        log(`事件 ${type}：${String(body).slice(0, 700)}`);
+      } catch (e) {
+        log(`事件打不出来：${e?.message ?? e}`);
+      }
+    });
+    let updateCount = 0;
+    let out;
+    try {
+      out = await runtime.session.prompt(brief);
+    } catch (e) {
+      log(`复核这一轮抛错了：${e?.message ?? e}`);
+      if (e?.stack) log(String(e.stack).split('\n').slice(0, 8).join('\n'));
+      throw e;
+    }
+    // **复核跑完到底干了什么**：只打「跑完了」的话，「它什么都没干」
+    // 与「它干完了」在日志里长得一模一样——而前者是最难查的那种故障。
+    try {
+      const text = typeof out === 'string' ? out
+        : (out && typeof out.text === 'string' ? out.text : '');
+      log(`复核跑完一轮，回复 ${String(text).length} 字：`
+        + String(text).slice(0, 400).replace(/\s+/g, ' '));
+      if (out && Array.isArray(out.messages)) {
+        log(`消息条数：${out.messages.length}`);
+      }
+    } catch (e) {
+      log(`复核回复取不出来：${e?.message ?? e}`);
+    }
     log('复核跑完一轮，退出');
+    try { unsubscribe(); } catch { /* 退订失败不影响结果 */ }
     return;
   }
 
@@ -433,10 +543,12 @@ analyze_bdnf.py 2>&1 | tail」——被截断到 70 字符，经常断在半截�
 
 /** 把平台规则追加到 pi 自己生成的 system prompt 之后。 */
 function platformRulesExtension() {
+  const rules = REVIEW_KIND === 'task' ? REVIEW_RULES_TASK
+    : (REVIEW_KIND === 'memory' ? REVIEW_RULES_MEMORY : PLATFORM_RULES);
   return (pi) => {
     pi.on('before_agent_start', async (event) => {
       const base = event?.systemPrompt ?? '';
-      return { systemPrompt: `${base}${REVIEW_MODE ? REVIEW_RULES : PLATFORM_RULES}` };
+      return { systemPrompt: `${base}${rules}` };
     });
   };
 }

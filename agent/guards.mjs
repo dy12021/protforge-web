@@ -339,7 +339,10 @@ function makeContext(opts) {
   const fileRoots = [...allowedFileRoots(), ...(opts.fileRoots || [])];
   // 工作目录本身就是允许写入的范围，redirect/删除判定都要算上它。
   if (opts.workDir) fileRoots.push(opts.workDir);
-  return { fileRoots, dockerRoots: dockerRoots(), workDir: opts.workDir };
+  // **只读根**：允许读、禁止写/改/删。审核进程用它去看被审任务的产物，
+  // 又不许把交付物改了——机器审核改了交付物，那份交付物就不是被审的那份了。
+  const readOnlyRoots = [...(opts.readOnlyRoots || [])];
+  return { fileRoots, readOnlyRoots, dockerRoots: dockerRoots(), workDir: opts.workDir };
 }
 
 // ------------------------------------------------------------------ 遍历
@@ -423,6 +426,9 @@ function visitRedirect(redir, ctx) {
   if (isNullDevice(value)) return OK;
   if (!isAbsoluteLike(value)) return OK; // 相对路径落在 cwd（= 工作目录）内
   if (isHomePath(value)) return bad('重定向到家目录，禁止');
+  if (ctx.readOnlyRoots.length && isUnderAny(value, ctx.readOnlyRoots)) {
+    return bad(`重定向写进只读区：${value}`);
+  }
   if (!isUnderAny(value, ctx.fileRoots)) {
     return bad(`重定向写到允许范围之外：${value}`);
   }
@@ -648,6 +654,9 @@ function checkDestructive(base, words, ctx) {
     }
     if (isHomePath(value)) return bad(`${base} 指向家目录，禁止：${value}`);
     if (!isAbsoluteLike(value)) continue;           // 相对路径落在 cwd 内
+    if (ctx.readOnlyRoots.length && isUnderAny(value, ctx.readOnlyRoots)) {
+      return bad(`${base} 作用于只读区：${value}`);
+    }
     if (!isUnderAny(value, ctx.fileRoots)) {
       return bad(`${base} 作用于允许范围之外的路径：${value}`);
     }
@@ -900,11 +909,22 @@ export function createGuardedBashOperations(opts, base = null) {
   };
 }
 
-/** 文件工具的路径限制：只允许读工作目录与声明的根。 */
-function confine(absolutePath, opts, what) {
+/** 文件工具的路径限制：只允许读工作目录与声明的根。
+ *
+ * `mode` 区分读与写：
+ * - `'read'` ：允许根之外还允许**只读根**（审核进程要看被审任务的产物）；
+ * - `'write'`：只读根里的路径一律拒——审核进程能看，不能改。
+ */
+function confine(absolutePath, opts, what, mode = 'read') {
   const allowed = allowedFileRoots();
   if (opts.workDir) allowed.push(opts.workDir);
-  if (!isUnderAny(absolutePath, [...allowed, ...(opts.fileRoots || [])])) {
+  const roots = [...allowed, ...(opts.fileRoots || [])];
+  const readOnly = opts.readOnlyRoots || [];
+  if (mode !== 'write' && readOnly.length) roots.push(...readOnly);
+  if (mode === 'write' && readOnly.length && isUnderAny(absolutePath, readOnly)) {
+    throw new Error(`${what} 被安全守卫拒绝：${absolutePath} 在只读区内，只能读不能改`);
+  }
+  if (!isUnderAny(absolutePath, roots)) {
     throw new Error(`${what} 被安全守卫拒绝：${absolutePath} 不在工作目录或允许的根内`);
   }
   return absolutePath;
@@ -914,10 +934,10 @@ function confine(absolutePath, opts, what) {
 export async function createGuardedReadOperations(opts, base) {
   const inner = base || (await defaultReadOperations());
   return {
-    readFile: (p) => inner.readFile(confine(p, opts, '读取')),
-    access: (p) => inner.access(confine(p, opts, '读取')),
+    readFile: (p) => inner.readFile(confine(p, opts, '读取', 'read')),
+    access: (p) => inner.access(confine(p, opts, '读取', 'read')),
     detectImageMimeType: inner.detectImageMimeType
-      ? (p) => inner.detectImageMimeType(confine(p, opts, '读取'))
+      ? (p) => inner.detectImageMimeType(confine(p, opts, '读取', 'read'))
       : undefined,
   };
 }
@@ -926,8 +946,8 @@ export async function createGuardedReadOperations(opts, base) {
 export async function createGuardedWriteOperations(opts, base) {
   const inner = base || (await defaultWriteOperations());
   return {
-    writeFile: (p, c) => inner.writeFile(confine(p, opts, '写入'), c),
-    mkdir: (d) => inner.mkdir(confine(d, opts, '创建目录')),
+    writeFile: (p, c) => inner.writeFile(confine(p, opts, '写入', 'write'), c),
+    mkdir: (d) => inner.mkdir(confine(d, opts, '创建目录', 'write')),
   };
 }
 
@@ -935,9 +955,9 @@ export async function createGuardedWriteOperations(opts, base) {
 export async function createGuardedEditOperations(opts, base) {
   const inner = base || (await defaultEditOperations());
   return {
-    readFile: (p) => inner.readFile(confine(p, opts, '编辑读取')),
-    writeFile: (p, c) => inner.writeFile(confine(p, opts, '编辑写入'), c),
-    access: (p) => inner.access(confine(p, opts, '编辑')),
+    readFile: (p) => inner.readFile(confine(p, opts, '编辑读取', 'read')),
+    writeFile: (p, c) => inner.writeFile(confine(p, opts, '编辑写入', 'write'), c),
+    access: (p) => inner.access(confine(p, opts, '编辑', 'read')),
   };
 }
 
