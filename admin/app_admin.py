@@ -716,6 +716,21 @@ def create_admin_app() -> FastAPI:
                                    message="管理员把任务放回队列")
         return _task_view(updated)
 
+    @app.post("/api/admin/tasks/{task_id}/accept")
+    def accept_task(task_id: int, user: dict = Depends(require_admin)):
+        """值班台代替用户验收：这一轮的结果算交付完成。
+
+        算完 ≠ 交付完成——任务打包完只是「算好了」，还没人认。值班台的任务表
+        里挂了「待验收」芯片，不给个能点的入口就成了只读摆设。
+
+        **幂等**：已经验收过的再点一次不报错（前端按钮也只在待验收时出现）。
+        """
+        try:
+            updated = svc.review.accept(int(task_id), actor="admin")
+        except svc.review.ReviewError as exc:
+            raise PanelError(422, str(exc)) from exc
+        return _task_view(updated)
+
     @app.get("/api/admin/tasks/{task_id}/audit")
     def audit_of_task(task_id: int,
                       after_id: int = Query(default=0, ge=0),

@@ -185,6 +185,9 @@ button:disabled { opacity: .45; cursor: default; }
 .btn:hover { background: var(--lift); }
 .btn-warn { color: var(--st-failed); border-color: var(--st-failed); background: transparent; }
 .btn-warn:hover { background: color-mix(in srgb, var(--st-failed) 8%, transparent); }
+/* 「验收通过」是**正事**（交付完成），与「中止」那种危险动作不同色。 */
+.btn-primary { background: var(--st-done); color: #fff; border-color: var(--st-done); }
+.btn-primary:hover { filter: brightness(1.06); }
 
 /* 干预框：默认收起，点「干预」才展开。它是 textarea 容器，
  * display:flex 与 [hidden] 同特异性，必须配伴生规则。 */

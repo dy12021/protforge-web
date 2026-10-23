@@ -610,7 +610,30 @@ function taskActs(t) {
   retry.disabled = live;
   retry.onclick = () => doRetry(t);
   box.append(retry);
+
+  /* 「验收通过」：**只对待验收的任务出现**。算完了但结果还没人认——
+   * 值班台上已经挂了「待验收」芯片，不给个能点的入口就成了只读摆设。
+   * 已验收的不再给这个按钮（点了也没意义）。 */
+  if (t.status === "done" && t.acceptance === "pending") {
+    const accept = el("button", "btn btn-primary", "验收通过");
+    accept.type = "button";
+    accept.onclick = () => doAccept(t);
+    box.append(accept);
+  }
   return box;
+}
+
+/* 值班台代替用户验收。**不做两步确认**：它只是把「算好了」标成「认了」，
+ * 没有不可撤销的后果（不满意还能单独打回续跑那一行）。 */
+async function doAccept(t) {
+  try {
+    await api("POST", "/tasks/" + t.id + "/accept", {});
+    setMsg(document.getElementById("board-msg"),
+      "任务 #" + t.id + " 已验收", "ok");
+    await load();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "验收失败", "bad");
+  }
 }
 
 async function doAbort(t) {

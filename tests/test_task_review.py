@@ -379,6 +379,45 @@ def test_workflow_batch_accept_specific_rows(alice, client):
     assert len(store.workflow_rows_awaiting_acceptance(wid)) == 1
 
 
+def test_admin_panel_can_accept_a_task(root, alice):
+    """值班台代替用户验收。
+
+    值班台的任务表里挂着「待验收」芯片，不给个能点的入口就成了只读摆设。
+    """
+    import app_admin
+
+    task = _done_task(_uid("alice"))
+    review.mark_pending(task["id"])
+    panel = TestClient(app_admin.create_admin_app())
+    r = panel.post(f"/api/admin/tasks/{task['id']}/accept",
+                   headers=_headers(root))
+    assert r.status_code == 200, r.text
+    assert r.json()["acceptance"] == db.ACCEPTANCE_ACCEPTED
+
+
+def test_admin_panel_can_accept_workflow_rows(root, alice):
+    """值班台也能整批验收。"""
+    import app_admin
+
+    wf = store.create_workflow(_uid("alice"), "批次", "查 {{seq}}")
+    wid = int(wf["id"])
+    row = store.create_task("第 1 行", "x", owner_id=_uid("alice"),
+                            actor="system", workflow_id=wid, workflow_row=0)
+    tid = int(row["id"])
+    store.artifacts.add(tid, f"work/{tid}/r.pdb", "r.pdb", size=10)
+    store.update_task(tid, summary="算完了")
+    store.set_status(tid, "done", actor="system", message="ok")
+    review.mark_pending(tid)
+
+    panel = TestClient(app_admin.create_admin_app())
+    r = panel.post(f"/api/admin/workflows/{wid}/accept", headers=_headers(root),
+                   json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["count"] == 1
+    assert store.get_task(tid, is_admin=True)["acceptance"] \
+        == db.ACCEPTANCE_ACCEPTED
+
+
 # ---------------------------------------------------------------- 接线
 
 
