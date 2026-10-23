@@ -790,11 +790,16 @@ function doReview(t, mode) {
   const dlg = document.getElementById("review");
   document.getElementById("rv-title").textContent =
     mode === "reject" ? "打回并补充要求" : "续跑并补充要求";
+  /* **说清楚结果表那一格会被覆盖**。这是平台的既有语义（最新一轮的结果
+   * 就是表里那一格；失败轮次就写「失败」），跟「重跑」一样——但用户
+   * 不知道这一条，事后看到好结果变成「失败」会以为出了故障。 */
   document.getElementById("rv-lead").textContent = mode === "reject"
     ? "这一轮的结果不认。写清楚哪里不行，它会带着这段话再跑一遍；"
       + "上一轮的产物留在工作目录里，模型可以接着改。"
+      + "（结果表里那一格会被这一轮的结果覆盖。）"
     : "同一个任务接着干。上一轮的产物留在工作目录里，"
-      + "写清楚还要什么，它会在那基础上继续。";
+      + "写清楚还要什么，它会在那基础上继续。"
+      + "（结果表里那一格会被这一轮的结果覆盖。）";
   document.getElementById("rv-note-k").textContent = "补充要求";
   document.getElementById("rv-ok").textContent =
     mode === "reject" ? "打回并续跑" : "续跑";
