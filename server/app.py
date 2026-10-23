@@ -205,9 +205,16 @@ def _task_view(task: dict) -> dict:
 
 
 def _detail(task: dict) -> dict:
+    arts = store.artifacts.list(task["id"])
     return {"task": _task_view(task),
             "events": store.list_events(task["id"]),
-            "artifacts": store.artifacts.list(task["id"])}
+            "artifacts": arts,
+            # **验收状态与硬条件没过的原因**。原因必须跟着详情一起给：
+            # 只写进时间线的话，用户得翻到最下面才知道自己为什么被拒——
+            # 而他正要做的决定（认不认、续不续跑）就在验收区里做。
+            # artifacts 传进去复用，别为这个再查一遍库。
+            "review": {"acceptance": task.get("acceptance") or db.ACCEPTANCE_NONE,
+                       "failures": review.hard_check_failures(task, arts)}}
 
 
 def _delete_task_row(task_id: int) -> None:

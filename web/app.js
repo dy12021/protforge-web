@@ -185,6 +185,7 @@ const state = {
   openId: null,         // 抽屉当前开着的任务
   drawerMsg: null,      // 抽屉里的提示条（存 state，重绘时才贴得住）
   taskArts: new Map(),  // taskId -> 产物清单（验收区要显示「这一轮交了什么」）
+  taskReview: new Map(), // taskId -> {acceptance, failures}（验收没过的原因）
   editing: false,       // 抽屉里有字段正在编辑 —— 此时**不重绘抽屉**
   me: null,
   canEdit: true,        // 服务端没开放编辑时降级成纯只读（见 PATCH 分支）
@@ -478,7 +479,9 @@ function paintCard(c, t) {
     rev.classList.toggle("is-bad", a === "rejected");
     c.querySelector(".card-review-k").textContent =
       a === "rejected" ? "验收没通过" : "待验收";
-    c.querySelector(".card-review-t").textContent = "这一轮的结果还没人认";
+    /* 被判不通过的不能说「还没人认」——它已经被人（或硬条件）否了。 */
+    c.querySelector(".card-review-t").textContent =
+      a === "rejected" ? "这一轮没通过验收" : "这一轮的结果还没人认";
   }
 }
 
@@ -787,6 +790,7 @@ async function doAccept(t) {
   try {
     const got = await api("POST", "/api/tasks/" + t.id + "/accept", {});
     state.byId.set(t.id, detailTask(got, "验收通过"));
+    rememberReview(t.id, got);
     /* **先重画再写提示**：drawDrawer 会把抽屉内容整个重建，
      * 提示写在前面的话会被这次重建冲掉——用户点了「验收通过」，
      * 屏幕上什么反应都没有。 */
@@ -852,10 +856,12 @@ async function doReviewSubmit() {
       const got = await api("POST", "/api/tasks/" + id + "/reject",
                             { note: note, rerun: true });
       state.byId.set(id, detailTask(got, "打回"));
+      rememberReview(id, got);
     } else {
       const got = await api("POST", "/api/tasks/" + id + "/continue",
                             { note: note, rerun: true });
       state.byId.set(id, detailTask(got, "续跑"));
+      rememberReview(id, got);
     }
     dlg.close();
     /* **提示要写在用户看得到的地方，而且要写在 load() 之后**。
@@ -890,6 +896,19 @@ document.getElementById("rv-cancel").onclick =
   () => document.getElementById("review").close();
 
 // ---------------------------------------------------------------- 抽屉
+
+/* 记下详情信封里的另外两样东西。
+ *
+ * **任务本体不进这个函数**——它必须由调用点自己 `detailTask()` 拆。
+ * 把拆包挪进辅助函数看着整齐，但围栏
+ * （tests/test_frontend_response_shape.py）靠扫源码里的 `detailTask(` 字面量
+ * 确认「凡是拿详情信封的地方都拆过」——挪进函数里，扫描器就**扫不到那一处**，
+ * 而那恰恰是漏拆就静默做错事的地方。围栏形同虚设。
+ */
+function rememberReview(id, got) {
+  state.taskArts.set(Number(id), got.artifacts || []);
+  state.taskReview.set(Number(id), got.review || null);
+}
 
 /* 状态芯片：任务与工作流共用一套语汇，颜色只借那五个状态色。 */
 function statusChip(key) {
@@ -1006,12 +1025,8 @@ async function openDrawer(id) {
   try {
     const got = await api("GET", "/api/tasks/" + id);
     t = detailTask(got, "打开详情");
-    /* 产物清单要单独留一份：detailTask 只把 got.task 交出来，而验收区
-     * 要显示「这一轮交了什么」——那正是 artifacts 的内容。
-     * 放 state.byId 里不行：那一格放的是**任务本体**，混进去之后
-     * 「任务对象」和「详情信封」两种形状会在同一个 Map 里打架。 */
-    state.taskArts.set(Number(id), got.artifacts || []);
     state.byId.set(id, t);
+    rememberReview(id, got);
   } catch (e) {
     if (e && e.status === 401) { signedOut("登录已过期，请重新登录"); return; }
     body.append(el("p", "drawer-error", "打不开：#" + id + " " + (e.message || "")));
@@ -1178,6 +1193,17 @@ function drawDrawer(id, t) {
       head.append(el("span", "review-note", "这一轮算完了。"));
     }
     slot.append(head);
+
+    /* **没过的原因要摆在验收区里**，不能只躺在时间线最下面：用户正要
+     * 在这一屏做决定（认不认、续不续跑），却要翻到最下面才知道自己
+     * 为什么被拒。 */
+    const rev = state.taskReview.get(Number(id));
+    const fails = (rev && rev.failures) || [];
+    if (fails.length) {
+      const why = el("ul", "review-fails");
+      fails.forEach(f => why.append(el("li", null, f)));
+      slot.append(why);
+    }
 
     /* 这一轮交了什么：产物清单。**没有产物清单就没法验收**——
      * 只看一句「算完了」是验不了收的。 */

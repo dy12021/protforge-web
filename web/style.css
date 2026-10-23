@@ -369,6 +369,15 @@ button { cursor: pointer; }
 }
 .review-arts li { margin: .1rem 0; }
 .review-more { color: var(--fg-dim); }
+/* 硬条件没过的原因。**红边**：它是「这一轮不成立」的理由，
+   不是提示（提示是灰的）。 */
+.review-fails {
+  list-style: none; margin: 0 0 .6rem; padding: .45rem .6rem;
+  border: 1px solid var(--st-failed); border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--st-failed) 6%, transparent);
+  font-size: .78rem; color: var(--fg);
+}
+.review-fails li { margin: .15rem 0; }
 
 /* ------------------------------------------------------------------ 抽屉
  *

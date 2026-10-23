@@ -593,6 +593,32 @@ def test_the_agent_knows_finish_is_a_promise():
     assert "续跑" in block, "要告诉模型看到「续跑」时是接着上一轮做，不是从头重来"
 
 
+def test_detail_carries_the_hard_check_failures(alice, client):
+    """详情信封里要带「硬条件没过的原因」。
+
+    原因只躺在时间线最下面的话，用户得翻到最下面才知道自己为什么被拒——
+    而他正要做的决定（认不认、续不续跑）就在验收区里做。
+    """
+    task = _done_task(_uid("alice"), size=0)      # 产物全是 0 字节 → 不通过
+    review.mark_pending(task["id"])
+    r = client.get(f"/api/tasks/{task['id']}", headers=_headers(alice))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["review"]["acceptance"] == db.ACCEPTANCE_REJECTED
+    assert body["review"]["failures"], "没过的原因要跟着详情一起给"
+    assert "0 字节" in " ".join(body["review"]["failures"])
+
+
+def test_detail_of_a_healthy_task_has_no_failures(alice, client):
+    """没被拒的任务不该带一堆失败原因（空列表，不是缺键）。"""
+    task = _done_task(_uid("alice"))
+    review.mark_pending(task["id"])
+    r = client.get(f"/api/tasks/{task['id']}", headers=_headers(alice))
+    body = r.json()
+    assert body["review"]["acceptance"] == db.ACCEPTANCE_PENDING
+    assert body["review"]["failures"] == []
+
+
 # ---------------------------------------------------------------- 迁移
 
 

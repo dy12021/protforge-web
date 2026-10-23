@@ -64,7 +64,7 @@ def _basename(path: str) -> str:
     return m.group(0) if m else str(path or "")
 
 
-def hard_check_failures(task: dict) -> list[str]:
+def hard_check_failures(task: dict, artifacts=None) -> list[str]:
     """机械的硬条件。返回**不通过的原因**；空列表 = 通过。
 
     **只查能从库里判定的机械事实**，不判断「这个蛋白设计结果对不对」——
@@ -72,11 +72,14 @@ def hard_check_failures(task: dict) -> list[str]:
 
     每条判据都要能被人一眼验证（「产物全是 0 字节」看一眼就知道），
     所以这里刻意不写任何需要模型判断的话。
+
+    ``artifacts`` 可以传进来（调用方多半已经查过）——省一次往返。
     """
     tid = int(task["id"])
     fails: list[str] = []
 
-    rows = [r for r in store.artifacts.list(tid) if int(r["verified"]) == 1]
+    rows = artifacts if artifacts is not None else store.artifacts.list(tid)
+    usable = [r for r in rows if int(r["verified"]) == 1]
 
     # ① 一个可下载产物都没有。
     if not rows:
