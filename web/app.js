@@ -71,6 +71,34 @@ const ROW_STATUS_LABEL = {
   queued: "已排队", running: "计算中", packaging: "打包中",
   done: "已完成", failed: "失败", skipped: "已跳过",
 };
+/* ---------------------------------------------- 验收
+ *
+ * 「算完」与「交付完成」是**两根轴**：status 说算没算完，acceptance 说
+ * 交没交付。模型自己调 finish 只说明它觉得算完了，平台原来照单全收——
+ * 交上来什么就打包、标绿、归档。
+ *
+ * 界面上的「待验收」= status 是 done 且 acceptance 是 pending。
+ * **别只看 status**：只看 status 的话，待验收的任务和验收通过的任务
+ * 长得一模一样，「结果没人认」这件事就完全看不见了。 */
+const ACCEPTANCE_LABEL = {
+  none: "", pending: "待验收", accepted: "已验收", rejected: "验收没通过",
+};
+
+/* 这个任务是不是在等人验收。 */
+function awaitingReview(t) {
+  return !!t && t.status === "done" && t.acceptance === "pending";
+}
+
+/* 验收状态的芯片。**只有待验收与没通过才显示**——已验收是默认状态，
+ * 到处挂一个「已验收」标签只会把真正要人看的那两个淹掉。 */
+function reviewChip(t) {
+  const a = (t && t.acceptance) || "none";
+  if (a === "none") return null;
+  if (a === "accepted") return null;
+  const cls = a === "rejected" ? "chip chip-failed" : "chip chip-review";
+  return el("span", cls, ACCEPTANCE_LABEL[a] || a);
+}
+
 const WF_ROLES = ["ignore", "key", "input", "context", "output"];
 const WF_ROLE_LABEL = {
   ignore: "忽略", key: "标识列", input: "输入列",
@@ -147,6 +175,8 @@ const state = {
   timelineFilter: "all",
   timelineOpen: false,  // 过程输出那一组是展开还是收起
   openId: null,         // 抽屉当前开着的任务
+  drawerMsg: null,      // 抽屉里的提示条（存 state，重绘时才贴得住）
+  taskArts: new Map(),  // taskId -> 产物清单（验收区要显示「这一轮交了什么」）
   editing: false,       // 抽屉里有字段正在编辑 —— 此时**不重绘抽屉**
   me: null,
   canEdit: true,        // 服务端没开放编辑时降级成纯只读（见 PATCH 分支）
@@ -239,6 +269,17 @@ function fmtTime(ts) {
   return ts.slice(5, 10) + " " + ts.slice(11, 16);
 }
 
+/* 字节 → 人看得懂的大小。验收区要显示「这一轮交了多少东西」，
+ * 光报一个字节数没人读得出来。 */
+function fmtSize(bytes) {
+  let n = Number(bytes || 0);
+  if (!isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n = n / 1024; i += 1; }
+  return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+}
+
 /* 耗时：秒 -> 人看得懂的样子。跑了 3 小时的和跑了 40 秒的要能一眼分开。 */
 function fmtDur(sec) {
   const n = Number(sec);
@@ -263,6 +304,29 @@ function setMsg(host, text, kind) {
   host.hidden = false;
 }
 function hideMsg(host) { host.hidden = true; host.textContent = ""; }
+
+/* 抽屉里的提示条。**存在 state 里**，不直接写 DOM。
+ *
+ * 为什么：drawDrawer 每次都会把 #drawer-body 整个重建，而它会被
+ * SSE 推一下、时间线补读、轮询刷新反复调用。提示直接写 DOM 的话，
+ * 下一次重绘就把它冲没了——用户点了「验收通过」，屏幕上一点反应都没有，
+ * 看起来就是按钮坏了。
+ *
+ * 存在 state 里，重绘时再贴回去，提示才活得住。 */
+function setDrawerMsg(text, kind) {
+  state.drawerMsg = text ? { text: text, kind: kind || "" } : null;
+  const host = drawerMsgHost();
+  if (!host) return;
+  if (state.drawerMsg) {
+    host.textContent = state.drawerMsg.text;
+    host.className = "drawer-msg" + (state.drawerMsg.kind ? " is-" + state.drawerMsg.kind : "");
+    host.hidden = false;
+  } else {
+    host.textContent = "";
+    host.className = "drawer-msg";
+    host.hidden = true;
+  }
+}
 
 // ---------------------------------------------------------------- 流转轨
 
@@ -363,7 +427,11 @@ function makeCard(t) {
   step.append(el("span", "card-step-k", "当前"), el("span", "card-step-t"));
   const fail = el("div", "card-fail");
   fail.append(el("span", "card-fail-k", "失败原因"), el("span", "card-fail-t"));
-  c.append(body, step, fail);
+  // 验收标记：**算完了但还没人认**。不放这里的话，看板上它和「已完成」
+  // 长得一模一样——而这两个恰恰是用户最需要区分的状态。
+  const review = el("div", "card-review");
+  review.append(el("span", "card-review-k"), el("span", "card-review-t"));
+  c.append(body, step, fail, review);
   c.addEventListener("click", () => openDrawer(t.id));
   /* Space 也是 button 的标准键——只认 Enter 的话，键盘用户按空格没反应。 */
   c.addEventListener("keydown", e => {
@@ -393,6 +461,17 @@ function paintCard(c, t) {
   const fail = c.querySelector(".card-fail");
   fail.hidden = !(failed && t.error);
   if (!fail.hidden) c.querySelector(".card-fail-t").textContent = t.error;
+  /* 验收标记。**只在这两种状态下出现**：待验收、验收没通过。
+   * 「已验收」是常态，不挂标签——挂了就变成到处都在喊「已验收」。 */
+  const rev = c.querySelector(".card-review");
+  const a = (t.acceptance || "none");
+  rev.hidden = !(t.status === "done" && (a === "pending" || a === "rejected"));
+  if (!rev.hidden) {
+    rev.classList.toggle("is-bad", a === "rejected");
+    c.querySelector(".card-review-k").textContent =
+      a === "rejected" ? "验收没通过" : "待验收";
+    c.querySelector(".card-review-t").textContent = "这一轮的结果还没人认";
+  }
 }
 
 // ---------------------------------------------------------------- 看板
@@ -678,6 +757,107 @@ function scheduleRefresh(id) {
   }, 400));
 }
 
+/* ---------------------------------------------------------------- 验收 / 续跑
+ *
+ * 「算完」与「交付完成」是两根轴。这三个动作是人在第二根轴上说话：
+ *
+ *   验收通过        这一轮的结果算交付完成
+ *   打回并补充要求   这一轮不认，带着「哪里不行」再跑一遍
+ *   续跑并补充要求   接着上一轮再跑（产物留着，模型接着改）
+ *
+ * 续跑是**同一个任务接着干**，不是重开一个：工作流是「一行一个任务」，
+ * 另起一轮会让那一行分裂成两个，归档进结果表时该写谁的结果就说不清了。 */
+
+/* 验收通过。**不用两步确认**：它是把「已经算好的东西」标成「已交付」，
+ * 没有不可撤销的后果——万一点错了，再打回一次就行。 */
+async function doAccept(t) {
+  try {
+    const got = await api("POST", "/api/tasks/" + t.id + "/accept", {});
+    state.byId.set(t.id, detailTask(got, "验收通过"));
+    /* **先重画再写提示**：drawDrawer 会把抽屉内容整个重建，
+     * 提示写在前面的话会被这次重建冲掉——用户点了「验收通过」，
+     * 屏幕上什么反应都没有。 */
+    drawDrawer(t.id, state.byId.get(t.id));
+    setDrawerMsg( "已验收：这一轮的结果算交付完成", "ok");
+    await load();
+  } catch (e) {
+    setDrawerMsg( e.message || "验收失败", "bad");
+  }
+}
+
+/* 打回 / 续跑：要一句话，所以先开那张有输入框的表。 */
+function doReview(t, mode) {
+  const dlg = document.getElementById("review");
+  document.getElementById("rv-title").textContent =
+    mode === "reject" ? "打回并补充要求" : "续跑并补充要求";
+  document.getElementById("rv-lead").textContent = mode === "reject"
+    ? "这一轮的结果不认。写清楚哪里不行，它会带着这段话再跑一遍；"
+      + "上一轮的产物留在工作目录里，模型可以接着改。"
+    : "同一个任务接着干。上一轮的产物留在工作目录里，"
+      + "写清楚还要什么，它会在那基础上继续。";
+  document.getElementById("rv-note-k").textContent = "补充要求";
+  document.getElementById("rv-ok").textContent =
+    mode === "reject" ? "打回并续跑" : "续跑";
+  const note = document.getElementById("rv-note");
+  note.value = "";
+  if (!dlg.open) dlg.showModal();
+  note.focus();
+  dlg.dataset.mode = mode;
+  dlg.dataset.task = String(t.id);
+}
+
+/* 对话框里那个按钮点了之后做的事。**打回与续跑是两个端点**：
+ * 打回=不认这一版（顺手续跑），续跑=只是接着干。 */
+async function doReviewSubmit() {
+  const dlg = document.getElementById("review");
+  const mode = dlg.dataset.mode || "continue";
+  const id = Number(dlg.dataset.task);
+  const note = document.getElementById("rv-note").value.trim();
+  if (!note) {
+    setDrawerMsg( "要写一句补充要求——不然模型不知道要改什么", "bad");
+    return;
+  }
+  const btn = document.getElementById("rv-ok");
+  btn.disabled = true;
+  try {
+    /* **两个分支都写完整路径，不用变量拼。**
+     *
+     * 围栏（tests/test_frontend_response_shape.py）靠扫源码里的
+     * `api("POST", "/api/tasks/...")` 字面量来确认「凡是拿详情信封的地方
+     * 都经 detailTask() 拆过」。路径写成变量的话，扫描器**扫不到这一处**，
+     * 而它恰恰是漏拆就静默做错事的那种地方——围栏形同虚设。
+     *
+     * 每个分支各自紧挨着 detailTask()：拆包与取数挨在一起，
+     * 中间隔着一大段的话，扫描器那 200 字符的窗口就套不住了。
+     */
+    if (mode === "reject") {
+      const got = await api("POST", "/api/tasks/" + id + "/reject",
+                            { note: note, rerun: true });
+      state.byId.set(id, detailTask(got, "打回"));
+    } else {
+      const got = await api("POST", "/api/tasks/" + id + "/continue",
+                            { note: note, rerun: true });
+      state.byId.set(id, detailTask(got, "续跑"));
+    }
+    dlg.close();
+    /* 同样是**先重画再写提示**（见 doAccept 的注释）。 */
+    drawDrawer(id, state.byId.get(id));
+    setDrawerMsg(
+      mode === "reject"
+        ? "已打回，它会带着这段要求再跑一遍"
+        : "已续跑，它会带着这段要求接着干", "ok");
+    await load();
+  } catch (e) {
+    setDrawerMsg( e.message || "操作失败", "bad");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("rv-ok").onclick = doReviewSubmit;
+document.getElementById("rv-cancel").onclick =
+  () => document.getElementById("review").close();
+
 // ---------------------------------------------------------------- 抽屉
 
 /* 状态芯片：任务与工作流共用一套语汇，颜色只借那五个状态色。 */
@@ -773,7 +953,7 @@ function patchFailed(e, id) {
     // 先重绘成只读，再放提示：drawDrawer 会把 #drawer-body 整个换掉，
     // 顺序反了提示条连同旧节点一起被扔掉，用户什么都看不到。
     if (t) drawDrawer(id, t);
-    setMsg(drawerMsgHost(), "服务端未开放编辑，以下内容改为只读", "warn");
+    setDrawerMsg( "服务端未开放编辑，以下内容改为只读", "warn");
     return true;
   }
   return false;
@@ -784,13 +964,22 @@ function drawerMsgHost() { return document.getElementById("drawer-msg"); }
 async function openDrawer(id) {
   state.openId = id;
   state.editing = false;
+  /* 换任务就把上一条提示清掉——提示是「对刚才那个任务说的」，
+   * 留着会让人以为新任务也出事了。 */
+  state.drawerMsg = null;
   const d = document.getElementById("drawer");
   d.hidden = false;
   const body = document.getElementById("drawer-body");
   body.textContent = "";
   let t = state.byId.get(id);
   try {
-    t = detailTask(await api("GET", "/api/tasks/" + id), "打开详情");
+    const got = await api("GET", "/api/tasks/" + id);
+    t = detailTask(got, "打开详情");
+    /* 产物清单要单独留一份：detailTask 只把 got.task 交出来，而验收区
+     * 要显示「这一轮交了什么」——那正是 artifacts 的内容。
+     * 放 state.byId 里不行：那一格放的是**任务本体**，混进去之后
+     * 「任务对象」和「详情信封」两种形状会在同一个 Map 里打架。 */
+    state.taskArts.set(Number(id), got.artifacts || []);
     state.byId.set(id, t);
   } catch (e) {
     if (e && e.status === 401) { signedOut("登录已过期，请重新登录"); return; }
@@ -823,6 +1012,14 @@ function drawDrawer(id, t) {
   const msg = el("div", "drawer-msg");
   msg.id = "drawer-msg";
   msg.hidden = true;
+  /* **重绘时把提示贴回去**（见 setDrawerMsg 的注释）：提示存在 state 里，
+   * 这里只是把它重新显示出来——不贴回去的话，一次 SSE 推送就能把
+   * 「已验收」四个字冲没。 */
+  if (state.drawerMsg) {
+    msg.textContent = state.drawerMsg.text;
+    msg.className = "drawer-msg" + (state.drawerMsg.kind ? " is-" + state.drawerMsg.kind : "");
+    msg.hidden = false;
+  }
   body.append(msg);
 
   // 动作常驻可见：中止与下载是高频动作，不该藏在区块里等用户翻到
@@ -862,11 +1059,11 @@ function drawDrawer(id, t) {
           const saved = detailTask(
             await api("PATCH", "/api/tasks/" + id, { brief: ta.value }), "保存需求说明");
           state.byId.set(id, saved);
-          setMsg(drawerMsgHost(), "需求说明已保存", "ok");
+          setDrawerMsg( "需求说明已保存", "ok");
           done(saved.brief == null ? "" : saved.brief);
         } catch (e) {
           s.disabled = false;
-          if (!patchFailed(e, id)) setMsg(drawerMsgHost(), e.message, "bad");
+          if (!patchFailed(e, id)) setDrawerMsg( e.message, "bad");
         }
       }, () => done(value));
       host.append(ta, bar);
@@ -898,11 +1095,11 @@ function drawDrawer(id, t) {
           const saved = detailTask(
             await api("PATCH", "/api/tasks/" + id, { title: input.value }), "保存标题");
           state.byId.set(id, saved);
-          setMsg(drawerMsgHost(), "标题已保存", "ok");
+          setDrawerMsg( "标题已保存", "ok");
           done(saved.title == null ? "" : saved.title);
         } catch (e) {
           s.disabled = false;
-          if (!patchFailed(e, id)) setMsg(drawerMsgHost(), e.message, "bad");
+          if (!patchFailed(e, id)) setDrawerMsg( e.message, "bad");
         }
       }, () => done(value));
       host.append(input, bar);
@@ -924,6 +1121,66 @@ function drawDrawer(id, t) {
   } else {
     resSlot.append(el("p", "field-empty",
       t.status === "done" ? "完成判定通过，没有额外的文字说明。" : "还没有结果。"));
+  }
+
+  /* --- 验收 ---------------------------------------------------------------
+   * **算完不等于交付完成。** 这一段是用户对「这一轮的结果到底行不行」
+   * 说话的地方：通过了才算交付，没通过可以打回并补要求。
+   *
+   * 只在算完（done）之后出现——还在跑的时候没有东西可验收。 */
+  if (t.status === "done") {
+    const slot = section(body, "验收");
+    const a = t.acceptance || "none";
+    const head = el("div", "review-head");
+    if (a === "pending") {
+      head.append(el("span", "chip chip-review", "待验收"));
+      head.append(el("span", "review-note",
+        "这一轮算完了，但结果还没人认。看完产物和结论再决定认不认。"));
+    } else if (a === "rejected") {
+      head.append(el("span", "chip chip-failed", "验收没通过"));
+      head.append(el("span", "review-note",
+        "这一轮的结果没通过验收。你可以补要求让它接着改。"));
+    } else if (a === "accepted") {
+      head.append(el("span", "chip chip-done", "已验收"));
+      head.append(el("span", "review-note", "这一轮的结果算交付完成。"));
+    } else {
+      head.append(el("span", "review-note", "这一轮算完了。"));
+    }
+    slot.append(head);
+
+    /* 这一轮交了什么：产物清单。**没有产物清单就没法验收**——
+     * 只看一句「算完了」是验不了收的。 */
+    const arts = state.taskArts.get(Number(id)) || [];
+    if (arts.length) {
+      const list = el("ul", "review-arts");
+      arts.slice(0, 12).forEach(a2 => {
+        list.append(el("li", null,
+          a2.name + "（" + fmtSize(a2.size) + "）"));
+      });
+      if (arts.length > 12) {
+        list.append(el("li", "review-more", "……另外还有 " + (arts.length - 12) + " 项"));
+      }
+      slot.append(list);
+    } else {
+      slot.append(el("p", "field-empty", "这一轮没有登记任何产物。"));
+    }
+
+    const acts2 = el("div", "action-row");
+    if (a !== "accepted") {
+      const ok = el("button", "btn btn-primary", "验收通过");
+      ok.type = "button";
+      ok.onclick = () => doAccept(t);
+      acts2.append(ok);
+      const bad = el("button", "btn btn-warn", "打回并补充要求");
+      bad.type = "button";
+      bad.onclick = () => doReview(t, "reject");
+      acts2.append(bad);
+    }
+    const cont = el("button", "btn", "续跑并补充要求");
+    cont.type = "button";
+    cont.onclick = () => doReview(t, "continue");
+    acts2.append(cont);
+    slot.append(acts2);
   }
 
   /* --- 时间线 ------------------------------------------------------------ */
@@ -1058,14 +1315,14 @@ function abortBtn(t) {
     try {
       state.byId.set(t.id, detailTask(
         await api("POST", "/api/tasks/" + t.id + "/abort", {}), "中止任务"));
-      setMsg(drawerMsgHost(), "已请求中止", "warn");
+      setDrawerMsg( "已请求中止", "warn");
       stopStream(t.id);
       await load().catch(() => {});
       const nt = state.byId.get(t.id);
       if (nt && state.openId === t.id) drawDrawer(t.id, nt);
     } catch (e) {
       b.disabled = false;
-      setMsg(drawerMsgHost(), e.message, "bad");
+      setDrawerMsg( e.message, "bad");
     }
   };
   return b;
@@ -1099,9 +1356,9 @@ function downloadBtn(t) {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 20000);
-      setMsg(drawerMsgHost(), "已开始下载 " + a.download, "ok");
+      setDrawerMsg( "已开始下载 " + a.download, "ok");
     } catch (e) {
-      setMsg(drawerMsgHost(), e.message, "bad");
+      setDrawerMsg( e.message, "bad");
     } finally {
       b.disabled = false;
     }
@@ -1136,7 +1393,7 @@ async function deleteTask(t) {
     } else if (e.status === 401) {
       signedOut("登录已过期，请重新登录");
     } else {
-      setMsg(drawerMsgHost(), e.message, "bad");
+      setDrawerMsg( e.message, "bad");
     }
   }
 }
@@ -1282,6 +1539,7 @@ function makeWorkflowCard(w) {
   meta.append(el("span", "wfc-count"));
   meta.append(el("span", "wfc-failed"));
   meta.append(el("span", "wfc-share-mark"));
+  meta.append(el("span", "wfc-pending"));
   card.append(meta);
 
   const bar = el("div", "bar");
@@ -1306,6 +1564,12 @@ function makeWorkflowCard(w) {
   share.type = "button";
   share.onclick = () => openShare(Number(w.id));
   acts.append(share);
+  /* 「验收」按钮：**未验收行数 > 0 时才出现**。61 行那种批次逐行点是不现实的，
+   * 所以这里是「把这一批还没人认的都认了」。 */
+  const accept = el("button", "btn wfc-accept-btn", "验收");
+  accept.type = "button";
+  accept.onclick = () => acceptWorkflowRows(Number(w.id));
+  acts.append(accept);
   acts.append(el("span", "wfc-ctrl"));
   card.append(acts);
 
@@ -1410,6 +1674,18 @@ function paintWorkflowCard(card, w) {
   const shareBtn = card.querySelector(".wfc-share-btn");
   if (shareBtn) {
     shareBtn.hidden = !(w.is_owner === true || isAdmin());
+  }
+  /* 「未验收 N 行」。**这个数必须显眼**——它是「这一批的结果有多少还没人认」
+   * 的唯一入口。行照跑照归档，所以它会一直挂在那儿直到有人处理。 */
+  const pend = card.querySelector(".wfc-pending");
+  const nPend = Number(w.pending_acceptance_rows) || 0;
+  if (pend) {
+    pend.textContent = nPend > 0 ? ("未验收 " + nPend + " 行") : "";
+    pend.className = "wfc-pending" + (nPend > 0 ? " is-warn" : "");
+  }
+  const acceptBtn = card.querySelector(".wfc-accept-btn");
+  if (acceptBtn) {
+    acceptBtn.hidden = !(nPend > 0 && (w.is_owner === true || isAdmin()));
   }
 }
 
@@ -1529,6 +1805,11 @@ function paintWorkflowRows(host, id) {
     dot.dataset.status = rowStatus(row, skips);
     st.append(dot);
     st.append(el("span", null, ROW_STATUS_LABEL[rowStatus(row, skips)] || row.status || ""));
+    /* 验收标记。**行照跑照归档，验收状态逐行记**——所以「已完成」与
+     * 「已完成但没人认」在行列表里必须分得开，不然用户扫一眼以为
+     * 整批都交付了。 */
+    const rc = reviewChip(row);
+    if (rc) st.append(rc);
     tr.append(st);
     tr.append(el("td", "wf-row-step", row.step || "—"));
     const art = el("td");
@@ -1880,6 +2161,33 @@ async function doTransfer(u) {
     shareCtx.mode = "browse";
     renderShare();
     setShareMsg(e.message || "转让失败", "bad");
+  }
+}
+
+/* 批量验收：把这一批**还没人认**的行都认了。
+ *
+ * 61 行那种批次逐行点 61 次是不现实的，所以要有「一批都认了」这一个入口。
+ * 只影响还没人认的行——已经认过的、还没跑的都不动。 */
+async function acceptWorkflowRows(wfId) {
+  const ok = await confirmAction({
+    title: "把这一批还没人认的行都认了？",
+    lead: "这会把这一批里所有「待验收」的行标成已验收。",
+    items: [
+      "认了就算交付完成（结果表里那一格照旧，不受影响）",
+      "只影响还没人认的行：已经认过的、还没跑的不动",
+      "之后对某一行不满意，仍然可以单独打回续跑那一行",
+    ],
+    okLabel: "确认验收",
+  });
+  if (!ok) return;
+  try {
+    const got = await api("POST", "/api/workflows/" + wfId + "/accept", {});
+    setMsg(document.getElementById("board-msg"),
+      (got.count || 0) + " 行已验收", "good");
+    await loadWorkflows();
+    await refreshOpenWorkflow(wfId);
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "验收失败", "bad");
   }
 }
 

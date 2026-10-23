@@ -800,10 +800,14 @@ def create_admin_app() -> FastAPI:
         # 两边各算一次就会漂。
         marks = store.share_annotations([int(w["id"]) for w in wfs],
                                         int(user["id"]), is_admin=True)
+        # **未验收行数**：值班台也要看得见「这一批还有几行没人认」。
+        pending = store.workflow_pending_acceptance_counts(
+            [int(w["id"]) for w in wfs])
         out = []
         for w in wfs:
             view = svc._wf_view(w, stats.get(int(w["id"])))
             view.update(marks.get(int(w["id"]), {}))
+            view["pending_acceptance_rows"] = int(pending.get(int(w["id"]), 0))
             out.append(view)
         return {"workflows": out}
 
@@ -811,6 +815,21 @@ def create_admin_app() -> FastAPI:
     # mount_workflow_sharing），只是路径前缀与鉴权依赖不同：
     # 这里挂在 /api/admin 下，鉴权是管理端自己的 require_admin。
     svc.mount_workflow_sharing(app, prefix="/api/admin", guard=require_admin)
+
+    @app.post("/api/admin/workflows/{workflow_id}/accept")
+    def accept_workflow_rows(workflow_id: int,
+                             user: dict = Depends(require_admin)):
+        """把这一批**还没人认**的行都认了。
+
+        61 行那种批次逐行点 61 次是不现实的，所以要有「一批都认了」。
+        **只影响还没人认的行**——已经认过的、还没跑的不动。
+        """
+        wf = store.get_workflow(int(workflow_id), is_admin=True)
+        pending = store.workflow_rows_awaiting_acceptance(int(wf["id"]))
+        for row in pending:
+            svc.review.accept(int(row["id"]), actor="admin")
+        return {"accepted": [int(r["id"]) for r in pending],
+                "count": len(pending)}
 
     # --- 反思（rsi）------------------------------------------------------------
     #

@@ -146,6 +146,25 @@
     </div>
   </dialog>
 
+  <!-- 打回 / 续跑。**要一句话的输入**，所以另开一张表而不是套那张两步确认表
+     （确认表里没有输入框，塞进去就变成「确认之前先在静态文案里打字」）。
+     「续跑」是同一个任务接着干：上一轮的产物留在工作目录里，模型接着改。 -->
+  <dialog class="review" id="review">
+    <div class="review-inner">
+      <h2 class="review-title" id="rv-title">补充要求</h2>
+      <p class="review-lead" id="rv-lead"></p>
+      <label class="field">
+        <span id="rv-note-k">补充要求</span>
+        <textarea id="rv-note" rows="5"
+                  placeholder="例如：换个对接种子再跑；把 RMSD 的判定标准写清楚再交。"></textarea>
+      </label>
+      <div class="composer-actions">
+        <button class="secondary" type="button" id="rv-cancel">算了</button>
+        <button class="primary" type="button" id="rv-ok">续跑</button>
+      </div>
+    </div>
+  </dialog>
+
   <!-- 登录。token 存 localStorage 并走 Authorization 头（不放 Cookie，
        浏览器不会自动附加自定义头，天然免 CSRF）。 -->
   <dialog class="login" id="login">

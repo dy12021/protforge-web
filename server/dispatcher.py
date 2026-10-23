@@ -1984,6 +1984,20 @@ class Dispatcher:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         brief = brief or ""
+        # **续跑的补充要求拼在 brief 末尾**（2026-10-23）。放在这里而不是调用方，
+        # 是因为只有这一处是「任务真正起进程」的地方——常规任务与工作流行
+        # 两条路都经过它，拼一次就够，而漏一处就是「补的要求没生效」。
+        #
+        # 存在 tasks.followup 而不是直接改 tasks.brief：工作流行重跑时 brief
+        # 是从模板**重新渲染**的（_spawn_workflow_row），改在 brief 上的补充
+        # 要求会被覆盖掉。
+        followup = ""
+        try:
+            followup = (store.get_followup(task_id) or "").strip()
+        except Exception:                              # noqa: BLE001
+            log.exception("读任务 %s 的补充要求失败", task_id)
+        if followup:
+            brief = brief.rstrip() + "\n\n" + followup
         brief_path = work_dir / "brief.md"
         try:
             brief_path.write_text(brief, encoding="utf-8")

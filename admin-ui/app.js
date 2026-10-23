@@ -564,6 +564,13 @@ function taskRow(t) {
   tr.append(title);
   const st = el("td", "c-st");
   st.append(statusChip(t.status));
+  /* **待验收**：算完不等于交付完成。值班台上看不到这个，就没人知道
+   * 哪些结果还等人认——而那正是需要人动手处理的那一批。 */
+  if (t.status === "done" && t.acceptance === "pending") {
+    st.append(el("span", "chip chip-review", "待验收"));
+  } else if (t.status === "done" && t.acceptance === "rejected") {
+    st.append(el("span", "chip chip-failed", "验收没通过"));
+  }
   tr.append(st);
   tr.append(el("td", "c-step", t.step || "—"));
   tr.append(el("td", "c-owner", ownerName(t.owner_id)));
@@ -1197,6 +1204,13 @@ function workflowRow(w) {
   st.append(el("span", "chip " + (n ? "chip-running" : "chip-none"),
     n ? ("共享给 " + n + " 人") : "没共享"));
   tr.append(st);
+  /* **未验收行数**：行照跑照归档，所以这个数会一直挂在那儿——
+   * 值班台要看得见「这一批还有几行没人认」。 */
+  const pend = el("td", "c-state");
+  const np = Number(w.pending_acceptance_rows) || 0;
+  pend.append(el("span", "chip " + (np ? "chip-review" : "chip-none"),
+    np ? ("未验收 " + np + " 行") : "都验过了"));
+  tr.append(pend);
   const total = Number(w.total_rows) || 0;
   const done = Number(w.cursor) || 0;
   tr.append(el("td", "c-time", done + " / " + total + " 行"));
@@ -1216,7 +1230,29 @@ function workflowActs(w) {
   transfer.type = "button";
   transfer.onclick = () => doTransfer(w);
   box.append(transfer);
+  /* 「验收」：只在有未验收行时出现。没有未验收行时挂一个灰按钮
+   * 占位，比让它忽隐忽现更难读。 */
+  const np = Number(w.pending_acceptance_rows) || 0;
+  const accept = el("button", "btn", "验收");
+  accept.type = "button";
+  accept.disabled = np <= 0;
+  accept.onclick = () => doAcceptRows(w);
+  box.append(accept);
   return box;
+}
+
+/* 把这一批还没人认的行都认了。**不做两步确认**——它只是把「算好了」
+ * 标成「认了」，没有不可撤销的后果（不满意还能单独打回续跑那一行）。 */
+async function doAcceptRows(w) {
+  const np = Number(w.pending_acceptance_rows) || 0;
+  if (np <= 0) return;
+  try {
+    const got = await api("POST", "/workflows/" + w.id + "/accept", {});
+    setWfMsg("已验收 " + (got.count || 0) + " 行", "ok");
+    await loadWorkflows();
+  } catch (e) {
+    setWfMsg(e.message || "验收失败", "bad");
+  }
 }
 
 /* 选一个人：**排除主人自己**——把工作流转给自己没有任何意义，

@@ -48,6 +48,7 @@ import dispatcher
 import guards
 import janitor
 import reflection
+import review
 import skills_index
 import status_api
 import sse
@@ -633,7 +634,9 @@ class FinishIn(BaseModel):
     error: str = Field(default="", max_length=4000)
     # agent 自报的产物清单。**注意它和产物发现不是一回事**：这里说的是工作目录下的
     # 相对路径，而 artifacts.discover 扫的是 ProtForge 的 outputs 根，两棵不同的树。
-    # 所以这份清单只记进时间线供排查，不参与打包——真按它去 assemble 会打空包。
+    # 所以这份清单**不参与打包**（真按它去 assemble 会打空包）。
+    # 它的用处是**验收核对**：模型说交了这几个，盘上却一个都找不到——
+    # 这正是「交了不算数」的一种，是硬条件之一。
     # 但字段必须收下：pydantic 会把未声明的键**静默丢掉**，agent 以为自己报了、
     # 后端却当没收到，这种不一致最难查。
     artifacts: list[str] = Field(default_factory=list, max_length=50)
@@ -678,6 +681,29 @@ class ShareIn(BaseModel):
     """共享/转让的目标账户。"""
 
     user_id: int
+
+
+class ReviewIn(BaseModel):
+    """验收 / 续跑的动作参数。
+
+    ``note`` 是人在这一轮说的话：打回时是「哪里不行」，
+    续跑时是「还要什么」。**它是续跑时喂给模型的那部分**，
+    所以留个上限（模型读的是它，不是整段历史）。
+    """
+
+    note: str = Field(default="", max_length=8000)
+    #: 打回时要不要顺手续跑。默认 True——打回是「这一版不行，再来」，
+    #: 分成两个动作要点两次，而中间那一版没人要。
+    rerun: bool = True
+
+
+class WorkflowAcceptIn(BaseModel):
+    """批量验收工作流行。
+
+    ``rows`` 省略 = 全部还没人认的行。给了就只认那几行（行序号从 0 起）。
+    """
+
+    rows: list[int] = Field(default_factory=list, max_length=500)
 
 
 class SkipIn(BaseModel):
@@ -956,6 +982,70 @@ def create_public_app() -> FastAPI:
         sse.notify()
         return _detail(updated)
 
+    # --- 验收 / 续跑 ------------------------------------------------------------
+    #
+    # 「算完」和「交付完成」是两件事。模型自己调 finish 只说明它觉得算完了；
+    # 平台原来照单全收——不管交上来的是结果还是空文件，一律打包、标绿、归档。
+    # 这三个端点把交付这一段卡住：
+    #
+    #   accept   验收通过：这一轮的结果算交付完成
+    #   reject   打回：这一轮的结果不认（可以顺手续跑）
+    #   continue 续跑：同一个任务接着干，保留上一轮的产物
+    #
+    # 续跑与「重跑」的区别：重跑是**从零重来**（清产物、清结论）；
+    # 续跑是**带着上一轮接着干**（产物文件留着，提示词里带上失败原因 /
+    # 上一轮结论 / 上一轮产出清单，再加用户这一轮的要求）。
+
+    @app.post("/api/tasks/{task_id}/accept")
+    def accept_task(task_id: int, user=Depends(auth.current_user)):
+        """验收通过。幂等：已经通过了再点一次不报错。"""
+        task = store.get_task_for(task_id, user["id"],
+                                  is_admin=user["role"] == "admin")
+        try:
+            updated = review.accept(task_id, actor="human")
+        except review.ReviewError as exc:
+            raise PreciseHTTPException(422, str(exc)) from exc
+        sse.notify()
+        return _detail(updated)
+
+    @app.post("/api/tasks/{task_id}/reject")
+    def reject_task(task_id: int, body: ReviewIn,
+                    user=Depends(auth.current_user)):
+        """打回：这一轮的结果不认。
+
+        ``rerun=True``（默认）时**顺手续跑**：打回是「这一版不行，再来」，
+        分成两个动作要人点两次，而中间那一版是没人要的。
+        """
+        task = store.get_task_for(task_id, user["id"],
+                                  is_admin=user["role"] == "admin")
+        try:
+            updated = review.reject(task_id, body.note, actor="human")
+            if body.rerun:
+                updated = review.continue_task(task_id, body.note, actor="human")
+        except review.ReviewError as exc:
+            raise PreciseHTTPException(422, str(exc)) from exc
+        sse.notify()
+        return _detail(updated)
+
+    @app.post("/api/tasks/{task_id}/continue")
+    def continue_task(task_id: int, body: ReviewIn,
+                      user=Depends(auth.current_user)):
+        """续跑：同一个任务接着干。
+
+        失败的任务 → 新一轮的提示词里带上失败原因；
+        算完的任务 → 带上上一轮的结论与产出清单，再加用户的要求。
+        **上一轮的产物文件保留**（工作目录不清），模型可以接着改。
+        """
+        task = store.get_task_for(task_id, user["id"],
+                                  is_admin=user["role"] == "admin")
+        try:
+            updated = review.continue_task(task_id, body.note, actor="human")
+        except review.ReviewError as exc:
+            raise PreciseHTTPException(422, str(exc)) from exc
+        sse.notify()
+        return _detail(updated)
+
+
     @app.post("/api/tasks/{task_id}/abort")
     def abort(task_id: int, user=Depends(auth.current_user)):
         task = store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")
@@ -1084,10 +1174,15 @@ def create_public_app() -> FastAPI:
         # 不然他会以为自己能删它（他不能）。
         marks = store.share_annotations([w["id"] for w in wfs], user["id"],
                                         is_admin=is_admin)
+        # **未验收行数**：工作流卡片上要显示「未验收 N 行」。前端数不出来——
+        # 它拿到的行列表是分页的，自己数会跟真实值对不上。
+        pending = store.workflow_pending_acceptance_counts(
+            [w["id"] for w in wfs])
         out = []
         for w in wfs:
             view = _wf_view(w, stats.get(int(w["id"])))
             view.update(marks.get(int(w["id"]), {}))
+            view["pending_acceptance_rows"] = int(pending.get(int(w["id"]), 0))
             out.append(view)
         return {"workflows": out}
 
@@ -1112,6 +1207,34 @@ def create_public_app() -> FastAPI:
                 # 要不要给下载入口。少了它，用户只能先点进去才知道有没有东西可下。
                 "packages_count": len(pkgs),
                 "packages_bytes": sum(p.stat().st_size for _, p in pkgs)}
+
+    @app.post("/api/workflows/{workflow_id}/accept")
+    def accept_workflow_rows(workflow_id: int, body: WorkflowAcceptIn,
+                              user=Depends(auth.current_user)):
+        """批量验收这个工作流里的行。
+
+        ``rows`` 省略 = **这个工作流里全部还没人认的行**。61 行那种批次
+        逐行点 61 次是不现实的，所以要有「一批都认了」这一个入口。
+        给了 ``rows`` 就只认那几行（行号是工作流的行序号，从 0 起）。
+
+        **验收不挡后续行**（用户 2026-10-23 定的）：行照跑照归档，
+        验收状态逐行记录，事后可以对任意一行打回续跑。
+        """
+        is_admin = user["role"] == "admin"
+        store.get_workflow_for(workflow_id, user["id"], is_admin=is_admin,
+                                allow_admin=True)
+        pending = store.workflow_rows_awaiting_acceptance(workflow_id)
+        if body.rows:
+            want = {int(r) for r in body.rows}
+            pending = [r for r in pending
+                       if int(r["workflow_row"] or 0) in want]
+        if not pending:
+            return {"accepted": [], "count": 0}
+        for row in pending:
+            review.accept(int(row["id"]), actor="human")
+        sse.notify()
+        return {"accepted": [int(r["id"]) for r in pending],
+                "count": len(pending)}
 
     @app.get("/api/workflows/{workflow_id}/preview")
     def preview_workflow(workflow_id: int,
@@ -1460,6 +1583,15 @@ def _package_one(task_id: int) -> None:
     except Exception:                                   # noqa: BLE001
         log.exception("收口任务 %s 失败", task_id)
         return
+    # **算完不等于交付完**（2026-10-23）：打完包只是把产物收成了形，
+    # 这一轮的结果还没人认。进「待验收」，并跑一遍平台能机械判定的硬条件。
+    # 放在 set_status 之后：mark_pending 只处理 status=='done' 的任务。
+    try:
+        review.mark_pending(task_id)
+    except Exception:                                   # noqa: BLE001
+        # 验收这一步出问题**不许把已经算完的任务拖成失败**——那是把
+        # 「平台自己出岔子」变成「用户的计算白跑了」。
+        log.exception("给任务 %s 标记待验收时出错", task_id)
     sse.notify()
 
 
@@ -1692,14 +1824,19 @@ def create_internal_app() -> FastAPI:
             updated = task
         if body.summary:
             updated = store.update_task(task_id, summary=body.summary)
-        # finished 事件放最后：调度器拿 has_finished() 区分"重连"与"真跑完"，
-        # 它出现即代表本次计算已彻底收口。
-        store.record_finished(task_id, actor="agent")
+        # **自报产物清单要落库**（2026-10-23）：验收时拿它核对「模型说有、
+        # 盘上一个都找不到」。只写时间线的话，机器查不到——事件是给人读的。
         if body.artifacts:
+            store.update_task(task_id, declared=json.dumps(
+                [p.strip() for p in body.artifacts if p.strip()][:50],
+                ensure_ascii=False))
             names = "、".join(p.strip() for p in body.artifacts[:8] if p.strip())
             more = f"（共 {len(body.artifacts)} 项）" if len(body.artifacts) > 8 else ""
             store.add_event(task_id, "note", "agent",
                             f"计算进程自报产物：{names}{more}")
+        # finished 事件放最后：调度器拿 has_finished() 区分"重连"与"真跑完"，
+        # 它出现即代表本次计算已彻底收口。
+        store.record_finished(task_id, actor="agent")
         sse.notify()
         # 标记落了不等于进程会退。agent 报完收口只是把结果告诉了我们，它自己
         # 还挂在 runRpcMode 上等 stdin——不主动收口，任务就永远停在「计算中」，

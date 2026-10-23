@@ -173,6 +173,14 @@ def _update(task_id: int, **fields) -> dict:
         "done_at",
         # 工作流三列。放行 pass 与归档 pass 全靠它们，改白名单就是给闸门断供。
         "workflow_id", "workflow_row", "workflow_archived",
+        # 验收状态与补充要求。**不要用 update_task 直接写 acceptance**——
+        # 验收状态的每一次变化都该留一条事件（谁在什么时候认了/打回了），
+        # 走 store.set_acceptance()，那里会一并记账。
+        "acceptance", "followup",
+        # 计算进程自报的产物清单（JSON 数组）。验收时拿它核对「模型说有、
+        # 盘上没有」，所以它得像产物表那样是**一份独立的记录**，
+        # 不能只活在事件文本里（事件是给人读的，不是给机器查的）。
+        "declared",
     }
     bad = set(fields) - allowed
     if bad:
@@ -194,6 +202,167 @@ def _update(task_id: int, **fields) -> dict:
 def update_task(task_id: int, **fields) -> dict:
     """白名单字段更新。给调度器/打包器收口字段用（package_path/summary/error…）。"""
     return _update(task_id, **fields)
+
+
+# ---------------------------------------------------------------- 验收
+#
+# 「算完没算完」是 status，「交付没交付」是 acceptance。两者正交：
+# 任务算完了、打完包了，但**没人认**——那它就是 pending，不是 accepted。
+#
+# 判「算不算交付完成」**只认 is_accepted()**，别在别处自己拼条件：
+# status='done' and acceptance='accepted' 这句话散在几个地方，早晚有一处
+# 漏掉后写成「done 就算完成」——那正是这个功能要堵的洞。
+
+
+def is_accepted(task: dict) -> bool:
+    """这个任务算不算「交付完成」。"""
+    return (str(task.get("status")) == "done"
+            and str(task.get("acceptance")) == db.ACCEPTANCE_ACCEPTED)
+
+
+def awaiting_acceptance(task: dict) -> bool:
+    """这个任务是不是「算完了、等人验收」。"""
+    return (str(task.get("status")) == "done"
+            and str(task.get("acceptance")) == db.ACCEPTANCE_PENDING)
+
+
+def set_acceptance(task_id: int, value: str) -> dict:
+    """写验收状态。**只写列，不写事件**——事件由 API 层写。
+
+    事件留在 API 层是有意的：事件里要说的话依赖调用场景（人点的通过、
+    调度器判的自动不通过、打回时附的那句意见），数据层不该替它选。
+    """
+    if value not in db.ACCEPTANCE_VALUES:
+        raise Invalid(f"未知的验收状态：{value}")
+    return _update(task_id, acceptance=value)
+
+
+def list_tasks_awaiting_acceptance(owner_id=None, *, is_admin: bool = False,
+                                    limit: int = 200) -> list[dict]:
+    """还没人认的任务（验收状态 pending）。最新在前。
+
+    管理员看得见所有人的（值班台要处理归属问题），普通用户只看自己的。
+    """
+    sql = ("SELECT * FROM tasks WHERE status = 'done' AND acceptance = ?")
+    args: list = [db.ACCEPTANCE_PENDING]
+    if not is_admin and owner_id is not None:
+        sql += " AND owner_id = ?"
+        args.append(int(owner_id))
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in c.execute(sql, args)]
+    finally:
+        c.close()
+
+
+def workflow_rows_awaiting_acceptance(workflow_id: int) -> list[dict]:
+    """一个工作流里还没人认的那些行。"""
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM tasks WHERE workflow_id = ?"
+            " AND status = 'done' AND acceptance = ? ORDER BY workflow_row",
+            (int(workflow_id), db.ACCEPTANCE_PENDING))]
+    finally:
+        c.close()
+
+
+def workflow_pending_acceptance_counts(workflow_ids) -> dict[int, int]:
+    """一批工作流各自「还有几行没人认」。**一条 GROUP BY 拿全**。
+
+    工作流卡片上要显示「未验收 N 行」——那个数不能在前端数：前端拿到的
+    行列表是分页的，数出来的 N 跟真实值对不上。
+    """
+    ids = [int(i) for i in workflow_ids]
+    if not ids:
+        return {}
+    c = db.connect()
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = c.execute(
+            "SELECT workflow_id, COUNT(*) AS n FROM tasks"
+            " WHERE workflow_id IN (" + marks + ")"
+            " AND status = 'done' AND acceptance = ? GROUP BY workflow_id",
+            ids + [db.ACCEPTANCE_PENDING]).fetchall()
+        return {int(r["workflow_id"]): int(r["n"]) for r in rows}
+    finally:
+        c.close()
+
+
+def count_awaiting_acceptance(owner_id=None, *, is_admin: bool = False) -> int:
+    """还没人认的任务数。给状态面板之外的地方用（比如工作流卡片上的角标）。"""
+    sql = "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND acceptance = ?"
+    args: list = [db.ACCEPTANCE_PENDING]
+    if not is_admin and owner_id is not None:
+        sql += " AND owner_id = ?"
+        args.append(int(owner_id))
+    c = db.connect()
+    try:
+        row = c.execute(sql, args).fetchone()
+        return int(row[0] or 0)
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------- 补充要求（续跑）
+#
+# 续跑时用户追加的那句话。**单独一列，不改 tasks.brief**——工作流行重跑时
+# brief 是从模板重新渲染的，改在 brief 上的补充要求会被覆盖掉。
+#
+# 这里存的是**已经组装好的静态文本**（含上一轮的失败原因、上一轮的结论、
+# 上一轮产出了哪些文件），不是「原话 + 指针」。组装发生在续跑那一刻，
+# 那一轮的事实此刻是确定的；存原话等到下一轮再组装的话，就得再去查
+# 「上一轮」到底是哪一轮——而重跑会把那些字段覆盖掉。
+
+#: 补充要求段的上限。**超了要截断**：brief 本身就有两万字上限，
+#: 续跑追加若干轮之后超长的话，起进程时 brief 写文件会失败。
+FOLLOWUP_MAX_CHARS = 8000
+
+
+def append_followup(task_id: int, text: str) -> dict:
+    """把一段补充要求接到这个任务的 followup 后面（累积）。"""
+    text = (text or "").strip()
+    if not text:
+        raise Invalid("补充要求不能为空")
+    c = db.connect()
+    try:
+        with c:
+            row = c.execute("SELECT followup FROM tasks WHERE id = ?",
+                            (int(task_id),)).fetchone()
+            if row is None:
+                raise NotFound("任务不存在")
+            cur = (row["followup"] or "").strip()
+            merged = (cur + "\n\n" + text) if cur else text
+            if len(merged) > FOLLOWUP_MAX_CHARS:
+                # 截断时**从尾部留**（最新的要求最要紧），并在前面留一句说明。
+                merged = ("（前几轮的补充要求过长，已省略）\n\n"
+                          + merged[-FOLLOWUP_MAX_CHARS:])
+            c.execute("UPDATE tasks SET followup = ? WHERE id = ?",
+                      (merged, int(task_id)))
+    finally:
+        c.close()
+    return get_task(task_id)
+
+
+def get_followup(task_id: int) -> str:
+    """这个任务的补充要求全文（可能为空串）。"""
+    c = db.connect()
+    try:
+        row = c.execute("SELECT followup FROM tasks WHERE id = ?",
+                        (int(task_id),)).fetchone()
+        return (row["followup"] or "") if row is not None else ""
+    finally:
+        c.close()
+
+
+def clear_followup(task_id: int) -> None:
+    """清掉补充要求。**新一轮重新提交时用**——从零开始算的老任务不该
+    带着上一轮的补充要求。"""
+    _update(task_id, followup="")
 
 
 def set_step(task_id: int, text: str) -> str:

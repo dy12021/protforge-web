@@ -42,6 +42,22 @@ STATUS_INDEX = {k: i for i, k in enumerate(STATUS_KEYS)}
 VALID_STATUSES = STATUS_KEYS + ["failed"]
 TERMINAL_STATUSES = ("done", "failed")
 
+#: **验收状态**（2026-10-23）。不是 status，是与它正交的**另一根轴**：
+#:
+#: - ``none``     ：还没进验收（还在跑，或失败了）
+#: - ``pending``  ：算完了、打完包了，**等人验收**
+#: - ``accepted`` ：人认了，算交付完成
+#: - ``rejected`` ：自动硬条件没通过，或被人打回
+#:
+#: 「算完没算完」看 ``status``，「交付没交付」看 ``acceptance``。
+#: 两件事分开，是为了让状态面板的吞吐口径不受验收影响，而界面又能诚实地
+#: 显示「这一批结果还没人认」。
+ACCEPTANCE_VALUES = ("none", "pending", "accepted", "rejected")
+ACCEPTANCE_PENDING = "pending"
+ACCEPTANCE_ACCEPTED = "accepted"
+ACCEPTANCE_REJECTED = "rejected"
+ACCEPTANCE_NONE = "none"
+
 # 反思的处理阶段。与任务状态**无关**，别混用。
 #   draft     模型已写出反思，等管理员分类（刚生成就是这一档）
 #   reviewed  管理员已分类，等落地（写经验 / 应用修改方案）
@@ -133,6 +149,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE,
   workflow_row INTEGER,
   workflow_archived INTEGER NOT NULL DEFAULT 0,
+  acceptance TEXT NOT NULL DEFAULT 'none',
+  declared TEXT NOT NULL DEFAULT '',
+  followup TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, done_at TEXT,
   CHECK (status IN ('queued','running','packaging','done','failed'))
 );
@@ -272,6 +291,27 @@ _MISSING_TASK_COLUMNS = (
     "workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE",
     "workflow_row INTEGER",
     "workflow_archived INTEGER NOT NULL DEFAULT 0",
+    # **验收状态**（2026-10-23）。取值见 ACCEPTANCE_VALUES。
+    #
+    # 为什么是**一列**而不是一个新 status：tasks.status 上有 CHECK 约束
+    # ('queued','running','packaging','done','failed')，加一个 'reviewing' 就要
+    # 重建表 —— 而 events/artifacts/uploads 都 ON DELETE CASCADE 引用着 tasks，
+    # 重建表时 DROP 会把子表数据级联带走。风险远大于收益。
+    #
+    # 代价是「完成」这件事要两个字段合起来看：status='done' 且
+    # acceptance='accepted' 才算交付完成。**只有一个地方判断它**：
+    # store.is_accepted()。别在别处自己拼条件。
+    "acceptance TEXT NOT NULL DEFAULT 'none'",
+    # **计算进程自报的产物清单**（JSON 数组）。验收时用它核对「模型说有、
+    # 盘上没有」——这是唯一能查的「交上来了什么」的第一手凭据。
+    "declared TEXT NOT NULL DEFAULT ''",
+    # **累积的补充要求**（续跑用）。存的是「用户在这一轮追加的话」，
+    # 由调度器在起进程时拼到 brief 末尾。
+    #
+    # 为什么不直接改 tasks.brief：工作流行重跑时 brief 是**从模板重新渲染**的
+    # （dispatcher._spawn_workflow_row），改在 brief 上的补充要求会被覆盖掉。
+    # 单独一列才活得下来。
+    "followup TEXT NOT NULL DEFAULT ''",
 )
 
 # 反思表补列。**方案失败的原因要单独一列**：reflections.error 是「这次反思

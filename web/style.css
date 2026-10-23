@@ -181,6 +181,18 @@ button { cursor: pointer; }
 .card-fail-k { flex: none; color: var(--st-failed); font-weight: 600; }
 .card-fail-t { color: var(--fg-dim); overflow-wrap: anywhere; }
 
+/* 验收标记：**算完了但还没人认**。挂在卡片上是因为「已完成」与
+ * 「已完成但没人认」在看板里必须一眼分得开——后者是用户要动手的事。 */
+.card-review {
+  display: flex; gap: .35rem; align-items: baseline;
+  font-size: .76rem; margin-top: .15rem;
+  border-top: 1px solid var(--line); padding-top: .35rem;
+}
+.card-review[hidden] { display: none; }
+.card-review-k { flex: none; color: var(--st-packaging); font-weight: 600; }
+.card-review.is-bad .card-review-k { color: var(--st-failed); }
+.card-review-t { color: var(--fg-dim); overflow-wrap: anywhere; }
+
 /* ------------------------------------------------- 流转轨：一条地铁线
  *
  * 签名元素。卡片顶部一条**横向**连续线，四站对应四个主链状态，任务就是那趟车。
@@ -336,6 +348,28 @@ button { cursor: pointer; }
 .share-msg.is-good { color: var(--st-done); }
 .share-msg.is-bad { color: var(--st-failed); }
 
+/* 打回 / 续跑的对话框。与共享那张同形——**同一类操作**（都是「对已有结果
+ * 再说一句」），两张表长得不一样只会让人多学一遍。 */
+.review {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0;
+  width: min(32rem, 94vw); background: var(--card); color: var(--fg);
+  box-shadow: 0 24px 64px rgba(21,32,51,.22);
+}
+.review::backdrop { background: rgba(23,32,45,.34); }
+.review-inner { padding: 1.1rem 1.2rem 1.2rem; }
+.review-title { font-family: var(--display); font-size: 1.02rem; margin: 0 0 .45rem; }
+.review-lead { margin: 0 0 .8rem; font-size: .82rem; color: var(--fg-dim); }
+.review-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
+.review-note { font-size: .8rem; color: var(--fg-dim); }
+.review-arts {
+  list-style: none; margin: 0 0 .6rem; padding: .4rem .55rem;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--panel); font-size: .78rem; color: var(--fg);
+  max-height: 12rem; overflow-y: auto;
+}
+.review-arts li { margin: .1rem 0; }
+.review-more { color: var(--fg-dim); }
+
 /* ------------------------------------------------------------------ 抽屉
  *
  * 点卡片 = 右侧抽屉。**默认只读**：用户明确纠正过「默认就是编辑模式，
@@ -448,6 +482,9 @@ button { cursor: pointer; }
 .chip-done      { color: var(--st-done);      border-color: color-mix(in srgb, var(--st-done) 40%, transparent); }
 .chip-failed    { color: var(--st-failed);    border-color: color-mix(in srgb, var(--st-failed) 40%, transparent); }
 .chip-none { color: var(--fg-dim); }
+/* 「待验收」：**不是完成，也不是出错**——是算完了等人认。
+ * 借打包那个紫（另一个「成形了但还没完」的阶段），不新起一套颜色。 */
+.chip-review { color: var(--st-packaging); border-color: color-mix(in srgb, var(--st-packaging) 40%, transparent); }
 
 /* 动作条：中止 / 下载。它们是**动作不是字段**，所以常驻可见——
  * 高频动作要一眼可点（SPEC 20.5）。 */
@@ -854,6 +891,10 @@ button { cursor: pointer; }
 .wfc-share-mark.is-shared {
   color: var(--accent); font-weight: 600;
 }
+/* 「未验收 N 行」。**它会一直挂在那儿**——行照跑照归档，这一批里
+ * 只要还有一行没人认，它就得一直显眼。 */
+.wfc-pending { color: var(--fg-dim); }
+.wfc-pending.is-warn { color: var(--st-packaging); font-weight: 600; }
 
 /* 展开后的行列表。行号列横向粘住：横着看长表时不会把「第几行」滚没。 */
 .wfc-rows { margin-top: .55rem; }

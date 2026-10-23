@@ -1,4 +1,4 @@
-"""三张新表 + tasks 三列的迁移（规格 4.1/4.2/4.3）。
+r"""三张新表 + tasks 六列的迁移（规格 4.1/4.2/4.3 + 2026-10-23 的验收三列）。
 
 只测新库等于没测——线上那个 <数据盘根>\web.db 早在本次改动之前
 就建好了，`CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作。所以这里手写一份
@@ -40,7 +40,16 @@ CREATE TABLE tasks (
 CREATE INDEX idx_tasks_owner ON tasks(owner_id, status);
 """
 
-NEW_TASK_COLUMNS = {"workflow_id", "workflow_row", "workflow_archived"}
+#: **靠 ALTER TABLE ADD COLUMN 补出来的列**（迁移库会把它们排在末尾）。
+#: 前三列是工作流那轮加的，后三列是 2026-10-23 的验收那轮加的
+#: （acceptance / declared / followup）。
+NEW_TASK_COLUMNS = {"workflow_id", "workflow_row", "workflow_archived",
+                    "acceptance", "declared", "followup"}
+
+#: 迁移库末尾的列，**顺序就是 _MISSING_TASK_COLUMNS 里的顺序**
+#: （ALTER TABLE 只能追加，所以它们全排在最后）。
+MIGRATED_TAIL = ["workflow_id", "workflow_row", "workflow_archived",
+                 "acceptance", "declared", "followup"]
 
 
 def _make_legacy(path: Path) -> None:
@@ -141,11 +150,12 @@ def test_init_db_is_idempotent(tmp_path, monkeypatch):
 def test_fresh_and_migrated_tasks_agree_on_names_not_order(tmp_path, monkeypatch):
     """两条路的列名集合必须**完全相同**；但顺序一定不同，代码不得依赖顺序。
 
-    ALTER TABLE ADD COLUMN 只能追加，所以迁移库的 workflow_* 三列永远排在
-    created_at/updated_at/done_at 之后，而 SCHEMA 里它们写在 session_id 之后。
-    这个顺序分叉是结构性的、消不掉（要消只能重建表 + 搬数据），所以真正的契约
-    是列名集合相同——这里断集合，顺带把分叉显式钉出来，免得将来有人照着 docstring
-    「两条路得到同一个结果」写出按位置解包的代码。
+    ALTER TABLE ADD COLUMN 只能追加，所以迁移库的 workflow_* 三列与
+    验收那三列永远排在 created_at/updated_at/done_at 之后，而 SCHEMA 里它们
+    写在 session_id 之后。这个顺序分叉是结构性的、消不掉（要消只能重建表 +
+    搬数据），所以真正的契约是列名集合相同——这里断集合，顺带把分叉显式
+    钉出来，免得将来有人照着 docstring「两条路得到同一个结果」写出按位置
+    解包的代码。
     """
     fresh = tmp_path / "fresh.db"
     monkeypatch.setenv("PROTFORGE_WEB_DB", str(fresh))
@@ -161,9 +171,9 @@ def test_fresh_and_migrated_tasks_agree_on_names_not_order(tmp_path, monkeypatch
     migrated_order = _task_column_order(legacy)
 
     assert set(fresh_order) == set(migrated_order), "两条路的列名集合必须一样"
-    # 顺序确实不同，且分叉点正是被 ALTER 追加到末尾的那三列
+    # 顺序确实不同，且分叉点正是被 ALTER 追加到末尾的那几列
     assert fresh_order != migrated_order
-    assert migrated_order[-3:] == ["workflow_id", "workflow_row", "workflow_archived"]
+    assert migrated_order[-len(MIGRATED_TAIL):] == MIGRATED_TAIL
     assert fresh_order.index("workflow_id") < fresh_order.index("created_at")
 
 

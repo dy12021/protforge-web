@@ -305,6 +305,9 @@ button:disabled { opacity: .45; cursor: default; }
 .chip-packaging { color: var(--st-packaging); border-color: color-mix(in srgb, var(--st-packaging) 40%, transparent); }
 .chip-done      { color: var(--st-done);      border-color: color-mix(in srgb, var(--st-done) 40%, transparent); }
 .chip-failed    { color: var(--st-failed);    border-color: color-mix(in srgb, var(--st-failed) 40%, transparent); }
+/* 「待验收」：算完了但还没人认。借打包那个紫（另一个「成形了但还没完」的
+ * 阶段），不新起一套颜色。 */
+.chip-review    { color: var(--st-packaging); border-color: color-mix(in srgb, var(--st-packaging) 40%, transparent); }
 
 /* 单元格里的动作按钮：连成一排，不要每个都占一整行。 */
 .row-acts { display: flex; gap: .25rem; flex-wrap: wrap; }

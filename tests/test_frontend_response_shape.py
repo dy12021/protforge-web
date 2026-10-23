@@ -69,14 +69,24 @@ _DETAIL_FETCH = re.compile(
 _LIST_CALL = ("GET", "/api/tasks")
 
 
+#: 扫描器看多大一圈来找 detailTask()。
+#:
+#: 原来前后各 60/90 字符——**太窄了**：取数与拆包之间隔着一段（比如
+#: if/else 两个分支各写一次）就套不住，于是明明拆了包，围栏却报没拆。
+#: 放宽到 200 字符不是为了放松这条规矩，而是为了让它别被代码的排版
+#: 触发——那种误报一次，人就会开始忽略它。
+_SCAN_WINDOW = 200
+
+
 def _detail_fetches() -> list[tuple[int, str]]:
-    """返回 (位置, 该处前后 60 字符) —— 逐个核对有没有被 detailTask 包住。"""
+    """返回 (位置, 该处前后若干字符) —— 逐个核对有没有被 detailTask 包住。"""
     code = _code()
     out = []
     for m in _DETAIL_FETCH.finditer(code):
         if (m.group(1), m.group(2)) == _LIST_CALL:
             continue
-        out.append((m.start(), code[max(0, m.start() - 60):m.end() + 90]))
+        out.append((m.start(), code[max(0, m.start() - _SCAN_WINDOW):
+                                    m.end() + _SCAN_WINDOW]))
     return out
 
 
@@ -136,9 +146,17 @@ def test_abort_really_returns_the_envelope(panel, task_id):
 
 
 def test_the_scanner_actually_finds_the_detail_fetches():
-    """防恒真：扫到 0 个就等于什么都没检查。"""
+    """防恒真：扫到 0 个就等于什么都没检查。
+
+    **这个数是手工数出来的**——多一个少一个都要有人看一眼：
+    少一个是扫描器漏扫了（形同虚设），多一个通常是有新的取详情信封的
+    调用点进来了（那要确认它经没经 detailTask）。
+
+    10 个：建任务、打开抽屉、实时刷新、改需求说明、改标题、中止、重跑，
+    加上 2026-10-23 验收那轮的**验收通过 / 打回 / 续跑**三处。
+    """
     found = _detail_fetches()
-    assert len(found) == 7, f"预期 7 个取详情信封的调用点，实际 {len(found)}：{found}"
+    assert len(found) == 10, f"预期 10 个取详情信封的调用点，实际 {len(found)}：{found}"
 
 
 def test_the_scanner_does_not_swallow_the_list_endpoint():
