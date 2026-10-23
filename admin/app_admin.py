@@ -545,8 +545,13 @@ def create_admin_app() -> FastAPI:
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request, exc):
         # PanelError 自己带的中文 detail 原样透出；框架层兜底的才查 svc.HTTP_DETAIL。
+        # **svc.PreciseHTTPException 也要算「自己带的」**：共享/转让那组端点是
+        # 从 server/app.py 挂过来的（mount_workflow_sharing），它们抛的正是它。
+        # 不认它的话，「工作流不存在」会被换成「接口不存在」——越权场景里
+        # 这句提示会把管理员引到完全错的方向。
         return JSONResponse(status_code=exc.status_code,
-                            content={"detail": svc.user_detail(exc, PanelError)})
+                            content={"detail": svc.user_detail(
+                                exc, (PanelError, svc.PreciseHTTPException))})
 
     # --- 静态三件套（零构建零外链，所以自己发就行，不必引 StaticFiles） -------
 
@@ -779,6 +784,33 @@ def create_admin_app() -> FastAPI:
 
         fresh = next((u for u in _list_users() if u["id"] == int(user_id)), None)
         return fresh or target
+
+    # --- 工作流（共享 / 转让）-------------------------------------------------
+    #
+    # 值班台原来**根本没有工作流列表**——它只看任务（行任务算任务）。
+    # 但「谁把工作流共享给了谁、主人是谁」这件事只有工作流这一层才知道，
+    # 所以这里补一个列表：管理员要能在这一层看清归属，并代替 owner 做
+    # 共享 / 转让（他自己对别人的工作流是只读的，但分享这一件事可以代劳）。
+
+    @app.get("/api/admin/workflows")
+    def list_workflows(user: dict = Depends(require_admin)):
+        wfs = store.list_workflows(None, is_admin=True)
+        stats = svc._row_stats([int(w["id"]) for w in wfs])
+        # 标注里的 owner_username / share_count 跟用户面板同一份实现——
+        # 两边各算一次就会漂。
+        marks = store.share_annotations([int(w["id"]) for w in wfs],
+                                        int(user["id"]), is_admin=True)
+        out = []
+        for w in wfs:
+            view = svc._wf_view(w, stats.get(int(w["id"])))
+            view.update(marks.get(int(w["id"]), {}))
+            out.append(view)
+        return {"workflows": out}
+
+    # 共享 / 转让这组端点与用户面板**同一份实现**（server/app.py 里的
+    # mount_workflow_sharing），只是路径前缀与鉴权依赖不同：
+    # 这里挂在 /api/admin 下，鉴权是管理端自己的 require_admin。
+    svc.mount_workflow_sharing(app, prefix="/api/admin", guard=require_admin)
 
     # --- 反思（rsi）------------------------------------------------------------
     #

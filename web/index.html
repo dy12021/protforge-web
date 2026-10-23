@@ -131,6 +131,21 @@
     </form>
   </dialog>
 
+  <!-- 共享 / 转让。**默认只读**：打开先看见「现在有谁在用」，
+       要加人就搜一个账户，要转让得点「转让」再走一步确认。
+       不用 window.prompt：那种框既挑不了账户，也放不下「转让之后你会
+       失去访问」这类后果说明——而没有后果说明的不可撤销动作是危险的。 -->
+  <dialog class="share" id="share">
+    <div class="share-inner">
+      <h2 class="share-title" id="sh-title">共享工作流</h2>
+      <p class="share-lead" id="sh-lead"></p>
+      <div class="share-body" id="sh-body"></div>
+      <div class="composer-actions">
+        <button class="secondary" type="button" id="sh-cancel">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
   <!-- 登录。token 存 localStorage 并走 Authorization 头（不放 Cookie，
        浏览器不会自动附加自定义头，天然免 CSRF）。 -->
   <dialog class="login" id="login">

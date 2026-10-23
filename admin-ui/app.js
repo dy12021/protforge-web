@@ -60,6 +60,8 @@ const state = {
   tasks: [],                 // GET /api/admin/tasks 的快照（最新在前）
   byId: new Map(),           // id -> task
   users: [],                 // 全部账号
+  workflows: [],             // GET /api/admin/workflows（工作流这一层：主人与共享）
+  wfLoaded: false,           // 工作流表拉过没有（页签懒加载用）
   audit: [],                 // 当前这一批审计行（过滤与导出都在前端做）
   auditAll: [],              // 未过滤的原始行（导出的必须是这个，过滤会让人以为只有那么多）
   streams: new Map(),        // taskId -> { stop, ac, lastId }
@@ -1160,6 +1162,139 @@ function syncAuditFilters() {
     state.auditFilter.kind);
 }
 
+// ---------------------------------------------------------------- 7 · 工作流
+//
+// 工作流列表 + 共享 / 转让。
+//
+// 值班台原来只有「任务」这一层（工作流的行也算任务）。但「谁把工作流共享给
+// 了谁、主人是谁」只有工作流这一层知道——任务里存的是行任务，主人是行任务
+// 的归属。所以补这一张表。
+
+async function loadWorkflows() {
+  const got = await api("GET", "/workflows");
+  state.workflows = got.workflows || [];
+  state.wfLoaded = true;
+  renderWorkflows();
+}
+
+function renderWorkflows() {
+  const body = document.getElementById("workflow-rows");
+  body.textContent = "";
+  state.workflows.forEach(w => body.append(workflowRow(w)));
+  const shared = state.workflows.filter(w => Number(w.share_count) > 0).length;
+  document.getElementById("workflows-sub").textContent =
+    state.workflows.length + " 个工作流 · " + shared + " 个共享着";
+  document.getElementById("workflows-empty").hidden = state.workflows.length > 0;
+}
+
+function workflowRow(w) {
+  const tr = el("tr");
+  tr.append(el("td", "c-id", "#" + w.id));
+  tr.append(el("td", "c-title", w.name || "（未命名工作流）"));
+  tr.append(el("td", "c-owner", w.owner_username || "—"));
+  const st = el("td", "c-state");
+  const n = Number(w.share_count) || 0;
+  st.append(el("span", "chip " + (n ? "chip-running" : "chip-none"),
+    n ? ("共享给 " + n + " 人") : "没共享"));
+  tr.append(st);
+  const total = Number(w.total_rows) || 0;
+  const done = Number(w.cursor) || 0;
+  tr.append(el("td", "c-time", done + " / " + total + " 行"));
+  const act = el("td", "c-act");
+  act.append(workflowActs(w));
+  tr.append(act);
+  return tr;
+}
+
+function workflowActs(w) {
+  const box = el("div", "row-acts");
+  const share = el("button", "btn", "共享");
+  share.type = "button";
+  share.onclick = () => doShare(w);
+  box.append(share);
+  const transfer = el("button", "btn btn-warn", "转让");
+  transfer.type = "button";
+  transfer.onclick = () => doTransfer(w);
+  box.append(transfer);
+  return box;
+}
+
+/* 选一个人：**排除主人自己**——把工作流转给自己没有任何意义，
+ * 而下拉里出现「转给我自己」这种选项只是让人多点一次。 */
+function accountSelect(excludeId) {
+  const sel = el("select", "wf-pick");
+  sel.setAttribute("aria-label", "选一个账号");
+  let n = 0;
+  state.users.forEach(u => {
+    if (u.disabled) return;                 // 停用的账号共享过去也用不了
+    if (excludeId != null && Number(u.id) === Number(excludeId)) return;
+    sel.append(new Option(u.username + (u.role === "admin" ? "（管理员）" : ""),
+                          String(u.id)));
+    n += 1;
+  });
+  if (!n) sel.append(new Option("（没有可选的账号）", ""));
+  return sel;
+}
+
+function setWfMsg(text, kind) {
+  const host = document.getElementById("workflows-msg");
+  host.textContent = text || "";
+  host.className = "row-msg" + (kind ? " is-" + kind : "");
+  host.hidden = !text;
+}
+
+async function doShare(w) {
+  const sel = accountSelect(w.owner_id);
+  const body = el("div");
+  body.append(el("h2", "confirm-title",
+    "把「" + (w.name || "未命名工作流") + "」共享给谁？"));
+  body.append(el("p", "confirm-lead",
+    "共享出去的人能看、能跑、能改配置，但不能删除，也不能再共享给别人。"));
+  const list = el("ul", "confirm-list");
+  list.append(el("li", null, "他不会成为主人，工作流还是你的"));
+  list.append(el("li", null, "取消共享即刻收回他的访问"));
+  body.append(list);
+  const field = el("label", "field");
+  field.append(el("span", null, "选一个账号"));
+  field.append(sel);
+  body.append(field);
+  const uid = await confirmBody(body, "确认共享", () => Number(sel.value));
+  if (!uid) return;
+  try {
+    await api("POST", "/workflows/" + w.id + "/shares", { user_id: uid });
+    await loadWorkflows();
+    setWfMsg("已把「" + (w.name || "未命名工作流") + "」共享出去", "ok");
+  } catch (e) {
+    setWfMsg(e.message || "共享失败", "bad");
+  }
+}
+
+async function doTransfer(w) {
+  const sel = accountSelect(w.owner_id);
+  const body = el("div");
+  body.append(el("h2", "confirm-title",
+    "把「" + (w.name || "未命名工作流") + "」转让给谁？"));
+  body.append(el("p", "confirm-lead", "转让之后会变成这样："));
+  const list = el("ul", "confirm-list");
+  list.append(el("li", null, "当前主人立刻失去这个工作流的访问权"));
+  list.append(el("li", null, "已有的行任务、产物、结果全部转到新主人名下"));
+  list.append(el("li", null, "这一步不能撤销"));
+  body.append(list);
+  const field = el("label", "field");
+  field.append(el("span", null, "选一个账号"));
+  field.append(sel);
+  body.append(field);
+  const uid = await confirmBody(body, "确认转让", () => Number(sel.value));
+  if (!uid) return;
+  try {
+    await api("POST", "/workflows/" + w.id + "/transfer", { user_id: uid });
+    await loadWorkflows();
+    setWfMsg("已把「" + (w.name || "未命名工作流") + "」转让出去", "ok");
+  } catch (e) {
+    setWfMsg(e.message || "转让失败", "bad");
+  }
+}
+
 // ---------------------------------------------------------------- 两步确认
 
 /* 两步确认的**标准入口**（静态文案：中止 / 重跑 / 确认归属 / 排除 / 改角色 /
@@ -1248,6 +1383,13 @@ function showTab(name) {
   if (name === "audit" && !state.auditAll.length) {
     loadAudit().catch(e =>
       setMsg(document.getElementById("board-msg"), e.message || "审计日志拉取失败", "bad"));
+  }
+  // 工作流表同理：页签第一次打开时才拉。但**用 wfLoaded 而不是
+  // state.workflows.length** 当闸——「一个工作流都没有」是合法状态，
+  // 拿长度当闸会让它每切一次就重拉一次。
+  if (name === "workflows" && !state.wfLoaded) {
+    loadWorkflows().catch(e =>
+      setMsg(document.getElementById("board-msg"), e.message || "工作流列表拉取失败", "bad"));
   }
   // 反思每次切进来都拉（不像审计那样只拉第一次）：它是有时效的待办，
   // 管理员判完一条回值班台、再切回来时看到的必须是最新那批。
@@ -1416,8 +1558,9 @@ function startClock() {
  * 曾经就有一个 `render` 留在名单里：渲染早就拆成 renderLive / renderTasks 等
  * 几个函数，render 这个名字早就不存在了。整个值班台于是从来没活过。 */
 Object.assign(window, {
-  api, state, el, load, reload: load, loadUsers, loadAudit,
+  api, state, el, load, reload: load, loadUsers, loadAudit, loadWorkflows,
   renderLive, renderPending, renderTasks, renderAudit, renderUsers, setScope,
+  renderWorkflows, workflowRow, workflowActs, doShare, doTransfer,
   fmtTime, fmtMs, fmtSize, STATUS_ORDER, STATUS_LABEL, ROLE_LABEL,
   SOURCE_LABEL, CMD_LABEL, KIND_LABEL, ACTOR_LABEL,
   apiBase, token,

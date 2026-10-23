@@ -104,6 +104,22 @@ CREATE TABLE IF NOT EXISTS workflow_skips (
   created_at TEXT NOT NULL,
   PRIMARY KEY (workflow_id, row_index)
 );
+--: 工作流的**共享**关系：一个工作流可以有多个「协作者」。
+--:
+--: 「转让」不走这张表——转让是把 workflows.owner_id 换掉，共享关系一并清空。
+--: 共享者**不能**删除工作流，也不能再分享/转让（那些只归 owner 与管理员）。
+--: 共享者**能**改配置、能跑/暂停/重跑行。
+--:
+--: 行任务始终记在 workflows.owner_id 名下（否则两个 owner 会往同一张结果表里写）。
+CREATE TABLE IF NOT EXISTS workflow_shares (
+  workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  granted_by  INTEGER NOT NULL,
+  created_at  TEXT NOT NULL,
+  PRIMARY KEY (workflow_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_shares_user ON workflow_shares(user_id);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL, brief TEXT NOT NULL DEFAULT '',

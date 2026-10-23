@@ -674,6 +674,12 @@ class WorkflowIn(BaseModel):
     writeback: bool = True
 
 
+class ShareIn(BaseModel):
+    """共享/转让的目标账户。"""
+
+    user_id: int
+
+
 class SkipIn(BaseModel):
     reason: str = Field(default="", max_length=400)
 
@@ -716,10 +722,119 @@ def require_agent(task_id: int, request: Request) -> int:
 
 # ---------------------------------------------------------------- 用户 API
 
+
+
+# ---------------------------------------------------------------- 共享 / 转让
+#
+# 「共享」= 加一个协作者；「转让」= 把 owner 换掉（旧主人立即失去访问，
+# 已有行任务/产物/结果一起转到新主人名下）。
+#
+# **谁能做**：创建者本人，或者管理员（管理员代替 owner 做——他自己对别人的
+# 工作流是只读的，但在「分享」这一件事上可以代劳）。共享者**不能**再分享、
+# **不能**转让、**不能**删除。
+#
+# 这组端点写成可挂载的函数，是因为管理端（8474）和用户面板（8473）是两个
+# 进程，得挂两次；**路径前缀不同，鉴权依赖也不同**，所以前缀与 guard 都是
+# 参数，不是写死的。
+def mount_workflow_sharing(app: FastAPI, *, prefix: str = "/api",
+                           guard=auth.current_user) -> None:
+    """把「共享 / 转让」这组端点挂到 app 上。
+
+    ``prefix`` 是路径前缀：用户面板 ``/api``，管理端 ``/api/admin``。
+    ``guard`` 是 FastAPI 依赖，返回当前用户 dict——用户面板用
+    ``auth.current_user``（任何登录用户），管理端用它自己的
+    ``require_admin``（只给管理员）。
+    """
+
+    def _wf_or_404(workflow_id: int, user: dict):
+        wf = store.get_workflow(int(workflow_id), is_admin=True)
+        is_admin = (user or {}).get("role") == "admin"
+        return wf, is_admin
+
+    def _assert_can_manage(wf: dict, user: dict, is_admin: bool) -> None:
+        """能不能**管理共享**（加/删共享者、转让）。只有 owner 与管理员。"""
+        if is_admin:
+            return
+        if int(wf["owner_id"]) == int(user["id"]):
+            return
+        # 共享者也不行——他不是主人，没资格再拉人进来或把工作流送走。
+        # 越权一律 404：不承认这个 id 存在。
+        raise PreciseHTTPException(404, "工作流不存在")
+
+    # **不能写成 Depends(_who)**：那会变成 Depends(Depends(...))，FastAPI 直接
+    # 报「not a callable object」。这里持有的是**依赖函数本身**。
+    _who = guard
+
+    @app.get(f"{prefix}/workflows/{{workflow_id}}/shares")
+    def list_shares(workflow_id: int, user=Depends(_who)):
+        """共享名单。owner / 共享者 / 管理员都看得到（共享者要知道还有谁一起用）。"""
+        wf, is_admin = _wf_or_404(workflow_id, user)
+        if not (is_admin or int(wf["owner_id"]) == int(user["id"])) \
+                and not store.can_access_workflow(workflow_id, user["id"]):
+            raise PreciseHTTPException(404, "工作流不存在")
+        return {"shares": store.list_workflow_shares(int(workflow_id)),
+                "owner_id": int(wf["owner_id"])}
+
+    @app.post(f"{prefix}/workflows/{{workflow_id}}/shares")
+    def add_share(workflow_id: int, body: ShareIn, user=Depends(_who)):
+        """把工作流共享给另一个账户。**只有 owner 与管理员**。"""
+        wf, is_admin = _wf_or_404(workflow_id, user)
+        _assert_can_manage(wf, user, is_admin)
+        try:
+            store.add_workflow_share(int(workflow_id), int(body.user_id),
+                                     int(user["id"]))
+        except store.Invalid as exc:
+            raise PreciseHTTPException(422, str(exc)) from exc
+        return {"shares": store.list_workflow_shares(int(workflow_id))}
+
+    @app.delete(f"{prefix}/workflows/{{workflow_id}}/shares/{{user_id}}")
+    def remove_share(workflow_id: int, user_id: int, user=Depends(_who)):
+        """取消共享。**只有 owner 与管理员**。"""
+        wf, is_admin = _wf_or_404(workflow_id, user)
+        _assert_can_manage(wf, user, is_admin)
+        store.remove_workflow_share(int(workflow_id), int(user_id))
+        return {"shares": store.list_workflow_shares(int(workflow_id))}
+
+    @app.post(f"{prefix}/workflows/{{workflow_id}}/transfer")
+    def transfer(workflow_id: int, body: ShareIn, user=Depends(_who)):
+        """把工作流转让给另一个账户。**只有 owner 与管理员**。
+
+        转让后：旧主人立即失去访问；已有的行任务、产物、结果全部转到新主人
+        名下（产物与结果表在磁盘上、与账号无关，不用搬）。
+        """
+        wf, is_admin = _wf_or_404(workflow_id, user)
+        _assert_can_manage(wf, user, is_admin)
+        try:
+            updated = store.transfer_workflow(int(workflow_id), int(body.user_id))
+        except store.Invalid as exc:
+            raise PreciseHTTPException(422, str(exc)) from exc
+        return {"workflow": _wf_view(updated)}
+
+
+def mount_user_search(app: FastAPI, *, prefix: str = "/api",
+                      guard=auth.current_user) -> None:
+    """挂一个**搜账户**的端点（共享时挑人用）。
+
+    只给 id / 用户名 / 角色——**不给密码哈希之类的东西**。这个端点对任何
+    登录用户开着：共享工作流要挑人，不能只让管理员能搜。
+
+    管理端**不挂**这个：那边已经有 ``GET /api/admin/users``（全量账号表，
+    管理员专用），路径会撞。
+    """
+
+    @app.get(f"{prefix}/users")
+    def users(q: str = Query(default="", max_length=100),
+              user=Depends(guard)):
+        return {"users": store.search_users(q)}
+
+
 def create_public_app() -> FastAPI:
     db.init_db()
     app = FastAPI(title="蛋白计算平台", version=VERSION)
     _install_common(app)
+    mount_workflow_sharing(app, prefix="/api", guard=auth.current_user)
+    mount_user_search(app, prefix="/api", guard=auth.current_user)
+
 
     @app.post("/api/auth/login")
     def login(body: LoginIn):
@@ -769,13 +884,11 @@ def create_public_app() -> FastAPI:
     @app.get("/api/tasks/{task_id}")
     def get_task(task_id: int, user=Depends(auth.current_user)):
         # 越权走 store.get_task → NotFound → 404，不返 403（不承认 id 存在）
-        return _detail(store.get_task(task_id, owner_id=user["id"],
-                                       is_admin=user["role"] == "admin"))
+        return _detail(store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin"))
 
     @app.patch("/api/tasks/{task_id}")
     def patch_task(task_id: int, body: TaskPatch, user=Depends(auth.current_user)):
-        task = store.get_task(task_id, owner_id=user["id"],
-                              is_admin=user["role"] == "admin")
+        task = store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")
         fields, changed = {}, []
         if body.title is not None:
             title = body.title.strip()
@@ -803,8 +916,7 @@ def create_public_app() -> FastAPI:
 
     @app.delete("/api/tasks/{task_id}")
     def delete_task(task_id: int, user=Depends(auth.current_user)):
-        task = store.get_task(task_id, owner_id=user["id"],
-                              is_admin=user["role"] == "admin")     # 越权 → 404
+        task = store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")     # 越权 → 404
         if task.get("workflow_id") is not None:
             # 删掉行任务后归档再也扫不到它 → 那一行的结果静默丢失，而闸门②
             # 因为该行不见了反而满足，整批继续往下跑（规格 6.5 洞三）。
@@ -829,8 +941,7 @@ def create_public_app() -> FastAPI:
         会被 422 拒掉（收口标记还在），而归档标记不清的话这一行的新结果
         永远写不回结果表。和管理员点「重跑」是同一套语义。
         """
-        task = store.get_task(task_id, owner_id=user["id"],
-                               is_admin=user["role"] == "admin")
+        task = store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")
         if task["status"] not in db.TERMINAL_STATUSES:
             raise PreciseHTTPException(422, "任务还在进行中，不需要重跑")
         store.update_task(task_id, done_at=None, step="", error="",
@@ -847,8 +958,7 @@ def create_public_app() -> FastAPI:
 
     @app.post("/api/tasks/{task_id}/abort")
     def abort(task_id: int, user=Depends(auth.current_user)):
-        task = store.get_task(task_id, owner_id=user["id"],
-                              is_admin=user["role"] == "admin")
+        task = store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")
         if task["status"] in db.TERMINAL_STATUSES:
             raise PreciseHTTPException(
                 422, f"任务{db.STATUS_LABEL.get(task['status'])}了，不能再中止")
@@ -875,8 +985,7 @@ def create_public_app() -> FastAPI:
         处理器是 `async def`：响应体是一条长连接，必须挂在事件循环上；
         鉴权依赖 current_user 是同步函数，由 FastAPI 自己丢线程池，不影响。
         """
-        store.get_task(task_id, owner_id=user["id"],
-                       is_admin=user["role"] == "admin")
+        store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")
         raw = request.headers.get("Last-Event-ID")
         if raw is None:
             raw = request.query_params.get("last_event_id")
@@ -896,8 +1005,7 @@ def create_public_app() -> FastAPI:
 
     @app.get("/api/tasks/{task_id}/package")
     def download(task_id: int, user=Depends(auth.current_user)):
-        task = store.get_task(task_id, owner_id=user["id"],
-                              is_admin=user["role"] == "admin")
+        task = store.get_task_for(task_id, user["id"], is_admin=user["role"] == "admin")
         if task["status"] not in db.TERMINAL_STATUSES:
             raise PreciseHTTPException(409, "结果包还在生成中，任务完成后才能下载")
         raw = (task.get("package_path") or "").strip()
@@ -945,7 +1053,8 @@ def create_public_app() -> FastAPI:
         用户把一列解绑再保存，旧列行必须消失，否则它继续参与渲染。
         """
         import workflow as wfmod
-        wf = store.get_workflow(body.workflow_id, owner_id=user["id"])
+        # 共享者**可以改配置**（用户 2026-10-23 明确要的）。
+        wf = store.get_workflow_for(body.workflow_id, user["id"])
         cols = [c.model_dump() for c in body.columns]
         wfmod.validate_binding(body.prompt_template, cols)     # 服务端强校验
         fields = {"prompt_template": body.prompt_template,
@@ -955,32 +1064,50 @@ def create_public_app() -> FastAPI:
             fields["name"] = body.name.strip()
         store.update_workflow(body.workflow_id, **fields)
         store.set_workflow_columns(body.workflow_id, cols)
-        return {"workflow": _wf_view(
-            store.get_workflow(int(wf["id"]), owner_id=user["id"]))}
+        # **取回更新后的行**用 is_admin=True：归属校验在上面已经做过
+        # （get_workflow_for），这里再按 owner 过滤一遍，共享者会拿到 404——
+        # 也就是说配置其实已经存下去了，界面却报「工作流不存在」。
+        return {"workflow": _wf_view(store.get_workflow(int(wf["id"]), is_admin=True))}
 
     @app.get("/api/workflows")
     def list_workflows(user=Depends(auth.current_user)):
         is_admin = user["role"] == "admin"
         wfs = store.list_workflows(
-            None if is_admin else user["id"], is_admin=is_admin)
+            None if is_admin else user["id"], is_admin=is_admin,
+            include_shared=not is_admin)
         # 卡片要显示失败数与「当前在跑第几行」（规格 8.2 列表那条 / 7.4
         # 「失败行数放到最显眼处」）。前端不编这个数：列表端点原来只有
         # SELECT * FROM workflows，而失败数不在 workflows 表里——所以它只能
         # 由行任务算出来。算的地方在这一处，**一次 GROUP BY 覆盖全部卡片**。
         stats = _row_stats([w["id"] for w in wfs])
-        return {"workflows": [_wf_view(w, stats.get(int(w["id"])))
-                              for w in wfs]}
+        # 共享标注也是**一次查完**：共享者看到的卡片要标明「这是共享给我的」，
+        # 不然他会以为自己能删它（他不能）。
+        marks = store.share_annotations([w["id"] for w in wfs], user["id"],
+                                        is_admin=is_admin)
+        out = []
+        for w in wfs:
+            view = _wf_view(w, stats.get(int(w["id"])))
+            view.update(marks.get(int(w["id"]), {}))
+            out.append(view)
+        return {"workflows": out}
 
     @app.get("/api/workflows/{workflow_id}")
     def get_workflow(workflow_id: int, user=Depends(auth.current_user)):
         is_admin = user["role"] == "admin"
-        wf = store.get_workflow(workflow_id, owner_id=user["id"],
-                                is_admin=is_admin)
+        wf = store.get_workflow_for(workflow_id, user["id"],
+                                     is_admin=is_admin, allow_admin=True)
         pkgs = _row_packages(workflow_id)
-        return {"workflow": _wf_view(wf),
+        view = _wf_view(wf)
+        view.update(store.share_annotations([int(workflow_id)], user["id"],
+                                            is_admin=is_admin)
+                  .get(int(workflow_id), {}))
+        return {"workflow": view,
                 "columns": store.list_workflow_columns(workflow_id),
                 "skips": sorted(store.list_workflow_skips(workflow_id)),
                 "rows": store.list_workflow_rows(workflow_id),
+                # 共享名单一并给：共享对话框要显示「现在有谁在用」，不为这个
+                # 单独再拉一次请求。
+                "shares": store.list_workflow_shares(workflow_id),
                 # **产物包件数与总大小**：前端据此显示「N 个 · X MB」并决定
                 # 要不要给下载入口。少了它，用户只能先点进去才知道有没有东西可下。
                 "packages_count": len(pkgs),
@@ -996,8 +1123,9 @@ def create_public_app() -> FastAPI:
         skip/delete，不是「看不见」。预览是纯读操作，不泄露任何写能力，所以跟
         列表/详情/结果表同属值班台可见项。"""
         import workflow as wfmod
-        wf = store.get_workflow(workflow_id, owner_id=user["id"],
-                                is_admin=user["role"] == "admin")
+        wf = store.get_workflow_for(workflow_id, user["id"],
+                                     is_admin=user["role"] == "admin",
+                                     allow_admin=True)
         source = Path(wf["source_path"])
         view = wfmod.read_source(source, header_row=int(wf["header_row"]))
         values = wfmod.row_values(source, view, int(row))
@@ -1020,7 +1148,9 @@ def create_public_app() -> FastAPI:
         """
         if action not in WORKFLOW_ACTIONS:
             raise PreciseHTTPException(422, "没有这个操作")
-        wf = store.get_workflow(workflow_id, owner_id=user["id"])   # 管理员也按 owner
+        # owner 或共享者。**管理员对别人的工作流仍然是只读的**（值班台
+        # 只读是既有设计），除非他本来就是 owner 或共享者。
+        wf = store.get_workflow_for(workflow_id, user["id"])
         if action in ("start", "resume"):
             if wf["prompt_template"] == PROMPT_PLACEHOLDER:
                 raise PreciseHTTPException(
@@ -1056,7 +1186,7 @@ def create_public_app() -> FastAPI:
         还没有行任务的那些行，调度器放行到它时会补一条**建出来就是终态**的
         任务（同样不会被跑），由归档 pass 写「已跳过」。两种顺序都收敛。
         """
-        wf = store.get_workflow(workflow_id, owner_id=user["id"])
+        wf = store.get_workflow_for(workflow_id, user["id"])
         store.skip_workflow_row(workflow_id, row_index, body.reason)
         for row in store.list_workflow_rows(workflow_id, row_index):
             if row["status"] not in db.TERMINAL_STATUSES:
@@ -1070,8 +1200,9 @@ def create_public_app() -> FastAPI:
 
     @app.get("/api/workflows/{workflow_id}/result.xlsx")
     def download_result(workflow_id: int, user=Depends(auth.current_user)):
-        wf = store.get_workflow(workflow_id, owner_id=user["id"],
-                                is_admin=user["role"] == "admin")
+        wf = store.get_workflow_for(workflow_id, user["id"],
+                                     is_admin=user["role"] == "admin",
+                                     allow_admin=True)
         # 判据两条，都是「有没有理由生成结果表」，**不是** status：
         # ① 配了 output 列吗？没有的话调度器压根不生成 result.xlsx；
         # ② 回写开关开着吗？规格 9.1 明写「开关打开时才有」——关掉之后结果
@@ -1104,8 +1235,9 @@ def create_public_app() -> FastAPI:
         **压缩方式用 ZIP_STORED**：里面装的本来就是 zip，再压一遍只烧 CPU
         （几百 MB 的文件反复 deflate）而几乎不省空间——实测省不到 3%。
         """
-        wf = store.get_workflow(workflow_id, owner_id=user["id"],
-                                is_admin=user["role"] == "admin")
+        wf = store.get_workflow_for(workflow_id, user["id"],
+                                     is_admin=user["role"] == "admin",
+                                     allow_admin=True)
         items = _row_packages(workflow_id)
         if not items:
             raise PreciseHTTPException(404, "这一批还没有可下载的产物包")

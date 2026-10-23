@@ -289,6 +289,53 @@ button { cursor: pointer; }
 .confirm-actions .danger:hover { background: color-mix(in srgb, var(--st-failed) 88%, #000); }
 .confirm-actions .secondary { padding: .45rem .9rem; }
 
+/* 共享 / 转让面板。
+ * 宽一点：名单 + 搜索 + 转让下拉挤在 27rem 里会换行成一小块一小时的字。 */
+.share {
+  border: 1px solid var(--border); border-radius: 14px; padding: 0;
+  width: min(34rem, 94vw); background: var(--card); color: var(--fg);
+  box-shadow: 0 24px 64px rgba(21,32,51,.22);
+}
+.share::backdrop { background: rgba(23,32,45,.34); }
+.share-inner { padding: 1.1rem 1.2rem 1.2rem; }
+.share-title {
+  font-family: var(--display); font-size: 1.02rem; margin: 0 0 .45rem;
+  overflow-wrap: anywhere;
+}
+.share-lead { margin: 0 0 .8rem; font-size: .82rem; color: var(--fg-dim); }
+.share-body { font-size: .84rem; color: var(--fg); }
+.share-sec { margin-bottom: 1rem; }
+.share-sec:last-child { margin-bottom: 0; }
+.share-h {
+  font-family: var(--display); font-size: .88rem; margin: 0 0 .35rem;
+}
+.share-note { margin: 0 0 .5rem; font-size: .78rem; color: var(--fg-dim); }
+.share-list { list-style: none; margin: 0; padding: 0; }
+.share-list li { margin: .12rem 0; }
+.share-row {
+  display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+  padding: .3rem 0; border-bottom: 1px solid var(--line);
+}
+.share-list li.share-row:last-child { border-bottom: 0; }
+.share-name { font-weight: 600; }
+.share-tag {
+  font-size: .72rem; color: var(--fg-dim); border: 1px solid var(--border);
+  border-radius: 999px; padding: .05rem .45rem;
+}
+.share-empty { color: var(--fg-dim); font-size: .8rem; }
+.share-search {
+  width: 100%; border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: .42rem .6rem; font: inherit; background: var(--panel); color: var(--fg);
+}
+.share-search:focus { border-color: var(--accent); background: var(--card); }
+.share-select {
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: .38rem .5rem; font: inherit; background: var(--panel); color: var(--fg);
+}
+.share-msg { margin: .5rem 0 0; font-size: .78rem; color: var(--fg-dim); min-height: 1rem; }
+.share-msg.is-good { color: var(--st-done); }
+.share-msg.is-bad { color: var(--st-failed); }
+
 /* ------------------------------------------------------------------ 抽屉
  *
  * 点卡片 = 右侧抽屉。**默认只读**：用户明确纠正过「默认就是编辑模式，
@@ -800,6 +847,13 @@ button { cursor: pointer; }
   display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; margin-top: .45rem;
 }
 .wfc-ctrl { display: inline-flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+
+/* 共享标注。**共享来的**要跟自己的活分得开——颜色 + 一句话，
+   不然共享者会在自己的列表里看到一个自己不能删的东西。 */
+.wfc-share-mark { color: var(--fg-dim); }
+.wfc-share-mark.is-shared {
+  color: var(--accent); font-weight: 600;
+}
 
 /* 展开后的行列表。行号列横向粘住：横着看长表时不会把「第几行」滚没。 */
 .wfc-rows { margin-top: .55rem; }

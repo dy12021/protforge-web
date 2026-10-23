@@ -667,18 +667,294 @@ def create_workflow(owner_id: int, name: str, prompt_template: str, *,
     return dict(row)
 
 
-def list_workflows(owner_id=None, *, is_admin: bool = False) -> list[dict]:
+def list_workflows(owner_id=None, *, is_admin: bool = False,
+                   include_shared: bool = False) -> list[dict]:
+    """列工作流。``include_shared`` 把「共享给我的」也算进来。
+
+    共享者看到的这些工作流**不是他的**（owner 还是别人），所以卡片上
+    要标出「共享」——不然他会在自己的列表里看到一个自己不能删的东西。
+    """
     sql = "SELECT * FROM workflows"
     where, args = [], []
     if not is_admin and owner_id is not None:
-        where.append("owner_id = ?")
-        args.append(int(owner_id))
+        if include_shared:
+            shared = sorted(shared_workflow_ids(int(owner_id)))
+            if shared:
+                marks = ",".join("?" * len(shared))
+                where.append("(owner_id = ? OR id IN (" + marks + "))")
+                args.append(int(owner_id))
+                args.extend(shared)
+            else:
+                where.append("owner_id = ?")
+                args.append(int(owner_id))
+        else:
+            where.append("owner_id = ?")
+            args.append(int(owner_id))
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY id DESC"
     c = db.connect()
     try:
         return [dict(r) for r in c.execute(sql, args).fetchall()]
+    finally:
+        c.close()
+
+
+
+
+def user_exists(user_id: int) -> bool:
+    """这个 id 上有没有账号。
+
+    **不走 auth.get_user**：auth 那一层会把账号**裁剪成公开字段**，而这里
+    只想知道「行不行」；再者 store 不该反过来依赖 auth（auth 也用 db）。
+    """
+    c = db.connect()
+    try:
+        return c.execute("SELECT 1 FROM users WHERE id = ?",
+                         (int(user_id),)).fetchone() is not None
+    finally:
+        c.close()
+
+
+def user_disabled(user_id: int) -> bool:
+    """账号被停用了吗（不存在也算「不可用」）。"""
+    c = db.connect()
+    try:
+        row = c.execute("SELECT disabled FROM users WHERE id = ?",
+                        (int(user_id),)).fetchone()
+        return row is None or bool(row["disabled"])
+    finally:
+        c.close()
+
+
+def search_users(q: str = "", limit: int = 50) -> list[dict]:
+    """按用户名搜账户（共享时选人用）。**只给 id / 用户名 / 角色**。
+
+    密码哈希之类的东西一律不给——这个接口对**任何登录用户**开着，
+    共享工作流时要挑人，不能只让管理员能搜。
+
+    默认回 50 条：账号多的时候，空查询那一条列表要够用；**再往后的靠搜索**，
+    所以界面上必须写明「只显示前 N 个」，不能让用户以为平台上就这么些人。
+    """
+    q = (q or "").strip()
+    like = "%" + q + "%"
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT id, username, role FROM users"
+            " WHERE disabled = 0 AND username LIKE ?"
+            " ORDER BY username LIMIT ?",
+            (like, int(limit)))]
+    finally:
+        c.close()
+
+
+def shared_workflow_ids(user_id: int) -> set[int]:
+    """共享给我的那些工作流的 id。"""
+    c = db.connect()
+    try:
+        return {int(r[0]) for r in c.execute(
+            "SELECT workflow_id FROM workflow_shares WHERE user_id = ?",
+            (int(user_id),))}
+    finally:
+        c.close()
+
+
+def list_workflow_shares(workflow_id: int) -> list[dict]:
+    """共享名单（带用户名）。"""
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT s.workflow_id, s.user_id, s.granted_by, s.created_at, u.username"
+            " FROM workflow_shares s JOIN users u ON u.id = s.user_id"
+            " WHERE s.workflow_id = ? ORDER BY u.username",
+            (int(workflow_id),))]
+    finally:
+        c.close()
+
+
+def share_annotations(workflow_ids: list[int], viewer_id: int,
+                      *, is_admin: bool = False) -> dict[int, dict]:
+    """给一批工作流补上「共享」标注（一次查完，不在循环里打数据库）。
+
+    每个工作流给四个键：
+
+    - ``owner_username``：主人的用户名。共享者在自己的列表里看到别人的
+      工作流，得知道这是谁的东西。
+    - ``is_owner``：这份工作流**是不是我创建的**。
+    - ``shared_with_me``：这份工作流**是不是明确共享给我的**（我真在共享
+      名单里）。**跟 ``is_owner`` 分开**，因为管理员看全量列表时几乎每张卡
+      都不是他的，但「不是我的」≠「共享给我的」——混成一个标志就会在值班台
+      上给所有卡片打「共享」标记。
+    - ``share_count``：还有几个人一起用。
+    """
+    ids = [int(i) for i in workflow_ids]
+    if not ids:
+        return {}
+    out: dict[int, dict] = {}
+    c = db.connect()
+    c.row_factory = sqlite3.Row
+    try:
+        marks = ",".join("?" * len(ids))
+        owners = {int(r["id"]): r["username"] for r in c.execute(
+            "SELECT id, username FROM users WHERE id IN ("
+            "SELECT DISTINCT owner_id FROM workflows WHERE id IN (" + marks + "))",
+            ids)}
+        shares = {i: [] for i in ids}
+        for r in c.execute(
+                "SELECT workflow_id, user_id FROM workflow_shares"
+                " WHERE workflow_id IN (" + marks + ")", ids):
+            shares[int(r["workflow_id"])].append(int(r["user_id"]))
+        wfs = {int(r["id"]): int(r["owner_id"]) for r in c.execute(
+            "SELECT id, owner_id FROM workflows WHERE id IN (" + marks + ")", ids)}
+    finally:
+        c.close()
+    for wid, owner_id in wfs.items():
+        members = shares.get(wid, [])
+        out[wid] = {
+            "owner_username": owners.get(owner_id, ""),
+            "is_owner": owner_id == int(viewer_id),
+            "shared_with_me": int(viewer_id) in members,
+            "share_count": len(members),
+        }
+    return out
+
+
+def add_workflow_share(workflow_id: int, user_id: int, granted_by: int) -> dict:
+    """加一个共享者。**不能把自己加进去**（那不是共享）。"""
+    wf = get_workflow(int(workflow_id), is_admin=True)
+    if int(wf["owner_id"]) == int(user_id):
+        raise Invalid("创建者自己就有全部权限，不用共享给自己")
+    if not user_exists(int(user_id)):
+        raise Invalid("账号不存在")
+    if user_disabled(int(user_id)):
+        # 停用的账号共享过去也用不了：他会登录失败，而主人却看到「已共享」。
+        raise Invalid("这个账号已停用，共享过去他也用不了")
+    c = db.connect()
+    try:
+        with c:
+            c.execute(
+                "INSERT OR REPLACE INTO workflow_shares"
+                " (workflow_id, user_id, granted_by, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (int(workflow_id), int(user_id), int(granted_by), db.now_iso()))
+    finally:
+        c.close()
+    return {"workflow_id": int(workflow_id), "user_id": int(user_id)}
+
+
+def remove_workflow_share(workflow_id: int, user_id: int) -> bool:
+    """取消共享。返回是不是真删掉了。"""
+    c = db.connect()
+    try:
+        with c:
+            cur = c.execute(
+                "DELETE FROM workflow_shares WHERE workflow_id = ? AND user_id = ?",
+                (int(workflow_id), int(user_id)))
+            return cur.rowcount > 0
+    finally:
+        c.close()
+
+
+def transfer_workflow(workflow_id: int, new_owner_id: int) -> dict:
+    """把工作流转让给另一个账号。
+
+    **已有行任务一起转**：行任务的 owner_id 是工作流 owner 的那份，不转的话
+    新主人看不到历史行，而旧主人反而还能在「全部任务」里看到——归属错位。
+    产物与结果表在 ``data/workflows/<id>/``，与账号无关，不用搬。
+    **共享关系一并清空**：旧主人的共享者身份（如果有）也要失效。
+    """
+    wf = get_workflow(int(workflow_id), is_admin=True)
+    if int(wf["owner_id"]) == int(new_owner_id):
+        raise Invalid("已经是他的了")
+    if not user_exists(int(new_owner_id)):
+        raise Invalid("账号不存在")
+    if user_disabled(int(new_owner_id)):
+        # 转让给停用账号 = 把工作流扔掉：没人能登录，也就没人能跑它。
+        raise Invalid("这个账号已停用，转让过去就没人能用了")
+    c = db.connect()
+    try:
+        with c:
+            c.execute("UPDATE workflows SET owner_id = ?, updated_at = ? WHERE id = ?",
+                      (int(new_owner_id), db.now_iso(), int(workflow_id)))
+            c.execute("UPDATE tasks SET owner_id = ? WHERE workflow_id = ?",
+                      (int(new_owner_id), int(workflow_id)))
+            c.execute("DELETE FROM workflow_shares WHERE workflow_id = ?",
+                      (int(workflow_id),))
+    finally:
+        c.close()
+    return get_workflow(int(workflow_id), is_admin=True)
+
+
+def can_access_workflow(workflow_id: int, user_id: int, *,
+                          is_admin: bool = False) -> bool:
+    """这个人能不能**访问**这个工作流：owner / 共享者 / 管理员。
+
+    「能不能访问」与「能不能改」是两件事——共享者能访问、能改配置，
+    但不能删除、不能再分享（那两件事只归 owner 与管理员）。
+    """
+    if is_admin:
+        return True
+    wf = get_workflow(int(workflow_id), is_admin=True)
+    if int(wf["owner_id"]) == int(user_id):
+        return True
+    c = db.connect()
+    try:
+        r = c.execute(
+            "SELECT 1 FROM workflow_shares WHERE workflow_id = ? AND user_id = ?",
+            (int(workflow_id), int(user_id))).fetchone()
+        return r is not None
+    finally:
+        c.close()
+
+
+def get_task_for(task_id: int, user_id: int, *, is_admin: bool = False) -> dict:
+    """取单个任务，越权 404（不承认 id 存在）。
+
+    比 :func:`get_task` 多认一种人：**这个任务所属工作流的共享者**。
+
+    为什么必须多这一种：行任务的归属记的是**工作流的主人**（规格 8 裁定 2），
+    所以共享者在 ``tasks.owner_id`` 上永远对不上——按 owner 校验的话，他连
+    自己共享来的那一行都重跑不了、下载不了，那「共享者能干活」就只剩一张
+    看得见的表。
+    """
+    t = get_task(task_id, is_admin=True)
+    if is_admin:
+        return t
+    if int(t["owner_id"]) == int(user_id):
+        return t
+    wid = t.get("workflow_id")
+    if wid is not None and can_access_workflow(int(wid), int(user_id)):
+        return t
+    raise NotFound("任务不存在")
+
+
+def get_workflow_for(workflow_id: int, user_id: int, *,
+                      is_admin: bool = False,
+                      allow_admin: bool = False) -> dict:
+    """取工作流，越权一律 NotFound（**404，不承认这个 id 存在**）。
+
+    谁能拿到：owner、共享者，以及（``allow_admin=True`` 时）管理员。
+
+    **``allow_admin`` 只给只读端点用。** 管理员对别人的工作流是**只读**的
+    （值班台需要看得见），写操作一律传 False——除非他本来就是 owner 或共享者。
+    管理端「代替 owner 分享/转让」是另一个动作，走共享端点自己那套校验。
+    """
+    wf = get_workflow(int(workflow_id), is_admin=True)
+    if int(wf["owner_id"]) == int(user_id):
+        return wf
+    if allow_admin and is_admin:
+        return wf
+    c = db.connect()
+    try:
+        r = c.execute(
+            "SELECT 1 FROM workflow_shares WHERE workflow_id = ? AND user_id = ?",
+            (int(workflow_id), int(user_id))).fetchone()
+        if r is None:
+            raise NotFound("工作流不存在")
+        return wf
     finally:
         c.close()
 

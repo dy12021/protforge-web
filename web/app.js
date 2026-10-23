@@ -1281,6 +1281,7 @@ function makeWorkflowCard(w) {
   meta.append(el("span", "wfc-id", "#" + w.id));
   meta.append(el("span", "wfc-count"));
   meta.append(el("span", "wfc-failed"));
+  meta.append(el("span", "wfc-share-mark"));
   card.append(meta);
 
   const bar = el("div", "bar");
@@ -1291,7 +1292,7 @@ function makeWorkflowCard(w) {
   card.append(stats);
 
   const acts = el("div", "wfc-acts");
-  const toggle = el("button", "btn", "展开");
+  const toggle = el("button", "btn wfc-toggle", "展开");
   toggle.type = "button";
   toggle.onclick = () => toggleWorkflow(Number(w.id));
   acts.append(toggle);
@@ -1299,6 +1300,12 @@ function makeWorkflowCard(w) {
   edit.type = "button";
   edit.onclick = () => openComposerForWorkflow(Number(w.id));
   acts.append(edit);
+  /* 「共享」按钮。**能不能看见由 paintWorkflowCard 决定**（owner 或管理员），
+   * 这里只是先把节点建出来——卡片是复用的，重建会丢滚动位置与展开状态。 */
+  const share = el("button", "btn wfc-share-btn", "共享");
+  share.type = "button";
+  share.onclick = () => openShare(Number(w.id));
+  acts.append(share);
   acts.append(el("span", "wfc-ctrl"));
   card.append(acts);
 
@@ -1381,6 +1388,29 @@ function paintWorkflowCard(card, w) {
   toggle.textContent = open ? "收起" : "展开";
   card.querySelector(".wfc-rows").hidden = !open;
   if (open) paintWorkflowRows(card.querySelector(".wfc-rows"), id);
+
+  /* 共享标注：**共享来的**要写明是谁共享给我的、**我共享出去的**要写明有几个人。
+   * 不写的话，共享者会在自己的列表里看到一个自己不能删的东西，主人也看不出
+   * 这批活是不是已经摊给了别人。 */
+  const mark = card.querySelector(".wfc-share-mark");
+  if (mark) {
+    const n = Number(w.share_count) || 0;
+    if (w.shared_with_me === true) {
+      mark.textContent = "共享给我 · 来自 " + (w.owner_username || "别人");
+      mark.className = "wfc-share-mark is-shared";
+    } else if (n > 0) {
+      mark.textContent = "共享给 " + n + " 人";
+      mark.className = "wfc-share-mark";
+    } else {
+      mark.textContent = "";
+      mark.className = "wfc-share-mark";
+    }
+  }
+  /* 「共享」只给创建者与管理员。共享者自己不能加人、不能转让——那是主人的权限。 */
+  const shareBtn = card.querySelector(".wfc-share-btn");
+  if (shareBtn) {
+    shareBtn.hidden = !(w.is_owner === true || isAdmin());
+  }
 }
 
 function wfControlBtn(id, action, label) {
@@ -1576,6 +1606,281 @@ async function downloadTaskPackage(taskId, rowNo) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 20000);
+}
+
+// ---------------------------------------------------------------- 共享 / 转让
+//
+// 两件事，语义完全不同，界面上也必须分开：
+//   - **共享**：加一个协作者。他能看、能跑、能改配置，但不能删除、不能再分享。
+//   - **转让**：换主人。旧主人**立刻失去访问**，已有的行任务/产物/结果
+//     全部转到新主人名下。
+//
+// 谁能做：创建者本人，或者管理员（管理员代替 owner 操作——他对别人的工作流
+// 本来是只读的，但归属问题得有人能处理）。共享者**只能看**这份名单。
+//
+// **转让的二次确认做在对话框内部**，不套第二层 dialog：两个 <dialog> 叠着时
+// 关闭顺序不可靠（Esc 传给谁、先关哪个都不确定），而转让是不可撤销的。
+const shareCtx = {
+  wfId: null,
+  wf: null,          // 工作流视图（含 is_owner / owner_username）
+  shares: [],        // [{user_id, username, ...}]
+  canManage: false,  // 能不能加/删/转让
+  users: [],         // 搜到的账户
+  mode: "browse",    // browse | transfer
+  transferTo: null,  // 待确认转让给谁
+};
+
+async function openShare(id) {
+  try {
+    const d = await api("GET", "/api/workflows/" + id);
+    shareCtx.wfId = Number(id);
+    shareCtx.wf = d.workflow || {};
+    shareCtx.shares = d.shares || [];
+    shareCtx.canManage = shareCtx.wf.is_owner === true || isAdmin();
+    shareCtx.users = [];
+    shareCtx.mode = "browse";
+    shareCtx.transferTo = null;
+    renderShare();
+    const dlg = document.getElementById("share");
+    if (!dlg.open) dlg.showModal();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"),
+      e.message || "打不开共享面板", "bad");
+  }
+}
+
+function renderShare() {
+  const body = document.getElementById("sh-body");
+  const wf = shareCtx.wf || {};
+  document.getElementById("sh-title").textContent =
+    "共享「" + (wf.name || "未命名工作流") + "」#" + (wf.id || shareCtx.wfId);
+  document.getElementById("sh-lead").textContent = shareCtx.canManage
+    ? "共享是加一个人一起用，转让是把整个工作流送走——两回事，别点错。"
+    : "这个工作流是共享给你的。你能看、能跑、能改配置，但不能删除，也不能再分享给别人。";
+  body.textContent = "";
+  if (shareCtx.mode === "transfer") { renderTransferConfirm(); return; }
+
+  /* 谁是主人、现在有谁在用。**共享者也看得到这份名单**——他要知道还有谁
+   * 跟自己用着同一批活。 */
+  const head = el("div", "share-sec");
+  head.append(el("h3", "share-h", "现在有谁在用"));
+  head.append(el("p", "share-note",
+    "创建者：" + (wf.owner_username || "（未知）")
+    + "。共享出去的人能看、能跑、能改配置，但不能删除，也不能再分享给别人。"));
+  const list = el("ul", "share-list");
+  if (!shareCtx.shares.length) {
+    list.append(el("li", "share-empty", "还没有共享给任何人。"));
+  }
+  shareCtx.shares.forEach(s => {
+    const li = el("li", "share-row");
+    li.append(el("span", "share-name", s.username || ("#" + s.user_id)));
+    if (shareCtx.canManage) {
+      const rm = el("button", "btn btn-warn", "取消共享");
+      rm.type = "button";
+      rm.onclick = () => doRemoveShare(s);
+      li.append(rm);
+    }
+    list.append(li);
+  });
+  head.append(list);
+  body.append(head);
+
+  if (!shareCtx.canManage) {
+    body.append(el("p", "share-note",
+      "你不是创建者，所以这里只能看。要加人或转让，请找创建者。"));
+    return;
+  }
+
+  /* 加一个人：搜账号。**结果里直接给「共享给他」**，省得再挑一次。 */
+  const add = el("div", "share-sec");
+  add.append(el("h3", "share-h", "加一个人"));
+  const input = el("input", "share-search");
+  input.type = "search";
+  input.placeholder = "搜用户名";
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", "搜用户名");
+  add.append(input);
+  const hits = el("ul", "share-list");
+  hits.id = "sh-hits";
+  add.append(hits);
+  body.append(add);
+
+  /* 转让：另起一节，与「共享」在视觉上分开——一个是加一个人，一个是把
+   * 整个工作流送走，混在一张列表里点错一次就是不可撤销的损失。 */
+  const tr = el("div", "share-sec");
+  tr.append(el("h3", "share-h", "转让整个工作流"));
+  tr.append(el("p", "share-note",
+    "转让之后你立刻失去这个工作流的访问权，已有的行任务、产物、结果全部转到"
+    + "新主人名下。这一步不能撤销。"));
+  const row = el("div", "share-row");
+  const sel = el("select", "share-select");
+  sel.id = "sh-transfer-sel";
+  sel.setAttribute("aria-label", "选一个接管人");
+  row.append(sel);
+  const go = el("button", "btn btn-warn", "转让给他");
+  go.type = "button";
+  go.onclick = () => {
+    const uid = Number(sel.value);
+    const u = shareCtx.users.find(x => Number(x.id) === uid);
+    if (!u) { setShareMsg("先在上面搜出一个人，再选他", "bad"); return; }
+    shareCtx.transferTo = u;
+    shareCtx.mode = "transfer";
+    renderShare();
+  };
+  row.append(go);
+  tr.append(row);
+  body.append(tr);
+
+  body.append(el("p", "share-msg", ""));
+  refreshTransferOptions();
+
+  let timer = null;
+  input.oninput = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => searchShareUsers(input.value, hits), 220);
+  };
+  searchShareUsers("", hits);
+}
+
+/* 转让前的二次确认。**不套第二层 dialog**（见上面那段说明）。 */
+function renderTransferConfirm() {
+  const body = document.getElementById("sh-body");
+  const wf = shareCtx.wf || {};
+  const u = shareCtx.transferTo || {};
+  const box = el("div", "share-sec");
+  box.append(el("h3", "share-h",
+    "确认把「" + (wf.name || "未命名工作流") + "」转让给 " + (u.username || "") + "？"));
+  const ul = el("ul", "share-list");
+  ["你会立刻失去访问这个工作流的权限",
+   "已有的行任务、产物、结果全部转到 " + (u.username || "") + " 名下",
+   "这一步不能撤销"].forEach(t => ul.append(el("li", null, t)));
+  box.append(ul);
+  const row = el("div", "share-row");
+  const no = el("button", "btn", "算了");
+  no.type = "button";
+  no.onclick = () => { shareCtx.mode = "browse"; shareCtx.transferTo = null; renderShare(); };
+  const ok = el("button", "btn btn-warn", "确认转让");
+  ok.type = "button";
+  ok.onclick = () => doTransfer(u);
+  row.append(no, ok);
+  box.append(row);
+  body.append(box);
+}
+
+function setShareMsg(text, kind) {
+  const p = document.querySelector("#sh-body .share-msg");
+  if (!p) return;
+  p.textContent = text || "";
+  p.className = "share-msg" + (kind ? " is-" + kind : "");
+}
+
+async function searchShareUsers(q, host) {
+  host.textContent = "";
+  let users = [];
+  try {
+    const got = await api("GET", "/api/users?q=" + encodeURIComponent(q || ""));
+    users = got.users || [];
+  } catch (e) {
+    host.append(el("li", "share-empty", "搜账号失败：" + (e.message || "")));
+    return;
+  }
+  shareCtx.users = users;
+  const owner = shareCtx.wf && Number(shareCtx.wf.owner_id);
+  const sharedIds = new Set(shareCtx.shares.map(s => Number(s.user_id)));
+  if (!users.length) {
+    host.append(el("li", "share-empty", "没有匹配的账号。"));
+  }
+  users.forEach(u => {
+    const li = el("li", "share-row");
+    li.append(el("span", "share-name", u.username));
+    if (Number(u.id) === owner) {
+      li.append(el("span", "share-tag", "创建者"));
+    } else if (sharedIds.has(Number(u.id))) {
+      li.append(el("span", "share-tag", "已共享"));
+    } else {
+      const add = el("button", "btn", "共享给他");
+      add.type = "button";
+      add.onclick = () => doAddShare(u);
+      li.append(add);
+    }
+    host.append(li);
+  });
+  /* **只显示前 N 个时要写明**。不写，用户会以为平台上就这么些人，
+   * 而要找的人恰好在被截掉的那一半里。 */
+  if (!q && users.length >= 50) {
+    host.append(el("li", "share-empty",
+      "只显示前 50 个账号，输名字可以精确找到。"));
+  }
+  refreshTransferOptions();
+}
+
+/* 转让的下拉：候选是**搜出来的账号 + 已经在共享名单里的人**。
+ * 下拉里不列创建者自己——把工作流转给自己没有任何意义。 */
+function refreshTransferOptions() {
+  const sel = document.getElementById("sh-transfer-sel");
+  if (!sel) return;
+  const owner = shareCtx.wf && Number(shareCtx.wf.owner_id);
+  const seen = new Map();
+  shareCtx.users.forEach(u => seen.set(Number(u.id), u));
+  shareCtx.shares.forEach(s => {
+    if (!seen.has(Number(s.user_id))) {
+      seen.set(Number(s.user_id), { id: s.user_id, username: s.username });
+    }
+  });
+  const picked = sel.value;
+  sel.textContent = "";
+  let n = 0;
+  seen.forEach(u => {
+    if (Number(u.id) === owner) return;
+    sel.append(new Option(u.username || ("#" + u.id), String(u.id)));
+    n += 1;
+  });
+  if (!n) sel.append(new Option("（没有可选的人）", ""));
+  if (picked) sel.value = picked;
+}
+
+async function doAddShare(u) {
+  try {
+    const got = await api("POST", "/api/workflows/" + shareCtx.wfId + "/shares",
+                          { user_id: Number(u.id) });
+    shareCtx.shares = got.shares || [];
+    /* **先重画再写提示**：renderShare 会把整个 body 重建，提示写在
+     * 前面的话会被这一次重建冲掉——用户看到的就永远是「什么都没发生」。 */
+    renderShare();
+    setShareMsg("已共享给 " + u.username, "good");
+    await loadWorkflows();
+  } catch (e) {
+    setShareMsg(e.message || "共享失败", "bad");
+  }
+}
+
+async function doRemoveShare(s) {
+  try {
+    const got = await api("DELETE",
+      "/api/workflows/" + shareCtx.wfId + "/shares/" + Number(s.user_id));
+    shareCtx.shares = got.shares || [];
+    renderShare();
+    setShareMsg("已取消与 " + (s.username || "") + " 的共享", "good");
+    await loadWorkflows();
+  } catch (e) {
+    setShareMsg(e.message || "取消共享失败", "bad");
+  }
+}
+
+async function doTransfer(u) {
+  try {
+    await api("POST", "/api/workflows/" + shareCtx.wfId + "/transfer",
+              { user_id: Number(u.id) });
+    const dlg = document.getElementById("share");
+    if (dlg.open) dlg.close();
+    setMsg(document.getElementById("board-msg"),
+      "已把工作流转给 " + u.username, "good");
+    await loadWorkflows();
+  } catch (e) {
+    shareCtx.mode = "browse";
+    renderShare();
+    setShareMsg(e.message || "转让失败", "bad");
+  }
 }
 
 // ---------------------------------------------------------------- 状态面板
@@ -1961,6 +2266,14 @@ async function saveWorkflowConfig(id) {
 }
 
 document.getElementById("c-cancel").onclick = () => document.getElementById("composer").close();
+
+/* 共享面板的关闭。**顺带把状态清干净**：转让确认态是 shareCtx.mode 里的
+ * 一个值，下次打开若忘了复位，会直接落在「确认转让」那一屏上。 */
+document.getElementById("sh-cancel").onclick = () => {
+  shareCtx.mode = "browse";
+  shareCtx.transferTo = null;
+  document.getElementById("share").close();
+};
 
 document.getElementById("composer-form").addEventListener("submit", async e => {
   e.preventDefault();

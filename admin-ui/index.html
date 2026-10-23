@@ -33,6 +33,7 @@
     </button>
     <button class="tab" data-tab="tasks" role="tab" type="button">全部任务</button>
     <button class="tab" data-tab="audit" role="tab" type="button">审计日志</button>
+    <button class="tab" data-tab="workflows" role="tab" type="button">工作流</button>
     <button class="tab" data-tab="users" role="tab" type="button">用户</button>
   </nav>
   <!-- 状态面板：管理员看得到系统指标与全局速度。**默认只读**——
@@ -135,6 +136,32 @@
         </table>
       </div>
       <p class="empty" id="audit-empty">没有匹配的审计记录。</p>
+    </section>
+
+    <!-- ====================== 7 · 工作流（共享 / 转让）===================
+         值班台原来只有「任务」这一层（工作流的行也算任务），没有工作流这一层。
+         但「谁把工作流共享给了谁、主人是谁」只有工作流这一层知道——任务里
+         存的是行任务，主人是行任务的归属。所以这里补一张表，
+         并让管理员能代替 owner 做共享 / 转让。 -->
+    <section class="pane" id="pane-workflows" data-pane="workflows" hidden>
+      <div class="pane-head">
+        <h2 class="pane-h">工作流</h2>
+        <span class="pane-sub" id="workflows-sub"></span>
+      </div>
+      <div class="grid-wrap">
+        <table class="grid">
+          <thead>
+            <tr>
+              <th class="c-id">#</th><th class="c-title">名称</th>
+              <th class="c-owner">创建者</th><th class="c-state">共享</th>
+              <th class="c-time">行数</th><th class="c-act">操作</th>
+            </tr>
+          </thead>
+          <tbody id="workflow-rows"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="workflows-empty">还没有工作流。</p>
+      <p class="row-msg" id="workflows-msg" hidden></p>
     </section>
 
     <!-- ========================== 6 · 反思 ================================ -->
