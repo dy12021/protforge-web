@@ -858,13 +858,26 @@ async function doReviewSubmit() {
       state.byId.set(id, detailTask(got, "续跑"));
     }
     dlg.close();
-    /* 同样是**先重画再写提示**（见 doAccept 的注释）。 */
-    drawDrawer(id, state.byId.get(id));
-    setDrawerMsg(
-      mode === "reject"
-        ? "已打回，它会带着这段要求再跑一遍"
-        : "已续跑，它会带着这段要求接着干", "ok");
+    /* **提示要写在用户看得到的地方，而且要写在 load() 之后**。
+     *
+     * ① 这个动作可能来自抽屉，也可能来自工作流的行列表——行列表那条路
+     * 抽屉是关着的，提示写进抽屉里等于什么都没发生（用户看着像按钮坏了）。
+     * ② load() 结尾会把看板提示条 **hideMsg 掉**（它是「拉数时的临时提示」）。
+     *    提示写在 load() 前面会被这一句擦掉——顺序反了就是「点了没反应」。 */
     await load();
+    /* 行列表那条路还要把工作流重画一遍：那一行的状态变了。 */
+    state.wfOpen.forEach(wfId => refreshOpenWorkflow(wfId));
+    const drawer = document.getElementById("drawer");
+    const drawerOpen = !drawer.hidden && Number(state.openId) === id;
+    const text = mode === "reject"
+      ? "已打回，它会带着这段要求再跑一遍"
+      : "已续跑，它会带着这段要求接着干";
+    if (drawerOpen) {
+      drawDrawer(id, state.byId.get(id));
+      setDrawerMsg(text, "ok");          // 抽屉那条：存 state，重绘也活得住
+    } else {
+      setMsg(document.getElementById("board-msg"), text, "ok");
+    }
   } catch (e) {
     setDrawerMsg( e.message || "操作失败", "bad");
   } finally {
@@ -1860,6 +1873,20 @@ function paintWorkflowRows(host, id) {
       retryTask(row.id, Number(row.workflow_row) + 1, id);
     };
     act.append(rb);
+    /* 「续跑」也放在行列表上：**失败行就在这一列里**，让人点进详情才找得到
+     * 续跑，等于把功能藏起来了。续跑与重跑的区别是「带着补充要求接着算」，
+     * 对话框里写得很清楚。 */
+    const cb = el("button", "mini", "续跑");
+    cb.type = "button";
+    /* 只有终态的行能续跑（跑着的行续跑会 422）。 */
+    cb.disabled = !["done", "failed"].includes(row.status);
+    cb.onclick = (e) => {
+      e.stopPropagation();
+      /* 复用抽屉里那一套：doReview 收的是任务对象，而工作流行本身就是
+       * 任务行，字段（id/status/summary/acceptance）都是齐的。 */
+      doReview(row, "continue");
+    };
+    act.append(cb);
     tr.append(act);
     body.append(tr);
   });
