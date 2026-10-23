@@ -1159,6 +1159,17 @@ function drawDrawer(id, t) {
   else stepSlot.append(el("p", "field-empty",
     ACTIVE.has(t.status) ? "还没上报步骤。" : "任务不在计算中，没有当前步骤。"));
 
+  /* --- 上一轮 -------------------------------------------------------------
+   * **续跑时上一轮的结论被人清空了**（清空是为了让新一轮的摘要占位，
+   * 否则界面显示的还是上一轮那句话，会被当成这一轮的结果）。但那份上下文
+   * 只喂给了模型、没给人看——「上一轮算出了什么、这次要改什么」恰恰是
+   * 人自己想确认的东西。
+   * followup 字段里就是那段（组装给模型的那一份），原样显示。 */
+  if ((t.followup || "").trim()) {
+    const prevSlot = section(body, "上一轮的要求与上下文");
+    prevSlot.append(el("pre", "prev-followup", t.followup));
+  }
+
   const resSlot = section(body, "结果");
   if (t.error) {
     resSlot.append(el("div", "kv-value is-bad", t.error));

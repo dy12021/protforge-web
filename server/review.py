@@ -184,18 +184,18 @@ def compose_followup(task: dict, note: str) -> str:
     lines.append("")
     status = str(task.get("status") or "")
     if status == "failed":
-        lines.append("上一轮**失败了**。")
+        lines.append("上一轮失败了。")
         err = (task.get("error") or "").strip()
         if err:
             lines.append(f"失败原因：{err[:600]}")
     else:
-        lines.append("上一轮算完了，但**结果没有通过验收**（或你就是要再改一版）。")
+        lines.append("上一轮算完了，但结果没有通过验收（或你就是要再改一版）。")
     summary = (task.get("summary") or "").strip()
     if summary:
         lines.append(f"上一轮的结论：{summary[:600]}")
     arts = [r for r in store.artifacts.list(tid) if int(r["verified"]) == 1]
     if arts:
-        lines.append("上一轮产出的文件（**还在工作目录里**，可以直接用、可以直接改）：")
+        lines.append("上一轮产出的文件（还在工作目录里，可以直接用、可以直接改）：")
         for r in arts[:20]:
             lines.append(f"- {r['name']}")
         if len(arts) > 20:
@@ -204,7 +204,7 @@ def compose_followup(task: dict, note: str) -> str:
     lines.append("### 本次补充要求")
     lines.append(note)
     lines.append("")
-    lines.append("在上一轮的基础上接着做。**上一轮已经算对的部分不要重算**，"
+    lines.append("在上一轮的基础上接着做。上一轮已经算对的部分不要重算，"
                  "改掉不对的那部分；确实要重算的，说明为什么。")
     return "\n".join(lines)
 
