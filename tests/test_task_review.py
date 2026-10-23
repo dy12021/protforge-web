@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,13 @@ import auth
 import db
 import review
 import store
+
+#: 值班台（admin/app_admin.py）在 admin/ 目录下，server/ 由 conftest 加上。
+#: **本文件要自己加**：否则单跑这个文件时 import app_admin 会 ModuleNotFoundError
+#: ——而它只在跟别的测试文件一起跑时恰好能用（别的文件加过 sys.path）。
+ADMIN_DIR = Path(__file__).resolve().parent.parent / "admin"
+if str(ADMIN_DIR) not in sys.path:
+    sys.path.insert(0, str(ADMIN_DIR))
 
 XLSX_MIME = ("application/vnd.openxmlformats-officedocument."
              "spreadsheetml.sheet")
@@ -497,6 +505,69 @@ def test_followup_reaches_the_brief(tmp_path, alice):
     assert "原始需求" in brief, brief
     assert "换个对接种子再跑" in brief, \
         "补充要求没进 brief.md —— 续跑就白续了：" + brief
+
+
+def test_workflow_row_keeps_the_followup_after_the_template_is_rendered(
+        tmp_path, alice):
+    """**工作流行续跑时，提示词是从模板重新渲染的**——补充要求必须活得下来。
+
+    改在 tasks.brief 上的补充要求会被这次渲染整个覆盖掉（brief 是渲染出来的，
+    不是上次那个字符串）。所以它存在独立一列（tasks.followup），由 _spawn 拼上去。
+
+    这条与上面那条（常规任务）**不是同一个洞**：常规任务的 brief 不会再渲染，
+    所以常规任务那条绿了、工作流行这条照样可能红。
+    """
+    import sys
+
+    import dispatcher
+    import guards
+    import workflow as wfmod
+
+    root = Path(tmp_path) / "data" / "workflows"
+    st = wfmod.staging_path(root)
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws.append(["编号", "序列", "项目"])
+    ws.append(["ID0", "SEQ0", "XBR"])
+    wb.save(st)
+    source = wfmod.finalize_upload(root, st, 9101)
+    wf = store.create_workflow(_uid("alice"), "wf", "查 {{seq}}",
+                               sheet="S1", source_path=str(source),
+                               header_row=1, key_col=0, total_rows=1,
+                               writeback=1)
+    store.set_workflow_columns(int(wf["id"]), [
+        {"col_index": 0, "header": "编号", "role": "key"},
+        {"col_index": 1, "header": "序列", "role": "input", "slot": "seq"},
+    ])
+    store.update_workflow(int(wf["id"]), status="running")
+
+    # 这一行已经算过一轮，现在续跑：它带着 followup。
+    row = store.create_task("第 1 行", "查 SEQ0", owner_id=_uid("alice"),
+                            actor="system", workflow_id=int(wf["id"]),
+                            workflow_row=0)
+    tid = int(row["id"])
+    store.set_status(tid, "failed", actor="system", message="炸了")
+    store.update_task(tid, error="采样时 OOM 了")
+    review.continue_task(tid, "换个更小的体系再跑")
+
+    script = tmp_path / "fake_agent.py"
+    script.write_text(FAKE_AGENT, encoding="utf-8")
+    disp = dispatcher.Dispatcher(
+        db, db.data_root(), node_exe=sys.executable,
+        agent_script=str(script), gpu_probe=lambda: 2, max_concurrency=1)
+    try:
+        disp._spawn_workflow_row(store.get_workflow(int(wf["id"]), is_admin=True),
+                                 0, tid)
+    finally:
+        disp.stop()
+
+    brief = (guards.regions(tid)[guards.WORK] / "brief.md").read_text(
+        encoding="utf-8")
+    assert "查 SEQ0" in brief, "模板渲染的那部分没了：" + brief
+    assert "换个更小的体系再跑" in brief, \
+        "补充要求被重新渲染覆盖了 —— 工作流行的续跑就白续了：" + brief
 
 
 # ---------------------------------------------------------------- 迁移
