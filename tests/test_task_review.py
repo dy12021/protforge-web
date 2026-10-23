@@ -570,6 +570,29 @@ def test_workflow_row_keeps_the_followup_after_the_template_is_rendered(
         "补充要求被重新渲染覆盖了 —— 工作流行的续跑就白续了：" + brief
 
 
+def test_the_agent_knows_finish_is_a_promise():
+    """平台规则里必须告诉模型：**finish 是一份承诺**，以及硬条件会怎么判。
+
+    不写这条，模型就不知道自己会被机械判不通过——summary 空着、产物全是
+    0 字节，平台直接判「验收没通过」，而模型完全不知道为什么，只能瞎猜。
+
+    覆盖边界要说清楚：这是对**提示词文本**的断言，测不了模型会不会照做。
+    真要验模型行为得跑一次真任务（几分钟起步），那条留在真机验收里。
+    这里能钉住的是「这段话不会被人顺手删掉」。
+    """
+    import re
+
+    run_mjs = (Path(__file__).resolve().parent.parent / "agent"
+               / "run.mjs").read_text(encoding="utf-8")
+    m = re.search(r"const PLATFORM_RULES = `((?:[^`\\]|\\.)*)`;", run_mjs, re.S)
+    assert m, "找不到 PLATFORM_RULES 模板"
+    block = m.group(1)
+    assert "待验收" in block, "要告诉模型 finish 之后结果会进「待验收」等人认"
+    assert "0 字节" in block, "要告诉模型硬条件之一是产物全是 0 字节的空文件"
+    assert "summary" in block, "要告诉模型 summary 空着会被判不通过"
+    assert "续跑" in block, "要告诉模型看到「续跑」时是接着上一轮做，不是从头重来"
+
+
 # ---------------------------------------------------------------- 迁移
 
 
