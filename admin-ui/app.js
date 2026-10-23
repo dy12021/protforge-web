@@ -1231,8 +1231,11 @@ function workflowRow(w) {
    * 值班台要看得见「这一批还有几行没人认」。 */
   const pend = el("td", "c-state");
   const np = Number(w.pending_acceptance_rows) || 0;
+  /* **不说「都验过了」**：功能上线之前算完的那些行**根本没人验过**，
+   * 说「都验过了」是把没验的说成验过了。这里只说「无待验收」——
+   * 它描述的是「现在没有等着人认的行」，不替过去的事作证。 */
   pend.append(el("span", "chip " + (np ? "chip-review" : "chip-none"),
-    np ? ("未验收 " + np + " 行") : "都验过了"));
+    np ? ("未验收 " + np + " 行") : "无待验收"));
   tr.append(pend);
   const total = Number(w.total_rows) || 0;
   const done = Number(w.cursor) || 0;
