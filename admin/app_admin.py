@@ -296,9 +296,12 @@ class ReviewModeIn(BaseModel):
     """验收方式。human（人工 + 条件判定）/ llm（机器审核）；空串 = 继承。
 
     ``review_timeout`` 是**审核进程的超时（秒）**，同一个入口一起改。
-    不传 = 这一项不动。
+
+    **两项都不传 = 什么都不动**；只传一项 = 只改那一项。
+    ``review_mode`` 传空串仍然是「非法」——它跟「不传」不是一回事：
+    全局默认不允许为空，而「不传」才是「这一项我不管」。
     """
-    review_mode: str = Field(default="", max_length=16)
+    review_mode: str | None = Field(default=None, max_length=16)
     review_timeout: int | None = Field(default=None, ge=60, le=14400)
 
 
@@ -765,10 +768,12 @@ def create_admin_app() -> FastAPI:
 
     @app.put("/api/admin/review-settings")
     def put_review_settings(body: ReviewModeIn, user: dict = Depends(require_admin)):
-        mode = store.normalize_review_mode(body.review_mode)
-        if not mode:
-            raise PanelError(422, "全局默认不能为空")
-        store.set_setting(store.REVIEW_MODE_KEY, mode)
+        mode = store.get_global_review_mode()
+        if body.review_mode is not None:
+            mode = store.normalize_review_mode(body.review_mode)
+            if not mode:
+                raise PanelError(422, "全局默认不能为空")
+            store.set_setting(store.REVIEW_MODE_KEY, mode)
         timeout = store.get_review_timeout()
         if body.review_timeout is not None:
             timeout = store.set_review_timeout(body.review_timeout)

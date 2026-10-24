@@ -32,6 +32,7 @@
 - ``test_timeout_keeps_the_partial_output_and_kills_the_tree`` 超时也要留现场 + 杀整棵树
 - ``test_agent_log_keeps_the_full_output_not_just_the_tail`` agent.log 不被截断
 - ``test_review_timeout_api_roundtrip``        超时能从值班台改、从两个面板读
+- ``test_timeout_only_update_keeps_the_review_mode`` 只改超时不动验收方式
 """
 from __future__ import annotations
 
@@ -621,6 +622,41 @@ def test_review_timeout_api_roundtrip(client, root, alice):
     r = client.put("/api/review-settings", headers=_headers(alice),
                    json={"review_mode": "llm", "review_timeout": 60})
     assert r.status_code == 403, r.text
+
+
+def test_timeout_only_update_keeps_the_review_mode(client, root):
+    """**只改超时，不该动验收方式。**
+
+    这条是界面验收时真踩出来的：值班台那个「审核超时」输入框只发
+    ``{review_timeout: 45}``，而服务端原来的写法把「没传 review_mode」
+    当成了「传了空串」→ 直接 422「全局默认不能为空」→ **改不动超时**。
+    """
+    import app_admin
+
+    panel = TestClient(app_admin.create_admin_app())
+    r = panel.put("/api/admin/review-settings", headers=_headers(root),
+                  json={"review_mode": "llm"})
+    assert r.status_code == 200, r.text
+
+    # 只带超时
+    r = panel.put("/api/admin/review-settings", headers=_headers(root),
+                  json={"review_timeout": 1500})
+    assert r.status_code == 200, r.text
+    assert r.json()["review_timeout"] == 1500, r.text
+    assert r.json()["review_mode"] == "llm", "只改超时，不该把验收方式改了"
+    assert store.get_global_review_mode() == db.REVIEW_MODE_LLM
+
+    # 只带方式
+    r = panel.put("/api/admin/review-settings", headers=_headers(root),
+                  json={"review_mode": "human"})
+    assert r.status_code == 200, r.text
+    assert r.json()["review_timeout"] == 1500, "只改方式，不该把超时重置了"
+
+    # **空串仍然是「非法」**：全局默认不允许为空。
+    # 它跟「不传」不是一回事——「不传」才是「这一项我不管」。
+    r = panel.put("/api/admin/review-settings", headers=_headers(root),
+                  json={"review_mode": ""})
+    assert r.status_code == 422, r.text
 
 
 def test_detail_exposes_mode_and_llm_verdict(client, alice):

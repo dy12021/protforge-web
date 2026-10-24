@@ -1852,7 +1852,11 @@ async function setReviewTimeout(minText) {
     return;
   }
   try {
-    await api("PUT", "/review-settings", { review_timeout: Math.round(mins * 60) });
+    /* 把当前验收方式一起带上：省得服务端把「没传方式」当成「要清空方式」。 */
+    const sel = document.getElementById("review-mode-default");
+    const mode = (sel && sel.value) || "human";
+    await api("PUT", "/review-settings",
+      { review_mode: mode, review_timeout: Math.round(mins * 60) });
     setMsg(document.getElementById("board-msg"),
       "审核超时已改：" + mins + " 分钟", "ok");
     await loadReviewTimeout();
