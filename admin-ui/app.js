@@ -1823,10 +1823,50 @@ async function setReviewDefault(mode) {
   }
 }
 
+/* 审核进程的超时（分钟）。**服务端存的是秒**，这里换算一次。
+ * 改完立刻生效：下一次审核就用新的时长。 */
+async function loadReviewTimeout() {
+  const inp = document.getElementById("review-timeout-min");
+  const note = document.getElementById("review-timeout-note");
+  if (!inp) return;
+  try {
+    const o = await api("GET", "/review-settings");
+    const secs = Number(o.review_timeout) || 1800;
+    inp.value = String(Math.round(secs / 60));
+    inp.onchange = () => setReviewTimeout(inp.value);
+    if (note) {
+      note.textContent = "审核进程跑多久算超时；超时了不算不通过，"
+        + "任务留在待验收等人。";
+    }
+  } catch (e) {
+    if (note) note.textContent = "审核超时取不到";
+  }
+}
+
+async function setReviewTimeout(minText) {
+  const mins = Number(minText);
+  const note = document.getElementById("review-timeout-note");
+  if (!mins || mins < 1 || mins > 240) {
+    if (note) note.textContent = "填 1 到 240 之间的分钟数";
+    await loadReviewTimeout();
+    return;
+  }
+  try {
+    await api("PUT", "/review-settings", { review_timeout: Math.round(mins * 60) });
+    setMsg(document.getElementById("board-msg"),
+      "审核超时已改：" + mins + " 分钟", "ok");
+    await loadReviewTimeout();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "改不动审核超时", "bad");
+    await loadReviewTimeout();
+  }
+}
+
 async function boot() {
   // 状态面板：先画它，别让它拖住别的。取不到也不该让面板整个空着。
   loadStatus().catch(() => {});
   loadReviewDefault().catch(() => {});
+  loadReviewTimeout().catch(() => {});
   try {
     state.me = await api("GET", "/me");
     document.getElementById("who").textContent =

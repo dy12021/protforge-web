@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -44,7 +45,12 @@ import store
 
 #: 审核进程的超时（秒）。审核要读产物、可能要跑几条读文件的命令，
 #: 比日常任务宽松；但也不能无限期挂着——它是后台任务，挂着就占着一台机器。
-REVIEW_TIMEOUT = 900.0
+#:
+#: **默认 30 分钟**，不是 15 分钟：真实批次里一行有 210+ 个产物，审核进程要
+#: 一个个看、还要联网查判据（UniProt、结构），15 分钟会被砍在半路
+#: （实测 task 56：900 秒到了它还在核产物，agent 被杀，验收状态只好留在
+#: pending 等人）。**真正的上限由平台设置项决定**，见 store.get_review_timeout()。
+REVIEW_TIMEOUT = 1800.0
 
 #: 拷进审核环境的产物体积上限（字节）。真实的一行产物在 20–250 MB 之间，
 #: 256 MB 能覆盖绝大多数行；超出的部分只进清单（名字 + 大小 + 文本片段）。
@@ -368,6 +374,23 @@ def build_review_brief(task: dict, artifacts: list[dict] | None = None,
 
 # ---------------------------------------------------------------- 起进程
 
+def _kill_tree(pid: int) -> None:
+    """**杀整棵进程树**，不只是直接子进程。
+
+    审核进程（node）会派 bash 子进程出来跑命令。只杀 node 的话，这些孙进程
+    会活下来变成孤儿，继续占着机器（还会往输出文件里写）。
+    Windows 用 taskkill /T，POSIX 用进程组（起进程时开了 start_new_session）。
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=60)
+        else:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
 def _spawn_review_agent(brief_path: Path, work_dir: Path, timeout: float,
                         readonly_roots: list[Path]) -> dict:
     """起一个审核进程。
@@ -402,21 +425,64 @@ def _spawn_review_agent(brief_path: Path, work_dir: Path, timeout: float,
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        # 自己开一个进程组：超时时才能把整棵树一起带走。
+        kwargs["start_new_session"] = True
+
+    # **输出直接落文件，不走管道。**
+    #
+    # 走管道（capture_output=True）在 Windows 上有两个坑，都咬过：
+    #   1) 超时分支里 subprocess.run 杀掉直接子进程之后，还要 communicate() 一次，
+    #      而**那一次没有超时**——孙进程（审核进程派出来的 bash）继承了
+    #      stdout/stderr 的写端，管道永远等不到 EOF → 整个审核线程永久阻塞；
+    #   2) 超时时已经写出来的输出跟着异常一起被丢掉，**现场没了**。
+    #
+    # 落文件则：正常结束、崩了、被超时杀了，文件里都留着。
+    log_path = work_dir / "agent.log"
     try:
-        proc = subprocess.run(
+        fh = open(log_path, "w", encoding="utf-8", errors="replace")
+    except OSError:
+        fh = None
+
+    try:
+        proc = subprocess.Popen(
             [node, str(script)], env=env, cwd=str(script.parent),
-            capture_output=True, timeout=timeout, **kwargs)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "returncode": None, "output": "",
-                "error": f"审核进程超过 {timeout:.0f} 秒还没结束"}
+            stdout=fh if fh else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if fh else subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, **kwargs)
     except Exception as exc:                             # noqa: BLE001
+        if fh:
+            fh.close()
         return {"ok": False, "returncode": None, "output": "",
                 "error": f"审核进程起不来：{exc}"}
-    out = (proc.stdout or b"").decode("utf-8", errors="replace")
-    err = (proc.stderr or b"").decode("utf-8", errors="replace")
-    return {"ok": proc.returncode == 0, "returncode": proc.returncode,
-            "output": (out + ("\n" + err if err else ""))[-4000:],
-            "error": "" if proc.returncode == 0 else f"退出码 {proc.returncode}"}
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(proc.pid)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        if fh:
+            fh.close()
+
+    out = ""
+    try:
+        out = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        out = ""
+
+    if timed_out:
+        return {"ok": False, "returncode": proc.returncode,
+                "output": out[-4000:],
+                "error": f"审核进程超过 {timeout:.0f} 秒还没结束"}
+    rc = proc.returncode
+    return {"ok": rc == 0, "returncode": rc, "output": out[-4000:],
+            "error": "" if rc == 0 else f"退出码 {rc}"}
 
 
 def _read_verdict(task_id: int) -> tuple[str, str]:
@@ -444,12 +510,16 @@ def _read_verdict(task_id: int) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- 跑一轮
 
-def run_llm_review(task_id: int, *, timeout: float = REVIEW_TIMEOUT,
+def run_llm_review(task_id: int, *, timeout: float | None = None,
                    actor: str = "system", keep_copy: bool = False) -> dict:
     """审一个任务。**同步跑**（会阻塞调用方几分钟），后台调用请自己开线程。
 
     返回一个 dict：``{"verdict": ..., "reason": ..., "applied": bool, ...}``。
+
+    ``timeout`` 不传 = 取平台设置项（值班台可改，默认 30 分钟）。
     """
+    if timeout is None:
+        timeout = store.get_review_timeout(REVIEW_TIMEOUT)
     task = store.get_task(task_id, is_admin=True)
     if str(task.get("status")) != "done":
         raise ReviewerError("任务还没算完，审不了")
@@ -495,8 +565,11 @@ def run_llm_review(task_id: int, *, timeout: float = REVIEW_TIMEOUT,
         # 而崩溃原因当时被丢掉了——收在 result["output"] 里，跟着返回值
         # 一起没了。下一次它再崩，还是查不出来。
         log_path = work_dir / "agent.log"
+        # 真实进程把输出**直接写进**了这个文件；别把它覆盖成尾巴那一段。
+        # 只有文件不存在或者是空的（替身进程）才由这里补写。
         try:
-            log_path.write_text(str(res.get("output") or ""), encoding="utf-8")
+            if not log_path.exists() or log_path.stat().st_size == 0:
+                log_path.write_text(str(res.get("output") or ""), encoding="utf-8")
         except OSError:
             pass
         if verdict == "error":

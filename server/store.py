@@ -369,6 +369,42 @@ def get_global_review_mode() -> str:
     return v if v in db.REVIEW_MODES else db.REVIEW_MODE_HUMAN
 
 
+#: 审核超时（秒）存在 settings 表里的键名。
+REVIEW_TIMEOUT_KEY = "review_timeout"
+
+#: 审核超时的默认值（秒）。**30 分钟**：真实批次里一行有 210+ 个产物，
+#: 审核进程要一个个看、还要联网查判据，15 分钟会被砍在半路。
+REVIEW_TIMEOUT_DEFAULT = 1800.0
+
+#: 审核超时的上下限（秒）。下限：连一分钟都不到，审核必然超时；
+#: 上限：审核工作线程只有一个，挂太久就把整个审核队列堵死了。
+REVIEW_TIMEOUT_MIN = 60.0
+REVIEW_TIMEOUT_MAX = 14400.0
+
+
+def get_review_timeout(default: float = REVIEW_TIMEOUT_DEFAULT) -> float:
+    """审核进程的超时（秒）。没设过 = 默认值。
+
+    **读出来的是夹过上下限的值**：存进去的东西可能是手改的，也可能是
+    老版本留下的，不夹一下就会出现「超时 0 秒」这种立刻必失败的设置。
+    """
+    raw = get_setting(REVIEW_TIMEOUT_KEY, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(REVIEW_TIMEOUT_MIN, min(v, REVIEW_TIMEOUT_MAX))
+
+
+def set_review_timeout(seconds: float) -> float:
+    """写审核超时（秒）。**返回真正写进去的值**（已夹到上下限内）。"""
+    v = max(REVIEW_TIMEOUT_MIN, min(float(seconds), REVIEW_TIMEOUT_MAX))
+    set_setting(REVIEW_TIMEOUT_KEY, str(int(v)))
+    return v
+
+
 def resolve_review_mode(task: dict) -> tuple[str, str]:
     """算出这条任务**实际**用哪种方式验收。
 

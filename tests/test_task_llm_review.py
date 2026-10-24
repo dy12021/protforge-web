@@ -26,11 +26,18 @@
 - ``test_broken_review_leaves_acceptance_alone``  审核没跑成 → 不动验收状态
 - ``test_manual_trigger_queues_review``       手动触发 = 切机器审 + 清结论 + 回到待验收
 - ``test_detail_exposes_mode_and_llm_verdict`` 详情信封给出方式与机器结论
+- ``test_review_timeout_default_is_thirty_minutes`` 审核超时默认 30 分钟
+- ``test_review_timeout_is_globally_configurable``   超时是平台级设置
+- ``test_review_timeout_is_clamped_to_sane_bounds`` 超时被夹到上下限内
+- ``test_timeout_keeps_the_partial_output_and_kills_the_tree`` 超时也要留现场 + 杀整棵树
+- ``test_agent_log_keeps_the_full_output_not_just_the_tail`` agent.log 不被截断
+- ``test_review_timeout_api_roundtrip``        超时能从值班台改、从两个面板读
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -283,18 +290,20 @@ def test_review_agent_gets_no_token(monkeypatch, alice):
     task = _done_task(_uid("alice"))
     seen: dict = {}
 
-    def fake_run(cmd, env=None, cwd=None, capture_output=None, timeout=None,
-                 **kwargs):
+    def fake_popen(cmd, env=None, cwd=None, stdout=None, stderr=None,
+                   stdin=None, **kwargs):
         seen.update(env or {})
         (Path(env["PROTFORGE_WORK_DIR"]) / "verdict.json").write_text(
             json.dumps({"verdict": "pass", "reason": "ok"}), encoding="utf-8")
         class P:
+            pid = 1
             returncode = 0
-            stdout = b""
-            stderr = b""
+
+            def wait(self, timeout=None):
+                return 0
         return P()
 
-    monkeypatch.setattr(task_reviewer.subprocess, "run", fake_run)
+    monkeypatch.setattr(task_reviewer.subprocess, "Popen", fake_popen)
     monkeypatch.setenv("PROTFORGE_AGENT_TOKEN", "should-not-leak")
     monkeypatch.setenv("PROTFORGE_TASK_ID", "999")
     task_reviewer.run_llm_review(task["id"])
@@ -315,16 +324,18 @@ def test_review_agent_cannot_write_artifacts(tmp_path, monkeypatch, alice):
     task = _done_task(_uid("alice"))
     seen: dict = {}
 
-    def fake_run(cmd, env=None, cwd=None, capture_output=None, timeout=None,
-                 **kwargs):
+    def fake_popen(cmd, env=None, cwd=None, stdout=None, stderr=None,
+                   stdin=None, **kwargs):
         seen.update(env or {})
         class P:
+            pid = 1
             returncode = 0
-            stdout = b""
-            stderr = b""
+
+            def wait(self, timeout=None):
+                return 0
         return P()
 
-    monkeypatch.setattr(task_reviewer.subprocess, "run", fake_run)
+    monkeypatch.setattr(task_reviewer.subprocess, "Popen", fake_popen)
     task_reviewer.run_llm_review(task["id"])
     roots = seen["PROTFORGE_WEB_REVIEW_READONLY_ROOTS"].split(";")
     assert str(task_reviewer.guards.regions(task["id"])[
@@ -457,6 +468,159 @@ def test_manual_trigger_queues_review(client, alice):
     assert updated["review_mode"] == db.REVIEW_MODE_LLM
     assert updated["acceptance"] == db.ACCEPTANCE_PENDING
     assert store.latest_task_review(task["id"]) is None
+
+
+# ---------------------------------------------------------------- 超时
+
+
+def test_review_timeout_default_is_thirty_minutes():
+    """审核超时的默认值是 **30 分钟**。
+
+    15 分钟（900 秒）实测不够：真实批次里一行有 210+ 个产物，审核进程要
+    一个个看、还要联网查判据，900 秒到了它还在核产物，agent 被杀，
+    验收状态只好留在 pending 等人（task 56 就是这么没审成的）。
+    """
+    assert store.get_review_timeout() == 1800.0
+    assert task_reviewer.REVIEW_TIMEOUT == 1800.0
+
+
+def test_review_timeout_is_globally_configurable(monkeypatch, alice):
+    """超时是**平台级设置**：值班台改一次，后面的审核都按新的来。"""
+    task = _done_task(_uid("alice"))
+    seen: dict = {}
+
+    def spawn(brief_path, work_dir, timeout, readonly_roots):
+        seen["timeout"] = timeout
+        return {"ok": True, "returncode": 0, "output": "", "error": ""}
+
+    monkeypatch.setattr(task_reviewer, "_spawn_review_agent", spawn)
+    store.set_review_timeout(1234)
+    task_reviewer.run_llm_review(task["id"])
+    assert seen["timeout"] == 1234, "设置项没传到审核进程"
+
+
+def test_review_timeout_is_clamped_to_sane_bounds():
+    """存进去的值可能被手改过——读出来必须夹在上下限内。
+
+    「超时 0 秒」会让每一次审核都立刻失败；「超时 100 天」等于把一台机器
+    永久挂死（审核工作线程只有一个）。
+    """
+    assert store.set_review_timeout(1) == store.REVIEW_TIMEOUT_MIN
+    assert store.get_review_timeout() == store.REVIEW_TIMEOUT_MIN
+    assert store.set_review_timeout(10 ** 9) == store.REVIEW_TIMEOUT_MAX
+    assert store.get_review_timeout() == store.REVIEW_TIMEOUT_MAX
+    # 存进去的垃圾值读出来也必须是能用的数
+    store.set_setting(store.REVIEW_TIMEOUT_KEY, "不是数字")
+    assert store.get_review_timeout() == 1800.0
+
+
+def test_timeout_keeps_the_partial_output_and_kills_the_tree(monkeypatch, alice):
+    """超时被杀也要留下现场：agent.log 里得有它已经写出来的东西。
+
+    实测踩过的坑：900 秒到了把审核进程杀掉，而 ``output`` 字段是写死的空串，
+    agent.log 落了个 **0 字节**——崩溃/超时现场等于没留，下一次还是查不出来。
+
+    另外：超时必须**杀整棵进程树**。只杀 node 的话，它派出来的 bash 会活下来
+    变成孤儿，继续占着机器。
+    """
+    task = _done_task(_uid("alice"))
+
+    class _FakeProc:
+        """假装 node 起来了：先写点输出，然后永远不结束。"""
+        pid = 4321
+        returncode = None
+
+        def __init__(self, *a, **kw):
+            self._fh = kw.get("stdout")
+            if self._fh is not None:
+                self._fh.write("[agent] 已经查到第 3 个产物了\n")
+                self._fh.flush()
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                return 0
+            raise subprocess.TimeoutExpired(cmd="node", timeout=timeout)
+
+    killed: list = []
+    monkeypatch.setattr(task_reviewer.subprocess, "Popen", _FakeProc)
+    monkeypatch.setattr(task_reviewer, "_kill_tree",
+                        lambda pid: killed.append(pid))
+
+    res = task_reviewer.run_llm_review(task["id"], timeout=5)
+
+    assert res["verdict"] == "error"
+    assert "超过 5 秒" in res["reason"], res["reason"]
+    logp = Path(res["log_path"])
+    assert logp.is_file(), "审核进程的输出必须落盘"
+    text = logp.read_text(encoding="utf-8")
+    assert "已经查到第 3 个产物了" in text, "超时也要留下现场"
+    assert "已经查到第 3 个产物了" in res["reason"], "reason 里要带现场尾巴"
+    assert killed == [4321], "超时必须杀掉整棵进程树"
+    updated = store.get_task(task["id"], is_admin=True)
+    assert updated["acceptance"] == db.ACCEPTANCE_PENDING, \
+        "审核没跑成不许动验收状态"
+
+
+def test_agent_log_keeps_the_full_output_not_just_the_tail(monkeypatch, alice):
+    """agent.log 存**完整输出**，不是 result["output"] 那个尾巴。
+
+    result["output"] 只带末尾 4000 字符（要塞进 reason）。要是拿它去覆盖
+    agent.log，前面几万字的现场就丢了——那正是留档的意义所在。
+    """
+    task = _done_task(_uid("alice"))
+    head = "H" * 5000
+    tail = "TAIL-MARKER-最后的现场"
+
+    class _FakeProc:
+        pid = 4322
+        returncode = None
+
+        def __init__(self, *a, **kw):
+            self._fh = kw.get("stdout")
+            if self._fh is not None:
+                self._fh.write(head + tail)
+                self._fh.flush()
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                return 0
+            raise subprocess.TimeoutExpired(cmd="node", timeout=timeout)
+
+    monkeypatch.setattr(task_reviewer.subprocess, "Popen", _FakeProc)
+    monkeypatch.setattr(task_reviewer, "_kill_tree", lambda pid: None)
+
+    res = task_reviewer.run_llm_review(task["id"], timeout=5)
+    text = Path(res["log_path"]).read_text(encoding="utf-8")
+    assert tail in text
+    assert len(text) > 4000, "agent.log 被截成了尾巴那一段，现场没了"
+
+
+def test_review_timeout_api_roundtrip(client, root, alice):
+    """超时能从值班台改，也能从两个面板读出来；普通用户改不了。"""
+    import app_admin
+
+    panel = TestClient(app_admin.create_admin_app())
+    r = panel.put("/api/admin/review-settings", headers=_headers(root),
+                  json={"review_mode": "human", "review_timeout": 1500})
+    assert r.status_code == 200, r.text
+    assert r.json()["review_timeout"] == 1500, r.text
+
+    r = panel.get("/api/admin/review-settings", headers=_headers(root))
+    assert r.json()["review_timeout"] == 1500, r.text
+
+    r = client.get("/api/review-settings", headers=_headers(alice))
+    assert r.status_code == 200, r.text
+    assert r.json()["review_timeout"] == 1500, r.text
+
+    # 只有这一项也要能改（不传 review_mode 就不该动默认方式）
+    r = panel.put("/api/admin/review-settings", headers=_headers(root),
+                  json={"review_mode": "human", "review_timeout": 900})
+    assert r.status_code == 200, r.text
+
+    # 普通用户改不了平台级设置
+    r = client.put("/api/review-settings", headers=_headers(alice),
+                   json={"review_mode": "llm", "review_timeout": 60})
+    assert r.status_code == 403, r.text
 
 
 def test_detail_exposes_mode_and_llm_verdict(client, alice):

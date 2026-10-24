@@ -584,3 +584,18 @@ button:disabled { opacity: .45; cursor: default; }
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* 审核超时输入框。跟下拉同一套样式，只是宽一点、好按。 */
+.review-timeout-input {
+  font: inherit;
+  font-size: .78rem;
+  padding: .25rem .4rem;
+  width: 4.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--fg);
+}
+.review-timeout-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

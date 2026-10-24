@@ -605,8 +605,13 @@ class TaskPatch(BaseModel):
 
 
 class ReviewModeIn(BaseModel):
-    """验收方式。取值 human（人工 + 条件判定）/ llm（机器审核）。"""
+    """验收方式。取值 human（人工 + 条件判定）/ llm（机器审核）。
+
+    ``review_timeout`` 是**审核进程的超时（秒）**，同一个入口一起改。
+    不传 = 这一项不动。
+    """
     review_mode: str = Field(default="", max_length=16)
+    review_timeout: int | None = Field(default=None, ge=60, le=14400)
 
 
 class WorkflowPatch(BaseModel):
@@ -1028,7 +1033,9 @@ def create_public_app() -> FastAPI:
     @app.get("/api/review-settings")
     def review_settings(user=Depends(auth.current_user)):
         """平台级的默认验收方式。**谁来看这一轮过不过**的默认值。"""
-        return {"review_mode": store.get_global_review_mode(), "source": "global"}
+        return {"review_mode": store.get_global_review_mode(),
+                "review_timeout": store.get_review_timeout(),
+                "source": "global"}
 
     @app.put("/api/review-settings")
     def put_review_settings(body: ReviewModeIn, user=Depends(auth.current_user)):
@@ -1040,8 +1047,11 @@ def create_public_app() -> FastAPI:
         if not mode:
             raise PreciseHTTPException(422, "全局默认不能为空")
         store.set_setting(store.REVIEW_MODE_KEY, mode)
+        timeout = store.get_review_timeout()
+        if body.review_timeout is not None:
+            timeout = store.set_review_timeout(body.review_timeout)
         sse.notify()
-        return {"review_mode": mode, "source": "global"}
+        return {"review_mode": mode, "review_timeout": timeout, "source": "global"}
 
     @app.patch("/api/workflows/{workflow_id}")
     def patch_workflow(workflow_id: int, body: WorkflowPatch,

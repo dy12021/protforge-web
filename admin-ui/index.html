@@ -55,6 +55,16 @@
       </select>
       <span class="sp-note" id="review-mode-note"></span>
     </div>
+    <!-- 审核进程的超时。**重行要逐个看几百个产物**，15 分钟会被砍在半路
+         （实测 task 56：900 秒到了它还在核产物，agent 被杀，验收状态只好
+         留在 pending 等人）。所以这里能调。 -->
+    <div class="sp-setting">
+      <span class="sp-setting-k">审核超时</span>
+      <input id="review-timeout-min" class="review-timeout-input"
+             type="number" min="1" max="240" step="1" inputmode="numeric">
+      <span class="sp-note">分钟</span>
+      <span class="sp-note" id="review-timeout-note"></span>
+    </div>
     <div class="sp-system" id="sp-system" hidden></div>
   </section>
 
