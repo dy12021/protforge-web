@@ -390,6 +390,30 @@ def test_broken_review_leaves_acceptance_alone(monkeypatch, alice):
     assert rec["auto_applied"] == 0
 
 
+def test_broken_review_keeps_the_process_output(monkeypatch, alice):
+    """审核进程崩了，**输出必须留档**：日志落盘，reason 里带尾巴。
+
+    它真的崩过（task 49：退出码 3221226505），而崩溃原因当时被丢掉了——
+    收在 result["output"] 里，跟着返回值一起没了。下一次它再崩，
+    没有这份输出就还是查不出来。
+    """
+    task = _done_task(_uid("alice"))
+
+    def spawn(brief_path, work_dir, timeout, readonly_roots):
+        return {"ok": False, "returncode": 3221226505,
+                "output": "[agent] 致命错误 boom\n[agent] 栈…", "error": "退出码 3221226505"}
+
+    monkeypatch.setattr(task_reviewer, "_spawn_review_agent", spawn)
+    res = task_reviewer.run_llm_review(task["id"])
+
+    assert res["verdict"] == "error"
+    assert "3221226505" in res["reason"]
+    assert "boom" in res["reason"], "崩溃现场必须跟着结论一起留下来"
+    logp = Path(res["log_path"])
+    assert logp.is_file(), "审核进程的输出必须落盘"
+    assert "boom" in logp.read_text(encoding="utf-8")
+
+
 def test_unrecognizable_verdict_is_an_error(monkeypatch, alice):
     """结论文件里的 verdict 认不出来 → 当没跑成，**不猜**。"""
     task = _done_task(_uid("alice"))

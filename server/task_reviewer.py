@@ -491,8 +491,20 @@ def run_llm_review(task_id: int, *, timeout: float = REVIEW_TIMEOUT,
     try:
         res = _spawn_review_agent(bp, work_dir, timeout, sorted(readonly))
         verdict, reason = _read_verdict(tid)
-        if verdict == "error" and res.get("error"):
-            reason = f"{reason}；{res['error']}"
+        # **审核进程的输出必须留档**：它崩过（退出码 3221226505），
+        # 而崩溃原因当时被丢掉了——收在 result["output"] 里，跟着返回值
+        # 一起没了。下一次它再崩，还是查不出来。
+        log_path = work_dir / "agent.log"
+        try:
+            log_path.write_text(str(res.get("output") or ""), encoding="utf-8")
+        except OSError:
+            pass
+        if verdict == "error":
+            if res.get("error"):
+                reason = f"{reason}；{res['error']}"
+            tail = str(res.get("output") or "")[-1500:].strip()
+            if tail:
+                reason = f"{reason}；进程输出（末尾）：{tail}"
 
         # 完整性核对：审核期间原件被动过 → 结论作废。
         touched = _changed(before)
@@ -525,5 +537,6 @@ def run_llm_review(task_id: int, *, timeout: float = REVIEW_TIMEOUT,
     return {"verdict": verdict, "reason": reason, "applied": applied,
             "output": res.get("output", ""), "error": res.get("error", ""),
             "brief_path": str(bp),
+            "log_path": str(work_dir / "agent.log"),
             "copied": len(copied.get("copied", [])),
             "skipped": len(copied.get("skipped", []))}
