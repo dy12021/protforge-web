@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import sys
 
@@ -117,3 +119,95 @@ def tool_spec(tool: dict, params: dict, cwd: str = "") -> dict:
         "timeout": int(tool.get("timeout_s") or 600),
         "params": params,
     }
+
+
+# ---------------------------------------------------------------- agent 填参数
+
+#: 模型回的一段 JSON 里可能带 ```json 围栏，也可能前后有话。
+#: 这里只取**第一个完整的 JSON 对象**，取不到就说取不到——不猜。
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.S)
+
+
+def _parse_json_obj(raw: str) -> dict:
+    text = str(raw or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S | re.I)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        m = _JSON_OBJ_RE.search(text)
+        if not m:
+            raise ToolParamError("模型回的不是 JSON 对象") from None
+        try:
+            data = json.loads(m.group(0))
+        except ValueError as exc:
+            raise ToolParamError(f"模型回的 JSON 解析不了：{exc}") from None
+    if not isinstance(data, dict):
+        raise ToolParamError("模型回的不是 JSON 对象")
+    return data
+
+
+def fill_params(tool: dict, requirement: str) -> dict:
+    """让模型把一句自然语言要求翻译成**契约参数**。
+
+    这是「手动模式」的辅助层：**执行仍然由脚本做，模型只负责填参数**。
+    换句话说，模型没有执行权——它改不了跑什么命令、也写不了产物，
+    最多把参数填歪，而填歪的参数会被契约校验挡住。
+
+    返回 ``{"params": {...}, "notes": "...", "missing": [...]}``：
+    - ``params``：能填的都填了（类型按契约转过）；
+    - ``missing``：**必填但模型没能填出来的**（模型不知道的那些），
+      界面把它们标出来让人补——而不是让模型编一个；
+    - ``notes``：模型自己说的假设。
+    """
+    import llm
+
+    req = str(requirement or "").strip()
+    if not req:
+        raise ToolParamError("先说说你想算什么")
+    params = tool.get("params") or []
+    if not params:
+        raise ToolParamError("这个工具没有参数契约，没什么可填的")
+
+    contract = json.dumps(params, ensure_ascii=False, indent=1)
+    system = (
+        "你是「自动化计算平台」的工具参数助手。\n"
+        "用户说清了他想用某个工具做什么，"
+        "你要把这个工具的**参数**按契约填出来。\n\n"
+        "硬规则：\n"
+        "1. **只用契约里出现过的参数名**，一个都不许新增。\n"
+        "2. 值要符合契约里的类型（int 就给整数，path 就给路径）。\n"
+        "3. 拿不准的值就给最有合理的默认值，**并在 _notes 里写清你的假设**。\n"
+        "4. 用户的描述里没有的信息，**不要编**——留空，让界面标出来让人补。\n"
+        "5. 只输出一个 JSON 对象，不要任何解释文字。\n\n"
+        "参数契约：\n" + contract)
+    user = ("工具：%s（%s）\n工具说明：%s\n\n用户的要求：%s"
+            % (tool.get("display_name") or tool.get("id"),
+               tool.get("id") or "?",
+               (tool.get("description") or "")[:800], req))
+
+    # **思考档位给 low**：这是抽取/映射类的活，不是要它推理。
+    raw = llm.chat_completion(user, system=system, reasoning_effort="low")
+    data = _parse_json_obj(raw)
+    notes = str(data.pop("_notes", "") or "")
+
+    spec = {p["name"]: p for p in params}
+    filled = {}
+    dropped = []
+    for name, value in data.items():
+        if name not in spec:
+            dropped.append(name)
+            continue
+        p = spec[name]
+        try:
+            filled[name] = coerce_value(p, value)
+        except ToolParamError:
+            dropped.append(name)
+    if dropped:
+        notes = (notes + "；".join([""] if not notes else [""])
+                + "忽略了不在契约里的参数：" + "、".join(dropped)).strip("；")
+
+    missing = [p["name"] for p in params
+               if p.get("required") and not filled.get(p["name"])]
+    return {"params": filled, "notes": notes, "missing": missing}

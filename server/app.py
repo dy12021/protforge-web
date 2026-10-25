@@ -52,6 +52,7 @@ import review
 import skills_index
 import status_api
 import sse
+import llm
 import store
 import tool_runner
 
@@ -605,6 +606,11 @@ class TaskPatch(BaseModel):
     review_mode: str | None = Field(default=None, max_length=16)
 
 
+class ToolFillIn(BaseModel):
+    """让 agent 帮��把一句要求翻译成契约参数。"""
+    requirement: str = Field(default="", max_length=4000)
+
+
 class ToolRunIn(BaseModel):
     """手动跑一个工具。**参数按契约校验**，不认识的名字一律拒。
 
@@ -1121,6 +1127,38 @@ def create_public_app() -> FastAPI:
         if not t:
             raise PreciseHTTPException(404, "没有这个工具")
         return t
+
+    @app.get("/api/tools/{tool_id}/doc")
+    def tool_doc(tool_id: str, user=Depends(auth.current_user)):
+        """一个工具的**详细文档**（它的 SKILL.md 原文）。
+
+        工具的说明书就是它的文档——技能仓里那份 SKILL.md 才是「这个工具
+        到底怎么用、有哪些坑」的权威来源。平台不另写一份（写两份就会漂移）。
+        """
+        d = skills_index.read_doc(tool_id)
+        if not d:
+            raise PreciseHTTPException(404, "没有这个工具的文档")
+        return d
+
+    @app.post("/api/tools/{tool_id}/fill-params")
+    def tool_fill_params(tool_id: str, body: ToolFillIn,
+                         user=Depends(auth.current_user)):
+        """**agent 辅助填参数**：把一句自然语言要求翻译成契约参数。
+
+        注意 agent 在这里**没有执行权**——它只产出参数，真正的活由脚本做。
+        填歪的参数会被契约校验挡住（类型不对、契约外的名字一律拒）。
+        """
+        t = skills_index.get_tool(tool_id)
+        if not t:
+            raise PreciseHTTPException(404, "没有这个工具")
+        if not t.get("directly_callable"):
+            raise PreciseHTTPException(422, "这个工具不能直接调用，没有参数契约")
+        try:
+            return tool_runner.fill_params(t, body.requirement)
+        except tool_runner.ToolParamError as exc:
+            raise PreciseHTTPException(422, str(exc)) from None
+        except llm.LLMError as exc:
+            raise PreciseHTTPException(502, "模型没给出结果：%s" % exc) from None
 
     @app.post("/api/tools/{tool_id}/run")
     def run_tool(tool_id: str, body: ToolRunIn,

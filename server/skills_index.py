@@ -122,6 +122,7 @@ class SkillInfo:
     reads_workspace: bool
     # --- 工具市场那几项（来自可选的 tool.yaml，缺文件就是空值）---
     tool_id: str = ""              # 空 = 不是「可直接调用的工具」
+    kind: str = "tool"             # tool = 工具；doc = 说明文档
     version: str = ""
     display_name: str = ""
     category: str = ""
@@ -300,6 +301,13 @@ def _build(skill_dir: Path) -> SkillInfo:
 
     manifest = _load_tool_manifest(skill_dir, name)
     params = _parse_params(manifest.get("params"), name)
+    # **kind**：tool = 能直接调用的工具；doc = 说明文档（编排器/路由说明）。
+    # 元技能（sandwich-antibody 那种「把别的工具拼起来」的说明书）算 doc——
+    # 它们没有入口脚本，点下去没有东西可跑。
+    kind = str(manifest.get("kind") or "tool").strip().lower()
+    if kind not in ("tool", "doc"):
+        raise SkillIndexError(
+            f"技能 {name} 的 kind 只能是 tool 或 doc，实际是 {kind!r}")
     # **tool.yaml 可以覆盖这个技能的超时档位**：档位表在平台代码里，
     # 但「这个工具的正常耗时」是工具自己的事——它自己最清楚。
     timeout_s = timeout_for(name)
@@ -329,6 +337,7 @@ def _build(skill_dir: Path) -> SkillInfo:
         timeout_s=timeout_s,
         reads_workspace=reads_workspace,
         tool_id=tool_id,
+        kind=kind,
         version=str(manifest.get("version") or ""),
         display_name=str(manifest.get("display_name") or ""),
         category=str(manifest.get("category") or ""),
@@ -368,6 +377,9 @@ def tool_view(info: SkillInfo) -> dict:
     return {
         "id": info.tool_id or _bare(info.name),
         "skill": info.name,
+        "kind": info.kind,
+        # **文档在不在**（说明书型技能也有 SKILL.md，只是不能直接调用）
+        "has_doc": bool(info.tool_id),
         "version": info.version,
         "display_name": info.display_name or info.name,
         "description": info.description,
@@ -383,9 +395,45 @@ def tool_view(info: SkillInfo) -> dict:
 
 
 def list_tools(skills_dir: str | Path | None = None) -> list[dict]:
-    """工具市场清单。按 id 排序。"""
+    """工具市场清单。按 id 排序。
+
+    **只列有 tool.yaml 的技能**——没有 tool.yaml 的不是「工具」，
+    它连参数契约都没有，列出来点下去也不知道能传什么。
+    """
     idx = scan(skills_dir)
-    return sorted((tool_view(i) for i in idx.values()), key=lambda t: t["id"])
+    items = [tool_view(i) for i in idx.values() if i.tool_id]
+    return sorted(items, key=lambda t: t["id"])
+
+
+def read_doc(tool_id: str, skills_dir: str | Path | None = None) -> dict | None:
+    """取一个工具的详细文档（它的 SKILL.md 原文）。
+
+    **工具的说明书就是它的文档**——技能仓里那份 SKILL.md 才是「这个工具
+    到底怎么用、有哪些坑」的权威来源，平台不该另写一份（写两份就会漂移）。
+    """
+    t = get_tool(tool_id, skills_dir)
+    if not t:
+        return None
+    root = Path(skills_dir or os.environ.get("PROTFORGE_WEB_SKILLS_DIR")
+                or PROTORGE_SKILLS_DIR)
+    path = root / str(t.get("skill")) / "SKILL.md"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    # frontmatter 单��出来：界面上「说明」和「正文」分开摆。
+    desc = ""
+    m = _FRONTMATTER_RE.match(text)
+    if m:
+        try:
+            meta = yaml.safe_load(m.group(1)) or {}
+            if isinstance(meta, dict):
+                desc = str(meta.get("description") or "")
+        except yaml.YAMLError:
+            desc = ""
+    body = text[m.end():] if m else text
+    return {"id": t["id"], "skill": t.get("skill"), "description": desc,
+            "doc": body.strip(), "path": str(path)}
 
 
 def get_tool(tool_id: str, skills_dir: str | Path | None = None) -> dict | None:

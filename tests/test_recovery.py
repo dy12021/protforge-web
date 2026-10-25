@@ -353,6 +353,36 @@ def test_assess_failure_makes_the_task_failed_not_crashed(failed_task, monkeypat
     st = recovery.load_state()
     assert st[str(failed_task["id"])]["verdict"] == "error"
 
+def test_recovery_does_not_act_after_the_data_root_changed(failed_task, monkeypatch,
+                                                           tmp_path):
+    """评估期间换了数据根 → 整条作废，**不许改到别处去**。
+
+    一次模型调用几十秒起步，而这条评估跑在**后台线程**里。几十秒里进程里
+    的环境变量完全可能被人换掉——pytest 的 monkeypatch 在用例结束时撤销
+    就是最典型的一种。那时候库已经换了一块，而**任务号从 1 重新开始**：
+    「把任务 1 放回队列」就落在了别人的任务上。
+
+    实测就是这样：一个用例起的后台线程活到下一个用例，把下一个用例的
+    一号行任务**静默**改成了 queued，失败落在无关的用例上，没人查得回
+    根因。反思那边早就加了这道闸（它写的是文件），恢复这边写的是**库**，
+    更重，所以也得有。
+    """
+    tid = int(failed_task["id"])
+
+    def _assess_and_swap(task):
+        # 模型评估期间把数据根换掉（等价于环境变量被换掉了）
+        monkeypatch.setenv("PROTFORGE_WEB_DATA_ROOT", str(tmp_path / "other"))
+        return {"recoverable": True, "reason": "看着能救",
+                "hint": "再试一次", "user_message": "已重投"}
+
+    monkeypatch.setattr(recovery, "assess", _assess_and_swap)
+
+    assert recovery.process(tid) == "error"
+    row = store.get_task(tid, is_admin=True)
+    assert row["status"] == "failed", \
+        "换了库还去改状态，就是把别人的任务改了——这正是要挡的那一下"
+
+
 def test_superseded_row_tasks_are_never_offered_to_the_sweep(make_task, monkeypatch):
     """**被新一轮顶替的旧行任务不该再进恢复流程。**
 

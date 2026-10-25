@@ -161,6 +161,28 @@
           <button class="secondary" type="button" id="mt-d-back">返回列表</button>
         </div>
         <p class="mt-d-meta" id="mt-d-meta"></p>
+
+        <!-- 详细文档。**工具的说明书就是它的文档**（技能仓里那份 SKILL.md），
+             平台不另写一份——写两份就会漂移。 -->
+        <details class="mt-doc" id="mt-doc-box">
+          <summary id="mt-doc-sum">详细文档</summary>
+          <pre class="mt-doc-body" id="mt-doc">（打开工具时自动取）</pre>
+        </details>
+
+        <!-- agent 辅助填参数：**执行仍然由脚本做**，agent 只负责把
+             「我要算什么」翻译成契约参数。填歪的会被契约校验挡住。 -->
+        <div class="mt-fill">
+          <label class="field">
+            <span class="field-k">用一句话说你要算什么，agent 帮你填参数</span>
+            <textarea id="mt-req" class="market-textarea" rows="2"
+                      placeholder="例如：给 1ubq.pdb 的 A 链设计 8 条序列，采样温度 0.2"></textarea>
+          </label>
+          <div class="mt-fill-row">
+            <button class="secondary" type="button" id="mt-fill">让 agent 填</button>
+            <span class="market-msg" id="mt-fill-msg" hidden></span>
+          </div>
+        </div>
+
         <div class="mt-params" id="mt-params"></div>
         <label class="toggle mt-batch">
           <input type="checkbox" id="mt-batch"> 批量（每行一个输入，共享下面的参数）

@@ -228,7 +228,9 @@ def test_recover_settles_stale_running_task_and_kills_orphan_tree(
     #    **必须轮询等它真的停，不能只睡一秒就断言。** kill_tree 杀整棵树要
     #    一点时间，机器一忙一秒就不够——于是这条在全量跑里偶发误红（单独跑
     #    从来不红）。判据是「心跳停止增长」，不是「一秒钟后没增长」。
-    deadline = time.time() + 15.0
+    #    窗口给 30 秒：全量跑时机器上还压着别的用例的进程，15 秒偶尔不够
+    #    ——那条偶发误红是**测试自己写的注释里就记着的老毛病**，不是新回归。
+    deadline = time.time() + 30.0
     last = hb_size(hb)
     quiet = 0.0
     while time.time() < deadline:

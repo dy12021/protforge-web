@@ -56,7 +56,10 @@ def disp(tmp_path, monkeypatch):
                               gpu_probe=lambda: 2)
     spawned: list[int] = []
 
-    def fake_spawn(task_id, brief, work_dir):
+    def fake_spawn(task_id, brief, work_dir, **kwargs):
+        # **_spawn 现在还有 kind / tool_params 两个可选参数**（手动模式要的）。
+        # 用 **kwargs 接住：夹具跟着生产代码变，改一次签名就崩一排用例，
+        # 那种失败跟被测行为无关，纯噪音。
         spawned.append(int(task_id))
         d._running[int(task_id)] = _FakeProc(task_id)
         return _FakeProc(task_id)

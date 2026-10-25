@@ -116,8 +116,11 @@ def test_malformed_frontmatter_raises_instead_of_being_dropped(tmp_path):
 
 def test_shell_kinds_detected(idx):
     assert idx["protforge-freesasa"].shell_kind == "gitbash"
-    assert idx["protforge-opendde"].shell_kind == "wsl"
-    assert idx["protforge-alphafold-db"].shell_kind == "host"
+    # WSL 直调的技能现在也有 .sh 入口（2026-10-25）：入口负责把命令翻译成
+    # `wsl.exe -d AF3Native` 的调用方式，平台这一侧就统一走 bash。
+    assert idx["protforge-opendde"].shell_kind == "gitbash"
+    # alphafold-db 也有 .sh 包装（.sh 优先于 .py，与 alphafold3 同理）。
+    assert idx["protforge-alphafold-db"].shell_kind == "gitbash"
 
 
 def test_alphafold3_sh_runner_beats_wsl_mention(idx):
@@ -129,10 +132,17 @@ def test_alphafold3_sh_runner_beats_wsl_mention(idx):
     assert idx["protforge-alphafold3"].has_runner is True
 
 
-def test_wsl_skills_have_no_bash_runner(idx):
+def test_wsl_skills_now_have_bash_runners(idx):
+    """WSL 直调的三个技能现在都有 .sh 入口（2026-10-25）。
+
+    入口负责把命令翻译成 `wsl.exe -d AF3Native` 的调用、把产物拷回共享
+    outputs 目录。**平台不该为「这个技能住在 WSL 里」再写一套执行路径**——
+    之前这三个人是「不可直接调用」的，现在它们是正经的工具。
+    """
     for name in ("protforge-esmfold2", "protforge-opendde", "protforge-af3-msa"):
-        assert idx[name].shell_kind == "wsl"
-        assert idx[name].runner_path is None      # 不经过 bash runner
+        assert idx[name].shell_kind == "gitbash"
+        assert idx[name].runner_path is not None
+        assert idx[name].runner_path.endswith(".sh")
 
 
 def test_unresolvable_skill_degrades_to_host_and_default_timeout(tmp_path):

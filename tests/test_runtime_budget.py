@@ -160,9 +160,24 @@ def test_tool_manifest_is_parsed(tmp_path):
 
 
 def test_router_skill_is_not_a_directly_callable_tool(tmp_path):
-    """说明书型技能**不能上架成能点的工具**——点下去没有入口可跑。"""
-    tools = {t["id"]: t for t in skills_index.list_tools(_skills_dir(tmp_path))}
+    """说明书型技能**不能上架成能点的工具**——点下去没有入口可跑。
+
+    两种形态都要挡住：
+
+    - 没有 tool.yaml 的：**根本不是工具**，不进市场（它连参数契约都没有，
+      列出来点下去也不知道能传什么）；
+    - 有 tool.yaml（kind: doc）但没有入口脚本的：进市场（它的说明书仍
+      值得读），但**不可直接调用**。
+    """
+    root = _skills_dir(tmp_path)
+    tools = {t["id"]: t for t in skills_index.list_tools(root)}
+    assert "router" not in tools, "没有 tool.yaml 的技能不是工具，不该上架"
+
+    (root / "protforge-router" / "tool.yaml").write_text(
+        "id: router\nversion: '1.0'\nkind: doc\n", encoding="utf-8")
+    tools = {t["id"]: t for t in skills_index.list_tools(root)}
     r = tools["router"]
+    assert r["kind"] == "doc"
     assert r["directly_callable"] is False
     assert r["batch"] is False
 

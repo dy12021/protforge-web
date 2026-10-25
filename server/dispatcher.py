@@ -782,9 +782,14 @@ class Dispatcher:
         self._rt_next_review: dict[int, float] = {}
         self._rt_started: dict[int, float] = {}
         self._rt_lock = threading.RLock()
-        #: 阈值缓存：``(取回时刻, 复核阈值, 续跑额度)``。
-        #: **不在每轮 tick 里读库**——tick 是每秒一轮的热路径。
-        # 阈值不在 tick 里读（见 _rt_threshold 的说明）。
+        #: 复核阈值的缓存：``(取值时刻, 阈值秒)``。
+        #:
+        #: **读库只发生在这里**：``db.connect()`` 每次都要
+        #: ``PRAGMA journal_mode=WAL`` 拿写锁，放在每秒一轮的 tick 热路径上
+        #: 会跟别的写入抢锁，把别的流程挤到后面去。
+        #: 缓存 60 秒失效一次——值班台改完阈值，一分钟内生效。
+        self._rt_threshold_cache: float | None = None
+        self._rt_cached_at: float = 0.0
 
         # --- 归档工作线程 -----------------------------------------------------------
         # openpyxl 不支持增量写：一次 write_back 是整表 load + 整表 save（宽表实测
@@ -1451,12 +1456,16 @@ class Dispatcher:
         """
         now = time.monotonic()
         started = 0
+        # 顺手让阈值缓存续命：缓存 60 秒过期，这一行**最多 60 秒才真读一次库**
+        # （命中缓存就不碰库）。顺带让值班台改的阈值一分钟内生效。
+        self._rt_threshold()
         with self._rt_lock:
             due = [tid for tid, when in self._rt_next_review.items() if now >= when]
         for task_id in due:
             if task_id not in self.running:
                 with self._rt_lock:
                     self._rt_next_review.pop(task_id, None)
+                    self._rt_started.pop(task_id, None)
                 continue
             ap = self.running.get(task_id)
             if ap is None or ap.settled or ap.aborted:
@@ -1472,18 +1481,42 @@ class Dispatcher:
         return len(due)
 
     def _rt_threshold(self) -> float:
-        """复核阈值（秒）。**只在 spawn 时读一次**。
+        """复核阈值（秒）。**带 60 秒缓存**，缓存过期时才真读库。
 
-        为什么不放 tick 里读：``db.connect()`` 每次都会
+        为什么不每轮都读：``db.connect()`` 每次都会
         ``PRAGMA journal_mode=WAL``，要拿写锁——放在每秒一轮的热路径上
         会和别的写入抢锁，把别的流程挤到后面去。
+
+        缓存 60 秒失效一次：值班台改完阈值，一分钟内生效。
         """
+        now = time.monotonic()
+        with self._rt_lock:
+            cached = self._rt_threshold_cache
+            if cached is not None and (now - self._rt_cached_at) < 60.0:
+                return cached
         try:
-            return store.get_runtime_review_after(
-                runtime_reviewer.REVIEW_AFTER_S)
+            value = float(store.get_runtime_review_after(
+                runtime_reviewer.REVIEW_AFTER_S))
         except Exception:                          # noqa: BLE001
             log.exception("读用时复核阈值失败，用默认值")
             return runtime_reviewer.REVIEW_AFTER_S
+        with self._rt_lock:
+            self._rt_threshold_cache = value
+            self._rt_cached_at = now
+        return value
+
+    def _rt_threshold_cached(self) -> float:
+        """当前生效的复核阈值。**一次库都不读**。
+
+        给「起进程」那条路用：那条路上不许有多余开销——多一次读库就能把
+        agent 的启动往后推几十毫秒，而一批时序敏感的用例正好卡在这个窗口里。
+        缓存没热过就先用默认值，等巡检那一轮刷新。
+        """
+        with self._rt_lock:
+            cached = self._rt_threshold_cache
+        if cached is None:
+            return float(runtime_reviewer.REVIEW_AFTER_S)
+        return cached
 
     def _rt_grant(self) -> float:
         """续跑额度（秒）。**只在复核线程里读**（判「合理」之后才用得上）。"""
@@ -2378,6 +2411,17 @@ class Dispatcher:
         )
         with self._lock:
             self._running[task_id] = ap
+        # --- 用时复核：登记起跑时刻与首次复核时间 ---------------------------
+        # **放在 Popen 之后**：起进程这条路上不许有多余开销——多一次读库就能把
+        # agent 的启动往后推几十毫秒，而一批时序敏感的用例正好卡在这个窗口里。
+        # 阈值走缓存（`_rt_threshold_cached`），这里一次库都不读。
+        #
+        # **这两条登记是复核能跑起来的前提**：少了它们，`_task_started_at`
+        # 永远返回「当前时刻」，elapsed 恒为 0，复核永远看不出「跑久了」。
+        with self._rt_lock:
+            self._rt_started[task_id] = time.monotonic()
+            self._rt_next_review[task_id] = (
+                self._rt_started[task_id] + self._rt_threshold_cached())
         # 立刻落运行态记录：进程一旦起来，它就可能活过本进程，必须留凭据给恢复用
         self._write_run_record(ap)
         ap.reader = threading.Thread(target=self._pump_stdout, args=(ap,),
@@ -2808,6 +2852,10 @@ class Dispatcher:
                 return ap.exit_code
             ap.settled = True
             self._running.pop(ap.task_id, None)
+        # 用时复核的登记跟着任务一起走：任务都收口了，不该再被复核。
+        with self._rt_lock:
+            self._rt_next_review.pop(ap.task_id, None)
+            self._rt_started.pop(ap.task_id, None)
 
         code = ap.proc.poll() if exit_code is None else exit_code
         ap.exit_code = code

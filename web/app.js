@@ -294,8 +294,15 @@ function el(tag, cls, text) {
  */
 const MT = { tools: [], cat: "", q: "", sel: null };
 
-function mtMsg(text, kind) {
-  const n = document.getElementById("mt-msg");
+/* 往一个 .market-msg 元素里写一行提示。
+ *
+ * **第三个参数是元素本身，不是 id 字符串**：静态检查靠正则扫
+ * getElementById(...) 才知道脚本碰了哪些 DOM id，写成
+ * getElementById(hostId || "mt-msg") 的话那个 id 在它眼里就没被引用过，
+ * HTML 里对应的元素会变成没人认领的孤儿。
+ */
+function mtMsg(text, kind, host) {
+  const n = host || document.getElementById("mt-msg");
   if (!n) return;
   n.hidden = !text;
   n.textContent = text || "";
@@ -423,6 +430,81 @@ function mtOpen(id) {
   document.getElementById("mt-batch-list").hidden = true;
   document.getElementById("mt-run").disabled = !t.directly_callable;
   document.getElementById("mt-run").textContent = t.directly_callable ? "运行" : "这个工具不能直接调用";
+  // 换工具就换一句话：上一句是给别的工具说的，别带过来。
+  document.getElementById("mt-req").value = "";
+  mtMsg("", "", document.getElementById("mt-fill-msg"));
+  // 文档：工具的说明书就是它的文档（技能仓里那份 SKILL.md 原文）。
+  loadToolDoc(t);
+  // **打开就滑到底部**：点一个工具是为了跑它，参数表单和运行按钮在下面。
+  // 用 requestAnimationFrame 等这一帧布局落定——不等的话 scrollHeight 还是旧的，
+  // 参数多的时候差一屏，滑不到位。
+  requestAnimationFrame(() => {
+    const dlg = document.getElementById("market");
+    if (dlg) dlg.scrollTop = dlg.scrollHeight;
+  });
+}
+
+/* 取一个工具的详细文档（它的 SKILL.md 原文）。
+ *
+ * **平台不另写一份文档**：技能仓里那份 SKILL.md 才是「这个工具到底怎么用、
+ * 有哪些坑」的权威来源。写两份就会漂移——而漂移出来的文档比没文档更坏。 */
+async function loadToolDoc(t) {
+  const box = document.getElementById("mt-doc");
+  const sum = document.getElementById("mt-doc-sum");
+  if (!box) return;
+  box.textContent = "（正在取文档…）";
+  try {
+    const d = await api("GET", "/api/tools/" + encodeURIComponent(t.id) + "/doc");
+    box.textContent = d.doc || "（这个工具没有文档）";
+    if (sum) sum.textContent = "详细文档 · " + (d.skill || t.id);
+  } catch (e) {
+    box.textContent = "文档取不到：" + (e.message || e);
+  }
+}
+
+/* agent 辅助填参数：一句自然语言要求 → 契约参数。
+ *
+ * **执行仍然由脚本做**：agent 在这里只干「翻译」这一件事，没有执行权，
+ * 也改不了跑什么命令。填歪的参数会被契约校验挡住（类型不对、契约外的名字
+ * 一律拒），填不出来的必填项摆出来让人补——不编。 */
+async function mtFillParams() {
+  const t = MT.sel;
+  if (!t) return;
+  const reqBox = document.getElementById("mt-req");
+  const req = (reqBox ? reqBox.value : "").trim();
+  if (!req) {
+    mtMsg("先说说你想算什么", "bad", document.getElementById("mt-fill-msg"));
+    return;
+  }
+  const btn = document.getElementById("mt-fill");
+  if (btn) btn.disabled = true;
+  mtMsg("正在把这句话翻译成参数…", "", document.getElementById("mt-fill-msg"));
+  try {
+    const r = await api("POST",
+                        "/api/tools/" + encodeURIComponent(t.id) + "/fill-params",
+                        { requirement: req });
+    const params = r.params || {};
+    Object.keys(params).forEach((name) => {
+      const inp = document.getElementById("mtp-" + name);
+      if (!inp) return;
+      if (inp.dataset.ptype === "bool") { inp.checked = !!params[name]; return; }
+      const v = params[name];
+      inp.value = (v === null || v === undefined) ? "" : String(v);
+    });
+    const miss = r.missing || [];
+    let msg = "填了 " + Object.keys(params).length + " 个参数";
+    if (miss.length) msg += "；这几项还得你补：" + miss.join("、");
+    if (r.notes) msg += "（" + r.notes + "）";
+    mtMsg(msg, miss.length ? "" : "ok", document.getElementById("mt-fill-msg"));
+    // 填完把参数表单带到眼前——不然填完还得自己找。
+    const pbox = document.getElementById("mt-params");
+    if (pbox && pbox.scrollIntoView) pbox.scrollIntoView({ block: "nearest" });
+  } catch (e) {
+    mtMsg("填不出来：" + (e.message || e), "bad",
+          document.getElementById("mt-fill-msg"));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function mtCollectParams() {
@@ -3168,22 +3250,11 @@ document.getElementById("mt-search").addEventListener("input", (e) => {
 document.getElementById("mt-batch").addEventListener("change", (e) => {
   document.getElementById("mt-batch-list").hidden = !e.target.checked;
 });
-document.getElementById("market-btn").onclick = () => openMarket();
-document.getElementById("mt-cancel").onclick = () => document.getElementById("market").close();
-document.getElementById("mt-d-back").onclick = () => {
-  document.getElementById("mt-detail").hidden = true;
-  document.getElementById("mt-grid").hidden = false;
-  document.getElementById("mt-search").hidden = false;
-  document.getElementById("mt-cats").hidden = false;
-  mtRenderGrid();
-};
-document.getElementById("mt-run").onclick = () => mtRun();
-document.getElementById("mt-search").addEventListener("input", (e) => {
-  MT.q = e.target.value || "";
-  mtRenderGrid();
-});
-document.getElementById("mt-batch").addEventListener("change", (e) => {
-  document.getElementById("mt-batch-list").hidden = !e.target.checked;
+document.getElementById("mt-fill").onclick = () => mtFillParams();
+document.getElementById("mt-doc-box").addEventListener("toggle", (e) => {
+  if (!e.target.open) return;
+  // 展开文档就把它带到眼前——不然内容在视口外，看不见自己展开了什么。
+  e.target.scrollIntoView({ block: "start" });
 });
 document.getElementById("logout-btn").onclick = () => signedOut("已退出");
 document.getElementById("drawer-close").onclick = () => closeDrawer();

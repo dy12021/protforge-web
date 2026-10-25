@@ -437,6 +437,13 @@ def write_hint(task_id: int, hint: str) -> None:
 def handle(task: dict, state: dict) -> str:
     """处理一个失败任务。返回 'requeued' / 'unrecoverable' / 'error'。"""
     tid = int(task["id"])
+    # **数据根在入口钉死**（理由同 reflection.generate 里那道闸）：评估是一次
+    # 模型调用，几十秒起步，而这条跑在**后台线程**里。几十秒里进程里的环境
+    # 变量完全可能被人换掉——pytest 的 monkeypatch 在用例结束时撤销就是最
+    # 典型的一种。那时候库已经换了一块，而**任务号从 1 重新开始**，
+    # 「把任务 1 放回队列」就落在了别人的任务上：失败落在无关的用例上，
+    # 没人查得回根因。
+    root = db.data_root()
     try:
         verdict = assess(task)
     except RecoveryError as exc:
@@ -454,6 +461,13 @@ def handle(task: dict, state: dict) -> str:
         "attempts": n,
         "evaluated_at": db.now_iso(),
     }
+    # 写之前再核一次：换了库就整条作废。**宁可少判一次，也不能改别人的库**。
+    if db.data_root() != root:
+        msg = (f"评估期间数据根从 {root} 变成了 {db.data_root()}，"
+               "为免改到别处去，这条评估作废")
+        log.warning("任务 %s 的%s", tid, msg)
+        return "error"
+
     if verdict["recoverable"] and n < MAX_AUTO_RETRY:
         rec["verdict"] = "requeued"
         rec["state"] = "done"

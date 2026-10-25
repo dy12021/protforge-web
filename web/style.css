@@ -1161,6 +1161,32 @@ button { cursor: pointer; }
   color: var(--fg); width: 100%; }
 .market-msg { font-size: .8rem; color: var(--fg-dim); margin: .5rem 0 0; }
 .market-msg.is-bad { color: #b4453c; }
+.market-msg.is-ok { color: #1B9A67; }
+
+/* 详细文档。**工具的说明书就是它的文档**——技能仓里那份 SKILL.md 原文。
+ * 折叠着放：它通常不短，摊开会把参数表单挤到屏幕外面去。
+ * 展开时用 max-height + overflow 自己滚，别把整个对话框撑长。 */
+.mt-doc { border: 1px solid var(--border); border-radius: 9px;
+  background: var(--lift); }
+.mt-doc > summary { cursor: pointer; padding: .45rem .6rem; font-size: .82rem;
+  font-weight: 600; color: var(--fg); }
+.mt-doc > summary:hover { color: var(--accent); }
+.mt-doc-body { margin: 0; padding: .15rem .7rem .7rem; font-size: .78rem;
+  line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 22rem; overflow: auto; color: var(--fg-dim);
+  font-family: var(--mono); }
+
+/* agent 辅助填参数。**执行仍然由脚本做**，agent 只负责把一句要求翻译成
+ * 契约参数——所以这块是「输入 + 一个按钮」，不是另一个执行面板。 */
+.mt-fill { border: 1px solid var(--border); border-radius: 9px;
+  background: var(--panel); padding: .55rem .65rem .6rem; }
+.mt-fill .field { margin-bottom: .45rem; }
+.mt-fill-row { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.mt-fill-row .secondary { background: transparent; color: var(--fg-dim);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: .35rem .8rem; }
+.mt-fill-row .secondary:hover { color: var(--fg); background: var(--card); }
+.mt-fill-row .secondary:disabled { opacity: .45; cursor: default; }
 .review-mode-select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
