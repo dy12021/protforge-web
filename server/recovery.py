@@ -447,6 +447,13 @@ def handle(task: dict, state: dict) -> str:
     try:
         verdict = assess(task)
     except RecoveryError as exc:
+        # 换了库就别写：**写的是别的库的任务**——任务号从 1 重新开始，
+        # 「给任务 1 记一条事件」落在别人的头上。宁可少记一条。
+        if db.data_root() != root:
+            log.warning("任务 %s 的评估期间数据根从 %s 变成了 %s，"
+                        "为免改到别处去，这条评估作废",
+                        tid, root, db.data_root())
+            return "error"
         state[str(tid)] = {"verdict": "error", "reason": str(exc),
                            "attempts": attempts_of(state, tid), "state": "done"}
         save_state(state)
