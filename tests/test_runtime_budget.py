@@ -244,7 +244,7 @@ def test_dispatcher_grants_time_when_reasonable(alice, monkeypatch):
     monkeypatch.setattr(runtime_reviewer, "review_runtime",
                         lambda tid, **kw: {"verdict": "reasonable",
                                             "reason": "文件在长"})
-    d._runtime_review_worker(tid, 3000.0, 2700.0, 2700.0)
+    d._runtime_review_worker(tid, 3000.0)
 
     assert store.get_task(tid, is_admin=True)["status"] == "queued", \
         "判合理绝不能把任务打死"
@@ -262,7 +262,7 @@ def test_dispatcher_fails_when_unreasonable(alice, monkeypatch):
     monkeypatch.setattr(runtime_reviewer, "review_runtime",
                         lambda tid, **kw: {"verdict": "unreasonable",
                                             "reason": "同一脚本反复超时"})
-    d._runtime_review_worker(tid, 3000.0, 2700.0, 2700.0)
+    d._runtime_review_worker(tid, 3000.0)
 
     t = store.get_task(tid, is_admin=True)
     assert t["status"] == "failed", t
@@ -280,7 +280,7 @@ def test_dispatcher_does_not_judge_when_review_fails(alice, monkeypatch):
     monkeypatch.setattr(runtime_reviewer, "review_runtime",
                         lambda tid, **kw: {"verdict": "error",
                                             "reason": "复核进程没写出结论文件"})
-    d._runtime_review_worker(tid, 3000.0, 2700.0, 2700.0)
+    d._runtime_review_worker(tid, 3000.0)
 
     assert store.get_task(tid, is_admin=True)["status"] == "running", \
         "复核挂了就把任务打死，等于把裁判失职当成任务有问题"

@@ -206,9 +206,12 @@ def test_settled_without_finish_then_crash_is_a_failure(disp, make_task, monkeyp
     assert wait_for(lambda: ap.proc.poll() is not None)
     disp.tick()
 
-    task = store.get_task(t["id"], is_admin=True)
-    assert task["status"] == "failed", (
-        "自行收口 + 非零退出没有被判成失败：status=%s" % task["status"])
+    # **收尾是异步的**（_reap 把它丢进后台线程）：tick() 返回时收尾未必做完。
+    # 等它要的结果，别读瞬间状态。
+    assert wait_for(
+        lambda: store.get_task(t["id"], is_admin=True)["status"] == "failed"), (
+        "自行收口 + 非零退出没有被判成失败：status=%s"
+        % store.get_task(t["id"], is_admin=True)["status"])
 
 
 # ================================================================ 候选筛选

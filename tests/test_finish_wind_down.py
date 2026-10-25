@@ -53,6 +53,12 @@ if MODE == "settled":
     # **模型答完话就自己结束，没有调 finish。** 真机上最常见的一种收口缺失：
     # stdout 里只有一段 assistant 文本 + agent_settled，一个工具调用都没有。
     # 然后它像真 agent 一样挂在 runRpcMode 上等 stdin，永远不退出。
+    #
+    # **先待 0.5 秒再收口**（2026-10-25 加）：真 agent 要跑一会儿才会结束，
+    # 而这条用例要验的正是「**中止优先于收口**」——如果假 agent 一起来就收口，
+    # 「谁先到」就成了一枚硬币（实测那窗口只有 42 毫秒），用例全看机器负载
+    # 决定过不过。推迟之后，被验的行为一个字没变，结果却是确定的。
+    time.sleep(0.5)
     emit({"type": "message_end", "message": {"role": "assistant",
           "content": [{"type": "text", "text": "算完了：1+1=2"}]}})
     emit({"type": "agent_settled"})
@@ -424,6 +430,7 @@ def test_an_aborted_task_is_not_closed_by_the_settle(disp, owner_id, monkeypatch
     """
     monkeypatch.setattr(dispatcher, "WIND_DOWN_GRACE", 0.5)
     t, ap = _settled_task(disp, owner_id, monkeypatch)
+
     ap.aborted = True
     ap.abort_reason = "用户中止了任务"
 
