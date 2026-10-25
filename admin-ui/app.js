@@ -1866,11 +1866,68 @@ async function setReviewTimeout(minText) {
   }
 }
 
+/* 时间阈值（命令额度 / 用时复核）。**单位在界面上是分钟，服务端存的是秒。** */
+const THRESHOLD_FIELDS = [
+  ['cmd-timeout-min', 'cmd_timeout_s'],
+  ['cmd-timeout-max-min', 'cmd_timeout_max_s'],
+  ['rt-after-min', 'runtime_review_after_s'],
+  ['rt-grant-min', 'runtime_review_grant_s'],
+];
+
+async function loadThresholds() {
+  let o = null;
+  try {
+    o = await api("GET", "/review-settings");
+  } catch (e) {
+    const note = document.getElementById("cmd-timeout-note");
+    if (note) note.textContent = "时间阈值取不到";
+    return;
+  }
+  for (const [id, key] of THRESHOLD_FIELDS) {
+    const inp = document.getElementById(id);
+    if (!inp) continue;
+    const secs = Number(o[key]);
+    inp.value = String(secs > 0 ? Math.round(secs / 60) : "");
+    inp.onchange = () => setThresholds();
+  }
+  const note = document.getElementById("cmd-timeout-note");
+  if (note) {
+    note.textContent = "命令额度是平台强制的：模型忘了设超时，"
+      + "命令也跑不过这个数。";
+  }
+  const rn = document.getElementById("rt-note");
+  if (rn) {
+    rn.textContent = "跑够这么久就起一个独立上下文判「这用时合理吗」："
+      + "合理就续跑，不合理才判失败。";
+  }
+}
+
+async function setThresholds() {
+  const body = {};
+  for (const [id, key] of THRESHOLD_FIELDS) {
+    const inp = document.getElementById(id);
+    if (!inp || inp.value === "") continue;
+    const mins = Number(inp.value);
+    if (!mins || mins < 1) continue;
+    body[key] = Math.round(mins * 60);
+  }
+  if (!Object.keys(body).length) return;
+  try {
+    await api("PUT", "/review-settings", body);
+    setMsg(document.getElementById("board-msg"), "时间阈值已改", "ok");
+    await loadThresholds();
+  } catch (e) {
+    setMsg(document.getElementById("board-msg"), e.message || "改不动时间阈值", "bad");
+    await loadThresholds();
+  }
+}
+
 async function boot() {
   // 状态面板：先画它，别让它拖住别的。取不到也不该让面板整个空着。
   loadStatus().catch(() => {});
   loadReviewDefault().catch(() => {});
   loadReviewTimeout().catch(() => {});
+  loadThresholds().catch(() => {});
   try {
     state.me = await api("GET", "/me");
     document.getElementById("who").textContent =

@@ -295,14 +295,24 @@ class VerifyIn(BaseModel):
 class ReviewModeIn(BaseModel):
     """验收方式。human（人工 + 条件判定）/ llm（机器审核）；空串 = 继承。
 
-    ``review_timeout`` 是**审核进程的超时（秒）**，同一个入口一起改。
+    同一个入口还管**时间阈值**（都可调，不传 = 不动）：
 
-    **两项都不传 = 什么都不动**；只传一项 = 只改那一项。
+    - ``review_timeout``         审核进程的超时（秒）
+    - ``cmd_timeout_s``          单条命令的默认额度（秒）
+    - ``cmd_timeout_max_s``      单条命令的通用上限（秒，模型最多能申请到这么多）
+    - ``runtime_review_after_s`` 任务跑过这么久就起一次**用时复核**（秒）
+    - ``runtime_review_grant_s`` 复核判「合理」之后再给多少时间（秒）
+
+    **不传 = 什么都不动**；只传一项 = 只改那一项。
     ``review_mode`` 传空串仍然是「非法」——它跟「不传」不是一回事：
     全局默认不允许为空，而「不传」才是「这一项我不管」。
     """
     review_mode: str | None = Field(default=None, max_length=16)
     review_timeout: int | None = Field(default=None, ge=60, le=14400)
+    cmd_timeout_s: int | None = Field(default=None, ge=30, le=86400)
+    cmd_timeout_max_s: int | None = Field(default=None, ge=60, le=86400)
+    runtime_review_after_s: int | None = Field(default=None, ge=300, le=86400)
+    runtime_review_grant_s: int | None = Field(default=None, ge=60, le=86400)
 
 
 class UserIn(BaseModel):
@@ -764,6 +774,10 @@ def create_admin_app() -> FastAPI:
     def review_settings(user: dict = Depends(require_admin)):
         return {"review_mode": store.get_global_review_mode(),
                 "review_timeout": store.get_review_timeout(),
+                "cmd_timeout_s": store.get_cmd_timeout(),
+                "cmd_timeout_max_s": store.get_cmd_timeout_max(),
+                "runtime_review_after_s": store.get_runtime_review_after(),
+                "runtime_review_grant_s": store.get_runtime_review_grant(),
                 "source": "global"}
 
     @app.put("/api/admin/review-settings")
@@ -777,7 +791,25 @@ def create_admin_app() -> FastAPI:
         timeout = store.get_review_timeout()
         if body.review_timeout is not None:
             timeout = store.set_review_timeout(body.review_timeout)
-        return {"review_mode": mode, "review_timeout": timeout, "source": "global"}
+        # --- 时间阈值：不传 = 不动 -------------------------------------------
+        cmd_timeout = store.get_cmd_timeout()
+        if body.cmd_timeout_s is not None:
+            cmd_timeout = store.set_cmd_timeout(body.cmd_timeout_s)
+        cmd_timeout_max = store.get_cmd_timeout_max()
+        if body.cmd_timeout_max_s is not None:
+            cmd_timeout_max = store.set_cmd_timeout_max(body.cmd_timeout_max_s)
+        rt_after = store.get_runtime_review_after()
+        if body.runtime_review_after_s is not None:
+            rt_after = store.set_runtime_review_after(body.runtime_review_after_s)
+        rt_grant = store.get_runtime_review_grant()
+        if body.runtime_review_grant_s is not None:
+            rt_grant = store.set_runtime_review_grant(body.runtime_review_grant_s)
+        return {"review_mode": mode, "review_timeout": timeout,
+                "cmd_timeout_s": cmd_timeout,
+                "cmd_timeout_max_s": cmd_timeout_max,
+                "runtime_review_after_s": rt_after,
+                "runtime_review_grant_s": rt_grant,
+                "source": "global"}
 
     @app.patch("/api/admin/tasks/{task_id}/review-mode")
     def patch_task_review_mode(task_id: int, body: ReviewModeIn,

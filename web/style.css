@@ -1125,6 +1125,42 @@ button { cursor: pointer; }
   background: var(--card);
   color: var(--fg);
 }
+/* --- 工具市场 ------------------------------------------------------------- */
+.market .composer-inner { max-width: 920px; }
+.market-bar { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+  margin: .6rem 0 .9rem; }
+.market-search { flex: 1 1 16rem; font: inherit; font-size: .86rem;
+  padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--card); color: var(--fg); }
+.market-cats { display: flex; gap: .3rem; flex-wrap: wrap; }
+.market-grid { display: grid; gap: .7rem;
+  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); }
+.mcard { border: 1px solid var(--border); border-radius: 10px; padding: .6rem .7rem;
+  background: var(--card); cursor: pointer; display: flex; flex-direction: column;
+  gap: .25rem; }
+.mcard:hover { border-color: var(--accent); }
+.mcard-head { display: flex; align-items: center; gap: .4rem; }
+.mcard-name { font-weight: 600; font-size: .9rem; }
+.mcard-badge { font-size: .68rem; padding: .1rem .35rem; border-radius: 999px;
+  background: var(--accent); color: #fff; }
+.mcard-id { font-size: .74rem; color: var(--fg-dim); }
+.mcard-cat { font-size: .72rem; color: var(--fg-dim); }
+.mcard-foot { margin-top: .2rem; }
+.mcard-state { font-size: .72rem; color: var(--fg-dim); }
+.market-detail { display: flex; flex-direction: column; gap: .55rem; }
+.market-detail-head { display: flex; align-items: center; justify-content: space-between; }
+.market-detail-head h3 { margin: 0; font-size: 1rem; }
+.mt-d-meta { font-size: .78rem; color: var(--fg-dim); margin: 0; }
+.mt-params { display: flex; flex-direction: column; gap: .45rem; }
+.market-input { font: inherit; font-size: .84rem; padding: .35rem .5rem;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--card);
+  color: var(--fg); width: 100%; }
+.market-check { width: auto; }
+.market-textarea { font: inherit; font-size: .84rem; padding: .4rem .5rem;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--card);
+  color: var(--fg); width: 100%; }
+.market-msg { font-size: .8rem; color: var(--fg-dim); margin: .5rem 0 0; }
+.market-msg.is-bad { color: #b4453c; }
 .review-mode-select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;

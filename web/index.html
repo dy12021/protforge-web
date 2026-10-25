@@ -18,6 +18,7 @@
     <h1>自动化计算平台</h1>
     <span class="toolbar-gap"></span>
     <span id="who" class="who"></span>
+    <button id="market-btn" class="secondary" type="button">工具市场</button>
     <button id="new-btn" class="primary" type="button">＋ 提交计算任务</button>
     <button id="logout-btn" class="secondary" type="button">退出</button>
   </header>
@@ -135,6 +136,45 @@
        要加人就搜一个账户，要转让得点「转让」再走一步确认。
        不用 window.prompt：那种框既挑不了账户，也放不下「转让之后你会
        失去访问」这类后果说明——而没有后果说明的不可撤销动作是危险的。 -->
+  <!-- 工具市场。**直接调工具**：选一个、按契约填参数、平台就跑它——
+       不经 agent（确定性的活别交给不确定的环节：agent 可能自己写替代脚本，
+       2026-10-24 那条跑了 4 小时 42 分的 O(n²) 碰撞消解就是这么来的）。 -->
+  <dialog class="composer market" id="market">
+    <div class="composer-inner">
+      <h2 class="composer-title" id="mt-title">工具市场</h2>
+      <p class="composer-lead">
+        按契约填参数，平台直接调用那个入口脚本。<b>不经 agent</b>——
+        跑出来的就是那个工具的结果，不会自己发明别的算法。
+      </p>
+      <div class="market-bar">
+        <input id="mt-search" class="market-search" type="search"
+               placeholder="搜工具名或分类">
+        <span id="mt-cats" class="market-cats"></span>
+      </div>
+      <div class="market-grid" id="mt-grid"></div>
+      <p class="zone-empty" id="mt-empty" hidden>没有匹配的工具。</p>
+      <p class="market-msg" id="mt-msg" hidden></p>
+
+      <div class="market-detail" id="mt-detail" hidden>
+        <div class="market-detail-head">
+          <h3 id="mt-d-title"></h3>
+          <button class="secondary" type="button" id="mt-d-back">返回列表</button>
+        </div>
+        <p class="mt-d-meta" id="mt-d-meta"></p>
+        <div class="mt-params" id="mt-params"></div>
+        <label class="toggle mt-batch">
+          <input type="checkbox" id="mt-batch"> 批量（每行一个输入，共享下面的参数）
+        </label>
+        <textarea id="mt-batch-list" class="market-textarea" rows="3"
+                  placeholder="每行一个输入（例如每个 pdb 路径）" hidden></textarea>
+        <div class="composer-actions">
+          <button class="secondary" type="button" id="mt-cancel">算了</button>
+          <button class="primary" type="button" id="mt-run">运行</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
   <dialog class="share" id="share">
     <div class="share-inner">
       <h2 class="share-title" id="sh-title">共享工作流</h2>

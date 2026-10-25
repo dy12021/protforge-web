@@ -116,6 +116,67 @@ const DESTRUCTIVE = new Set([
   'mkfs.ext3', 'mkfs.xfs', 'diskpart', 'format', 'wipefs', 'cp', 'mv',
 ]);
 
+/**
+ * **单条命令的默认超时（秒）**。
+ *
+ * 为什么要有这个：pi 的 bash 工具的 timeout 参数是**可选且没有默认值**
+ * （工具说明原文："Timeout in seconds (optional, no default timeout)"），
+ * 于是「模型忘了传 timeout」= 这条命令可以跑到天荒地老。
+ * 2026-10-24 实测就是这样：一条 `python work/build_designed.py`（6126 原子
+ * × 80 轮的 O(n²) 碰撞消解）**跑了 4 小时 42 分**，把整行拖垮。
+ *
+ * 技能里其实早写了「单条命令不超过 10 分钟」（protforge-sandwich-antibody
+ * 2026-10-22 提交），但那是**散文**：模型没遵守。**规矩要落在代码里。**
+ */
+const DEFAULT_CMD_TIMEOUT_S = envInt('PROTFORGE_WEB_CMD_TIMEOUT_S', 600);
+
+/**
+ * 通用命令的**上限**（秒）。模型可以申请比默认更长，但不超过这个数。
+ *
+ * 这条上限管的是「**不认识的东西**」——agent 自己写的脚本、内联解释器、
+ * 临时拼的管道。2026-10-24 那条跑了 4 小时 42 分的
+ * `python work/build_designed.py` 就属于这一类（它不是任何注册工具的入口），
+ * 4.5 小时 → 30 分钟。
+ *
+ * **认得出的工具走自己的额度**（见 toolBudgets）：大计算（rfdiffusion /
+ * bindcraft / gromacs）不该跟「列个目录」共用一个数。
+ */
+const MAX_CMD_TIMEOUT_S = envInt('PROTFORGE_WEB_CMD_TIMEOUT_MAX_S', 1800);
+
+/**
+ * 本任务的**总计算预算**（秒）。默认 2 小时。
+ *
+ * 这是整套机制里最要紧的一条：**大项目和小项目靠这个区分，而不是靠猜命令。**
+ *
+ * - 一条 30 秒的预测：跑完就结束，压根碰不到预算；
+ * - 一个跑 4 小时的抗体设计项目：任务预算在一点点被吃掉，
+ *   **后面的命令额度越来越少**，撞到上限时守卫抛出「预算用尽」，
+ *   agent 收到的是「收工交付」而不是「这条命令被腰斩」。
+ *
+ * 服务端 spawn 时用 `PROTFORGE_WEB_TASK_BUDGET_S` 注入（秒）。
+ */
+const DEFAULT_TASK_BUDGET_S = 7200;
+
+/**
+ * 任务预算的**下限**：剩这么少就不该再开新命令了，直接收口。
+ * 低于它就抛「预算用尽」——硬砍一条正在跑的命令不如让它自己收工，
+ * 那样还能把已经算出来的东西交上来。
+ */
+const TASK_BUDGET_FLOOR_S = 60;
+
+/**
+ * 读一个整数环境变量，**读不到或读坏了就用默认值**。
+ *
+ * 阈值是**运行策略**（值班台可改），不是写死在代码里的常量——
+ * 写死就意味着换个批次想调一下得改代码、重新上线。
+ */
+function envInt(name, fallback) {
+  const raw = (process.env[name] || '').trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 /** 只包一层、不改变语义的命令：取剩余 argv 递归回去。 */
 const WRAPPERS = new Set([
   'sudo', 'doas', 'nohup', 'env', 'nice', 'ionice', 'timeout', 'stdbuf',
@@ -334,6 +395,106 @@ function baseName(words) {
 }
 
 // ------------------------------------------------------------------ 上下文
+
+// ---------------------------------------------------------------- 命令超时
+
+/**
+ * 工具预算表：``{识别键: 该工具的超时预算（秒）}``。
+ *
+ * 由服务端 spawn 时用 `PROTFORGE_WEB_TOOL_BUDGETS` 注入（JSON），
+ * 内容来自 server/skills_index.py 的 `tool_budgets()`——**平台是唯一的事实源**，
+ * 守卫这边不自己维护一份表（两份表漂移起来没人发现）。
+ *
+ * 键有三种，都是「命令里可能出现的字样」：
+ * - 入口脚本文件名（`proteinmpnn.sh`）：bash runner 型技能；
+ * - 技能裸名（`opendde` / `esmfold2`）：WSL 直调型技能，入口写在
+ *   SKILL.md 正文里、**没有 scripts/ 目录**，只能按名字认；
+ * - 技能全名（`protforge-opendde`）：同上。
+ *
+ * 用文件名/名字而不是绝对路径：agent 的命令里入口常写成
+ * `${PLUGIN_DIR}/skills/...` 这种变量形式，绝对路径匹配不上。
+ */
+let _toolBudgets = null;
+
+export function toolBudgets() {
+  if (_toolBudgets !== null) return _toolBudgets;
+  const raw = (process.env.PROTFORGE_WEB_TOOL_BUDGETS || '').trim();
+  let map = {};
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) {
+          const secs = Number(v);
+          if (Number.isFinite(secs) && secs > 0) map[String(k)] = secs;
+        }
+      }
+    } catch {
+      map = {};   // 坏 JSON 不许让整条命令跑不了，按通用规则走
+    }
+  }
+  _toolBudgets = map;
+  return map;
+}
+
+/**
+ * 本任务的总计算预算（秒）。服务端注入；没注入就用默认 2 小时。
+ */
+function taskBudgetSeconds() {
+  const raw = (process.env.PROTFORGE_WEB_TASK_BUDGET_S || '').trim();
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs > 0) return secs;
+  return DEFAULT_TASK_BUDGET_S;
+}
+
+/**
+ * 本任务**还剩**多少预算（秒）。
+ *
+ * 从 agent 进程启动算起——agent 进程的生命周期就是一次计算任务的生命周期。
+ * 这个数**在本地算**，不需要服务端回传：agent 自己知道它跑了多久。
+ */
+function taskRemainingSeconds() {
+  const budget = taskBudgetSeconds();
+  const used = (Date.now() - AGENT_STARTED_AT) / 1000;
+  return Math.max(0, budget - used);
+}
+
+/**
+ * 这条命令的上限是多少秒。
+ *
+ * 规则（**与技能里写的规矩一一对应**）：
+ * - 认得出是哪个工具 → 用**那个工具的预算**（大计算自然有更大的额度）；
+ * - 认不出 → 通用上限（1800 秒）。
+ */
+export function timeoutCapFor(command) {
+  const budgets = toolBudgets();
+  for (const [name, secs] of Object.entries(budgets)) {
+    // 词边界匹配：命令名出现在引号里、空白后、斜杠后都算；
+    // 出现在单词中间（`myproteinmpnn.sh`）不算。
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(^|[\\s/'"])${escaped}([\\s'"]|\|$)`);
+    if (re.test(command)) return secs;
+  }
+  return MAX_CMD_TIMEOUT_S;
+}
+
+/**
+ * 这条命令实际用多少秒超时。
+ *
+ * - 模型传了 timeout → 用它，但**不许超过上限**（夹住，不报错：
+ *   模型已经拿到「被腰斩」的结果了，再报错只是多一次往返）；
+ * - 模型没传 → 默认 600 秒。
+ *
+ * 返回 ``{seconds, cap, clamped}``：clamped 表示「模型要的比给的多」，
+ * 这条要记进审计——不然没人知道上限在起作用。
+ */
+export function resolveTimeout(command, requested) {
+  const cap = timeoutCapFor(command);
+  let want = Number(requested);
+  if (!Number.isFinite(want) || want <= 0) want = DEFAULT_CMD_TIMEOUT_S;
+  const seconds = Math.min(want, cap);
+  return { seconds, cap, clamped: want > cap, requested: want };
+}
 
 function makeContext(opts) {
   const fileRoots = [...allowedFileRoots(), ...(opts.fileRoots || [])];
@@ -882,11 +1043,18 @@ export function createGuardedBashOperations(opts, base = null) {
         throw new Error(`命令被安全守卫拒绝：${verdict.reason}\n请改用等效的安全写法后重试。`);
       }
       const started = Date.now();
+      // **每条命令都必须有超时**。见 DEFAULT_CMD_TIMEOUT_S 的说明。
+      const t = resolveTimeout(command, options && options.timeout);
+      const execOptions = { ...(options || {}), timeout: t.seconds };
       try {
-        const result = await local.exec(command, cwd, options);
+        const result = await local.exec(command, cwd, execOptions);
         await reportAudit(opts, {
           kind: 'bash',
-          command,
+          // 被夹住的时候在**新的一行**上说明——跟「被守卫拒绝」同一个做法：
+          // 原文仍然是原文，只是后面多一行说明，不改写命令本身。
+          command: t.clamped
+            ? `${command}\n# 超时被夹到 ${t.seconds} 秒（上限 ${t.cap} 秒，模型要的是 ${t.requested} 秒）`
+            : command,
           // pi 的 BashResult.exitCode 在被 kill / 取消时是 undefined，
           // 原样传 null 而不是编一个 0 出来——"没退出码"和"退出码是 0"
           // 在追责时是两回事。
@@ -899,7 +1067,9 @@ export function createGuardedBashOperations(opts, base = null) {
         // 否则"命令跑了很久然后没了"在审计里查不到任何东西。
         await reportAudit(opts, {
           kind: 'bash',
-          command,
+          command: t.clamped
+            ? `${command}\n# 超时被夹到 ${t.seconds} 秒（上限 ${t.cap} 秒，模型要的是 ${t.requested} 秒）`
+            : command,
           exit_code: null,
           elapsed_ms: Date.now() - started,
         });

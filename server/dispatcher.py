@@ -50,6 +50,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -62,9 +63,12 @@ import llm
 import memory
 import recovery
 import reflection
+import runtime_reviewer
+import skills_index
 import sse
 import store
 import task_reviewer
+import tool_runner
 import workflow as workflow_mod
 
 log = logging.getLogger(__name__)
@@ -136,6 +140,9 @@ _INTERNAL_ENV = "PROTFORGE_WEB_INTERNAL"
 _MAX_CONCURRENCY_ENV = "PROTFORGE_WEB_MAX_CONCURRENCY"
 _NODE_ENV = "PROTFORGE_WEB_NODE"
 _AGENT_SCRIPT_ENV = "PROTFORGE_WEB_AGENT_SCRIPT"
+
+#: 手动模式的执行器脚本（环境变量可覆盖）。
+_TOOL_RUNNER_ENV = "PROTFORGE_WEB_TOOL_RUNNER"
 
 #: 归档线程池大小。**下限是 2，不是调优参数**。
 #:
@@ -745,6 +752,10 @@ class Dispatcher:
         self.db = db_module or db
         self.data_root = Path(data_root) if data_root else self.db.data_root()
         self.node_exe = str(node_exe or os.environ.get(_NODE_ENV) or "node")
+        #: 手动模式的执行器：它按契约直接跑那个入口脚本。
+        self.tool_runner_script = Path(
+            os.environ.get(_TOOL_RUNNER_ENV)
+            or (Path(__file__).resolve().parent.parent / "agent" / "run_tool.py"))
         self.agent_script = Path(agent_script or os.environ.get(_AGENT_SCRIPT_ENV)
                                  or DEFAULT_AGENT_SCRIPT)
         self.internal_base = str(internal_base or os.environ.get(_INTERNAL_ENV)
@@ -764,6 +775,16 @@ class Dispatcher:
         self._thread: threading.Thread | None = None
         self._wake = threading.Event()
         self._stopping = False
+
+        # --- 用时复核 -----------------------------------------------------------
+        # ``task_id -> 下次该复核的 monotonic 时刻``。**不设总时长上限**——
+        # 判「合理」就继续跑（那是复核的裁决），判「不合理」才判失败。
+        self._rt_next_review: dict[int, float] = {}
+        self._rt_started: dict[int, float] = {}
+        self._rt_lock = threading.RLock()
+        #: 阈值缓存：``(取回时刻, 复核阈值, 续跑额度)``。
+        #: **不在每轮 tick 里读库**——tick 是每秒一轮的热路径。
+        self._rt_cfg: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
         # --- 归档工作线程 -----------------------------------------------------------
         # openpyxl 不支持增量写：一次 write_back 是整表 load + 整表 save（宽表实测
@@ -1209,6 +1230,11 @@ class Dispatcher:
             self._review_pass()
         except Exception:                          # noqa: BLE001
             log.exception("机器审核巡检出错")
+        # 用时复核也排在最后：它比机器审核更少见（只有跑得久的任务才触发）。
+        try:
+            self._runtime_review_pass()
+        except Exception:                          # noqa: BLE001
+            log.exception("用时复核巡检出错")
         return admitted
 
     # --- 反思 ---------------------------------------------------------------------
@@ -1402,6 +1428,140 @@ class Dispatcher:
             finally:
                 with self._rev_lock:
                     self._rev_inflight.discard(task_id)
+
+    # --- 用时复核 -------------------------------------------------------------
+
+    def _runtime_review_pass(self) -> int:
+        """跑得久的任务 → 起一次**用时复核**。**只入队**，复核在后台线程上跑。
+
+        为什么要它：一个计算跑了很久，可能是「本来就慢的大计算」，
+        也可能是「撞进了病态算法」。机械地按时间砍会砍错第一种；
+        放任不管会烧掉第二种。**所以交给另一个上下文去判**——
+        它没看过干活的计算进程怎么想的，只看事实（跑了多久、在跑什么、
+        文件有没有在长）。
+
+        裁决：
+        - 合理 → **续跑**（把下次复核时间往后推），记一条事件；
+        - 不合理 → **判失败**（杀进程树 + 写明理由），**不产出交付**；
+        - 复核没跑成 → **不裁决**，继续跑（复核挂了不等于用时不合理）。
+        """
+        after, grant = self._rt_thresholds()
+        now = time.monotonic()
+        started = 0
+        with self._rt_lock:
+            due = [tid for tid, when in self._rt_next_review.items() if now >= when]
+        for task_id in due:
+            if task_id not in self.running:
+                with self._rt_lock:
+                    self._rt_next_review.pop(task_id, None)
+                continue
+            ap = self.running.get(task_id)
+            if ap is None or ap.settled or ap.aborted:
+                continue
+            started = max(0.0, now - self._task_started_at(task_id))
+            # **先把下次复核时间推后**，再起线程：复核要跑一两分钟，
+            # 期间 tick 每秒都在跑，不推后就会连着起好几个复核。
+            with self._rt_lock:
+                self._rt_next_review[task_id] = now + after
+            threading.Thread(target=self._runtime_review_worker,
+                             args=(task_id, started, after, grant),
+                             name=f"rt-review-{task_id}", daemon=True).start()
+        return len(due)
+
+    def _rt_thresholds(self) -> tuple[float, float]:
+        """取（复核阈值, 续跑额度）。**带 30 秒缓存**。
+
+        这两个数是平台设置，几乎不变；而 tick 是每秒一轮的热路径，
+        每轮读两次库就是在满负载时每秒白等两次。
+        """
+        now = time.monotonic()
+        cached_at, after, grant = self._rt_cfg
+        if cached_at and (now - cached_at) < 30.0:
+            return after, grant
+        try:
+            after = store.get_runtime_review_after(runtime_reviewer.REVIEW_AFTER_S)
+            grant = store.get_runtime_review_grant(runtime_reviewer.GRANT_EXTRA_S)
+        except Exception:                          # noqa: BLE001
+            log.exception("读用时复核阈值失败，沿用上一次的值")
+            return after, grant
+        self._rt_cfg = (now, after, grant)
+        return after, grant
+
+    def _tool_task_argv(self, task: dict, work_dir: Path, env: dict) -> list[str]:
+        """工具任务：起 ``run_tool.py``，让它按契约直接跑那个入口脚本。
+
+        **不经 agent**——agent 那一层在手动模式里是多余的：需求已经由契约
+        变成了确切的 argv，剩下的是执行。
+        """
+        tool_id = str(task.get("tool_id") or "")
+        tool = skills_index.get_tool(tool_id)
+        if not tool:
+            raise DispatcherError(f"任务 {task.get('id')} 指向的工具 {tool_id!r} 不存在")
+        try:
+            params = json.loads(task.get("tool_params") or "{}")
+        except ValueError as exc:
+            raise DispatcherError(f"任务 {task.get('id')} 的工具参数不是合法 JSON：{exc}") from None
+        # **再校验一遍**：任务可能不是从 API 建的（直接落库的），
+        # 参数里可能缺字段。校验会把默认值补齐，缺必填就当场报。
+        params = tool_runner.validate_params(tool, params)
+        # **产物的落点在这里定死**：共享 outputs 目录下的子目录名必须以
+        # `t<任务号>_` 开头，平台才认它是这一轮的产物；不带的会被判「归属不明」，
+        # 走时间窗兜底 → 未经确认 → **打包被拒**（这一行于是 failed）。
+        # 手动模式没有 agent 教它命名，所以得平台自己来。
+        tid = int(task.get("id") or 0)
+        names = {p.get("name") for p in (tool.get("params") or [])}
+        if "job_name" in names:
+            given = str(params.get("job_name") or "").strip()
+            if not given.startswith(f"t{tid}_"):
+                base = given or str(tool.get("id") or "job")
+                params["job_name"] = f"t{tid}_{base}"
+        spec = tool_runner.tool_spec(tool, params, cwd=str(work_dir))
+        env["PROTFORGE_WEB_TOOL_SPEC"] = json.dumps(spec, ensure_ascii=False)
+        # 工具任务**不需要模型**：不物化模型配置，也不发模型请求。
+        return [sys.executable, str(self.tool_runner_script)]
+
+    def _task_started_at(self, task_id: int) -> float:
+        """这个任务起跑的时刻（monotonic）。"""
+        with self._rt_lock:
+            return self._rt_started.get(task_id, time.monotonic())
+
+    def _runtime_review_worker(self, task_id: int, elapsed: float,
+                               after: float, grant: float) -> None:
+        """跑一次用时复核，然后按裁决行事。**任何异常都不许逃出去。**"""
+        try:
+            res = runtime_reviewer.review_runtime(task_id, elapsed_s=elapsed)
+        except Exception:                          # noqa: BLE001
+            log.exception("任务 %s 的用时复核出错", task_id)
+            return
+        verdict = res.get("verdict")
+        reason = (res.get("reason") or "").strip()
+        try:
+            if verdict == "reasonable":
+                store.add_event(task_id, "note", "system",
+                                f"用时复核：判定合理（{reason[:400]}），继续跑")
+                # **续跑**：下次复核推后一个「续跑额度」。
+                with self._rt_lock:
+                    self._rt_next_review[task_id] = time.monotonic() + grant
+            elif verdict == "unreasonable":
+                store.add_event(task_id, "error", "system",
+                                f"用时复核：判定不合理（{reason[:400]}）")
+                # **判失败**：杀进程树 + 写明理由。**不产出交付**——
+                # 半成品冒充成果比明确失败糟得多。
+                why = f"用时复核判定不合理：{reason[:900]}"
+                if task_id in self.running:
+                    self.abort(task_id, reason=why)
+                else:
+                    # 调度器重启后内存表里没有这个任务了（进程早没了），
+                    # 但库里还是 running——**照样要判失败**，否则这一行
+                    # 会永远停在「计算中」。
+                    self._mark_failed(task_id, why)
+            else:
+                store.add_event(task_id, "note", "system",
+                                f"用时复核：没裁决（{reason[:200]}），继续跑")
+                with self._rt_lock:
+                    self._rt_next_review[task_id] = time.monotonic() + after
+        except Exception:                          # noqa: BLE001
+            log.exception("处理任务 %s 的用时复核结论出错", task_id)
 
     def _review_stop(self) -> None:
         """停机：投哨兵。**不等审核跑完**——它最长十几分钟，
@@ -2115,6 +2275,14 @@ class Dispatcher:
             raise DispatcherError(f"需求描述写入工作区失败：{e}")
 
         token = issue_agent_token(task_id)
+        # **起跑时刻**（monotonic）：用时复核从这里算已跑多久。
+        # 用 monotonic 而不是 time.time()——系统时间被对时调回，
+        # time() 会算出负的耗时，复核就永远不会触发。
+        with self._rt_lock:
+            self._rt_started[task_id] = time.monotonic()
+            self._rt_next_review[task_id] = (
+                time.monotonic() + store.get_runtime_review_after(
+                    runtime_reviewer.REVIEW_AFTER_S))
         env = dict(os.environ)
         env[_INTERNAL_ENV] = self.internal_base
         env["PROTFORGE_TASK_ID"] = str(task_id)
@@ -2133,6 +2301,20 @@ class Dispatcher:
         # 只设 PYTHONIOENCODING（stdout/stderr），不动 open() 的默认编码。
         env["PYTHONIOENCODING"] = "utf-8"
 
+        # --- 命令超时（**平台层强制，不是靠提示词**）---------------------------
+        # pi 的 bash 工具的 timeout 参数**没有默认值**——模型忘了传，
+        # 这条命令就能跑到天荒地老（2026-10-24 实测：一条 O(n²) 脚本跑了
+        # 4 小时 42 分）。这里把「默认额度」「通用上限」「各工具的档位」
+        # 一次交到 agent 侧，由守卫强制执行。
+        env["PROTFORGE_WEB_CMD_TIMEOUT_S"] = str(int(store.get_cmd_timeout()))
+        env["PROTFORGE_WEB_CMD_TIMEOUT_MAX_S"] = str(int(store.get_cmd_timeout_max()))
+        try:
+            env["PROTFORGE_WEB_TOOL_BUDGETS"] = json.dumps(
+                skills_index.tool_budgets(), ensure_ascii=False)
+        except Exception:                          # noqa: BLE001
+            # 拿不到预算表就让守卫用通用规则，**不许因为这张表坏掉就不给上限**。
+            env["PROTFORGE_WEB_TOOL_BUDGETS"] = "{}"
+
         # 模型配置跟着任务走：写在工作目录里，跟着任务建、跟着任务删。
         agent_dir, have_key = llm.materialize_model_config(work_dir)
         env["PROTFORGE_AGENT_DIR"] = str(agent_dir)
@@ -2145,7 +2327,19 @@ class Dispatcher:
             log.warning("任务 %s：环境变量 %s 没值，agent 大概率发不出模型请求",
                         task_id, llm.key_env())
 
-        argv = [self.node_exe, str(self.agent_script)]
+        # --- 手动模式：直接跑工具脚本，**不经 agent** ---------------------------
+        # 工具是「固定入口 + 固定契约」。让模型去按要求调用它，等于把确定性的活
+        # 交给不确定的环节：它可能自己写一段替代脚本（2026-10-24 那条跑了
+        # 4 小时 42 分的 O(n²) 碰撞消解就是这么来的），还多烧一次模型调用。
+        task_row = None
+        try:
+            task_row = store.get_task(task_id, is_admin=True)
+        except Exception:                              # noqa: BLE001
+            log.exception("读任务 %s 失败，按常规 agent 任务起", task_id)
+        if task_row and str(task_row.get("kind") or "agent") == "tool":
+            argv = self._tool_task_argv(task_row, work_dir, env)
+        else:
+            argv = [self.node_exe, str(self.agent_script)]
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.logs_dir / f"agent-{task_id}.log"
         stderr_path = self.logs_dir / f"agent-{task_id}.err.log"

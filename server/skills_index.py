@@ -88,6 +88,28 @@ class SkillIndexError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ToolParam:
+    """工具的一个参数（契约）。
+
+    ``name`` 必须与入口脚本的**位置参数**同名——手动模式按契约拼 argv，
+    契约里没有的名字不许传（防「参数名写错→静默用默认值」）。
+    """
+
+    name: str
+    type: str                # string | int | float | bool | path
+    required: bool
+    default: str
+    label: str
+    description: str
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "type": self.type,
+                "required": self.required, "default": self.default,
+                "label": self.label or self.name,
+                "description": self.description}
+
+
+@dataclass(frozen=True)
 class SkillInfo:
     """单个技能的静态索引信息。"""
 
@@ -98,6 +120,18 @@ class SkillInfo:
     shell_kind: str          # gitbash | wsl | host
     timeout_s: int
     reads_workspace: bool
+    # --- 工具市场那几项（来自可选的 tool.yaml，缺文件就是空值）---
+    tool_id: str = ""              # 空 = 不是「可直接调用的工具」
+    version: str = ""
+    display_name: str = ""
+    category: str = ""
+    batch: bool = False
+    params: tuple = ()             # tuple[ToolParam, ...]
+    #: **能不能被「直接调用」**：有入口脚本 + 声明了 tool_id。
+    #: 说明书型的技能（sandwich-antibody / opendde 那些「路由器」）
+    #: 没有可直接调用的入口，只能由 agent 编排——它们在工具市场里
+    #: 会被标成「需要 agent 辅助」，而不是伪装成一个能点的工具。
+    directly_callable: bool = False
 
 
 def _bare(name: str) -> str:
@@ -108,6 +142,76 @@ def _bare(name: str) -> str:
 def timeout_for(name: str) -> int:
     """按技能名查超时（秒）。认带不带 `protforge-` 前缀，未知技能给默认值。"""
     return _TIMEOUT_BY_SKILL.get(_bare(name), DEFAULT_TIMEOUT_S)
+
+
+#: 工具元数据文件名（放在技能目录里，跟技能一起版本化）。
+TOOL_MANIFEST_NAME = "tool.yaml"
+
+#: 允许的参数类型。**不在表内的类型直接拒**——手动模式要拿这个类型
+#: 去校验用户填的值，放行未知类型等于把校验漏掉。
+_PARAM_TYPES = ("string", "int", "float", "bool", "path")
+
+
+def _load_tool_manifest(skill_dir: Path, skill_name: str) -> dict:
+    """读 ``tool.yaml``。**没有就返回空字典**——不是每个技能都是工具。
+
+    解析失败抛 :class:`SkillIndexError`（与 frontmatter 同一套规矩）：
+    契约文件坏掉就静默丢掉，等于「这个工具存在但参数不校验」。
+    """
+    path = skill_dir / TOOL_MANIFEST_NAME
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+    except yaml.YAMLError as e:
+        raise SkillIndexError(
+            f"技能 {skill_name} 的 {TOOL_MANIFEST_NAME} 不是合法 YAML：{e}") from e
+    except OSError:
+        return {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise SkillIndexError(
+            f"技能 {skill_name} 的 {TOOL_MANIFEST_NAME} 必须是映射（键值对），"
+            f"实际是 {type(data).__name__}")
+    return data
+
+
+def _parse_params(raw, skill_name: str) -> tuple:
+    """把 tool.yaml 的 params 变成 :class:`ToolParam` 序列。
+
+    **每个参数都必须有名字**——没名字的参数在手动模式里没法拼 argv。
+    类型不在白名单里直接拒：手动模式要按类型校验用户填的值。
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise SkillIndexError(f"技能 {skill_name} 的 params 必须是列表")
+    out = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise SkillIndexError(f"技能 {skill_name} 的某个参数不是映射：{item!r}")
+        name = str(item.get("name") or "").strip()
+        if not name:
+            raise SkillIndexError(f"技能 {skill_name} 有参数没写 name")
+        if name in seen:
+            raise SkillIndexError(f"技能 {skill_name} 的参数 {name} 重复")
+        seen.add(name)
+        ptype = str(item.get("type") or "string").strip().lower()
+        if ptype not in _PARAM_TYPES:
+            raise SkillIndexError(
+                f"技能 {skill_name} 的参数 {name} 类型 {ptype!r} 不在白名单 {_PARAM_TYPES}")
+        default = item.get("default")
+        out.append(ToolParam(
+            name=name,
+            type=ptype,
+            required=bool(item.get("required", False)),
+            default="" if default is None else str(default),
+            label=str(item.get("label") or ""),
+            description=str(item.get("description") or ""),
+        ))
+    return tuple(out)
 
 
 def _read_text(path: Path) -> str:
@@ -194,14 +298,45 @@ def _build(skill_dir: Path) -> SkillInfo:
     executable = runner is not None or shell_kind == "wsl"
     reads_workspace = executable and bool(_INPUTS_RE.search(body))
 
+    manifest = _load_tool_manifest(skill_dir, name)
+    params = _parse_params(manifest.get("params"), name)
+    # **tool.yaml 可以覆盖这个技能的超时档位**：档位表在平台代码里，
+    # 但「这个工具的正常耗时」是工具自己的事——它自己最清楚。
+    timeout_s = timeout_for(name)
+    if manifest.get("timeout_s") is not None:
+        try:
+            timeout_s = int(manifest["timeout_s"])
+        except (TypeError, ValueError):
+            raise SkillIndexError(
+                f"技能 {name} 的 timeout_s 不是整数：{manifest['timeout_s']!r}") from None
+        if timeout_s <= 0:
+            raise SkillIndexError(f"技能 {name} 的 timeout_s 必须大于 0")
+    tool_id = str(manifest.get("id") or "").strip()
+    # **有 tool.yaml 但没 id** = 想当工具却没给身份 → 报错，不是当普通技能。
+    if manifest and not tool_id:
+        raise SkillIndexError(
+            f"技能 {name} 有 {TOOL_MANIFEST_NAME} 但没写 id，"
+            f"工具市场里没有身份的工具是不能上架的")
+    if tool_id and not tool_id.replace("-", "").replace("_", "").isalnum():
+        raise SkillIndexError(f"技能 {name} 的工具 id 只能含字母数字下划线连字符：{tool_id!r}")
+
     return SkillInfo(
         name=name,
         description=desc,
         has_runner=runner is not None,
         runner_path=str(runner) if runner is not None else None,
         shell_kind=shell_kind,
-        timeout_s=timeout_for(name),
+        timeout_s=timeout_s,
         reads_workspace=reads_workspace,
+        tool_id=tool_id,
+        version=str(manifest.get("version") or ""),
+        display_name=str(manifest.get("display_name") or ""),
+        category=str(manifest.get("category") or ""),
+        batch=bool(manifest.get("batch", False)),
+        params=params,
+        # **能直接调用 = 有入口脚本 + 有工具身份**。
+        # 说明书型技能（没有 runner）不给上架，免得点下去跑不起来。
+        directly_callable=bool(tool_id) and runner is not None,
     )
 
 
@@ -219,3 +354,71 @@ def scan(skills_dir: str | Path | None = None) -> dict[str, SkillInfo]:
         return {}
 
     return {p.name: _build(p) for p in sorted(root.glob("protforge-*")) if p.is_dir()}
+
+
+# ---------------------------------------------------------------- 工具市场
+
+def tool_view(info: SkillInfo) -> dict:
+    """一个技能在工具市场里的样子。
+
+    说明书型技能（没有可直接调用的入口）也出现在清单里，但
+    ``directly_callable=False``——界面上标成「需要 agent 辅助」，
+    **不能假装成一个能点的工具**。
+    """
+    return {
+        "id": info.tool_id or _bare(info.name),
+        "skill": info.name,
+        "version": info.version,
+        "display_name": info.display_name or info.name,
+        "description": info.description,
+        "category": info.category,
+        "batch": info.batch,
+        "directly_callable": info.directly_callable,
+        "shell_kind": info.shell_kind,
+        "runner_path": info.runner_path,
+        "timeout_s": info.timeout_s,
+        "reads_workspace": info.reads_workspace,
+        "params": [p.to_dict() for p in info.params],
+    }
+
+
+def list_tools(skills_dir: str | Path | None = None) -> list[dict]:
+    """工具市场清单。按 id 排序。"""
+    idx = scan(skills_dir)
+    return sorted((tool_view(i) for i in idx.values()), key=lambda t: t["id"])
+
+
+def get_tool(tool_id: str, skills_dir: str | Path | None = None) -> dict | None:
+    """按工具 id 取一个工具。找不到返回 None（不抛）。"""
+    want = (tool_id or "").strip()
+    if not want:
+        return None
+    for t in list_tools(skills_dir):
+        if t["id"] == want or t["skill"] == want:
+            return t
+    return None
+
+
+def tool_budgets(skills_dir: str | Path | None = None) -> dict:
+    """``{入口脚本文件名: 该工具的超时预算（秒）}``。
+
+    给 agent 侧的守卫用：命令里出现了哪个工具的入口脚本，就用那个工具的
+    预算当上限。**键是文件名**（``proteinmpnn.sh``）而不是绝对路径——
+    agent 的命令里入口可能写成 ``${PLUGIN_DIR}/skills/...`` 这种变量形式，
+    绝对路径匹配不上。
+    """
+    out: dict = {}
+    for info in scan(skills_dir).values():
+        budget = int(info.timeout_s)
+        # **技能裸名**也算一个识别键：WSL 直调型技能（opendde / esmfold2 /
+        # af3-msa）的入口写在 SKILL.md 正文里、**没有 scripts/ 目录**，
+        # 按文件名认不出来。命令里出现技能名时按它的档位给额度。
+        bare = _bare(info.name)
+        if bare:
+            out.setdefault(bare, budget)
+        if not info.runner_path:
+            continue
+        name = Path(info.runner_path).name
+        if name:
+            out[name] = budget
+    return out

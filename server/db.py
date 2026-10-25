@@ -201,6 +201,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- **这一轮用哪种方式验收**（2026-10-23）。空串 = 跟着上层走
   -- （工作流的设置，再往上是值班台里的全局默认）。
   review_mode TEXT NOT NULL DEFAULT '',
+  -- **这一轮是「让 agent 干」还是「直接跑一个工具」**（2026-10-25）。
+  -- kind='agent' 是常规；kind='tool' 是手动模式：平台按契约直接跑那个
+  -- 入口脚本，**不经 agent**（确定性的活别交给不确定的环节）。
+  kind TEXT NOT NULL DEFAULT 'agent',
+  -- 手动模式：跑的是哪个工具（工具市场的 id）、参数（JSON）。
+  tool_id TEXT NOT NULL DEFAULT '',
+  tool_params TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, done_at TEXT,
   CHECK (status IN ('queued','running','packaging','done','failed'))
 );
@@ -364,6 +371,14 @@ _MISSING_TASK_COLUMNS = (
     # **这一轮用哪种方式验收**（2026-10-23）。空串 = 跟着上层走。
     # 取值见 REVIEW_MODES；解析顺序是 任务 > 工作流 > 全局默认。
     "review_mode TEXT NOT NULL DEFAULT ''",
+    # **手动模式**（2026-10-25）：kind='tool' = 平台直接跑一个工具。
+    #
+    # **必须排在最后**：ALTER TABLE ADD COLUMN 只能追加，迁移库里的物理顺序
+    # 就是这个元组的顺序。插在中间会让「新库」与「迁移库」的列顺序对不上
+    # （tests/test_workflow_schema.py 钉的就是这件事）。
+    "kind TEXT NOT NULL DEFAULT 'agent'",
+    "tool_id TEXT NOT NULL DEFAULT ''",
+    "tool_params TEXT NOT NULL DEFAULT ''",
 )
 
 # 工作流表补列。**工作流自己也能定审核方式**：一批几十行时，

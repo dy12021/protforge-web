@@ -285,6 +285,192 @@ function el(tag, cls, text) {
   return n;
 }
 
+/* ---------------------------------------------------------------- 工具市场
+ *
+ * 手动模式：**直接调工具**，不经 agent。
+ *
+ * 工具清单来自 API（服务端扫技能目录得到），每个工具有一份**参数契约**——
+ * 契约外的参数名、类型不对、必填缺了，服务端一律拒，不猜。
+ */
+const MT = { tools: [], cat: "", q: "", sel: null };
+
+function mtMsg(text, kind) {
+  const n = document.getElementById("mt-msg");
+  if (!n) return;
+  n.hidden = !text;
+  n.textContent = text || "";
+  n.className = "market-msg" + (kind ? " is-" + kind : "");
+}
+
+async function loadTools() {
+  const r = await api("GET", "/api/tools");
+  MT.tools = r.tools || [];
+}
+
+function mtFiltered() {
+  const q = MT.q.trim().toLowerCase();
+  return MT.tools.filter((t) => {
+    if (MT.cat && t.category !== MT.cat) return false;
+    if (!q) return true;
+    return ((t.display_name || "") + " " + (t.id || "") + " "
+            + (t.category || "") + " " + (t.description || ""))
+      .toLowerCase().includes(q);
+  });
+}
+
+function mtCard(t) {
+  const c = el("div", "mcard");
+  const head = el("div", "mcard-head");
+  head.appendChild(el("span", "mcard-name", t.display_name || t.id));
+  if (t.batch) head.appendChild(el("span", "mcard-badge", "batch"));
+  c.appendChild(head);
+  c.appendChild(el("div", "mcard-id", (t.id || "") + " v" + (t.version || "1.0")));
+  if (t.category) c.appendChild(el("span", "mcard-cat", t.category));
+  const foot = el("div", "mcard-foot");
+  foot.appendChild(el("span", "mcard-state",
+    t.directly_callable ? "可直接调用" : "需 agent 辅助"));
+  c.appendChild(foot);
+  c.addEventListener("click", () => mtOpen(t.id));
+  return c;
+}
+
+function mtRenderCats() {
+  const box = document.getElementById("mt-cats");
+  box.textContent = "";
+  const cats = [...new Set(MT.tools.map((t) => t.category).filter(Boolean))].sort();
+  const mk = (label, value) => {
+    const b = el("button", "seg-btn" + (MT.cat === value ? " is-on" : ""), label);
+    b.type = "button";
+    b.addEventListener("click", () => { MT.cat = value; mtRenderCats(); mtRenderGrid(); });
+    box.appendChild(b);
+  };
+  mk("全部", "");
+  cats.forEach((c) => mk(c, c));
+}
+
+function mtRenderGrid() {
+  const grid = document.getElementById("mt-grid");
+  const empty = document.getElementById("mt-empty");
+  grid.textContent = "";
+  const list = mtFiltered();
+  empty.hidden = list.length > 0;
+  list.forEach((t) => grid.appendChild(mtCard(t)));
+}
+
+async function openMarket() {
+  const dlg = document.getElementById("market");
+  document.getElementById("mt-detail").hidden = true;
+  document.getElementById("mt-grid").hidden = false;
+  document.getElementById("mt-search").hidden = false;
+  document.getElementById("mt-cats").hidden = false;
+  try {
+    await loadTools();
+  } catch (e) {
+    mtMsg("工具清单取不到：" + (e.message || e), "bad");
+    return;
+  }
+  document.getElementById("mt-title").textContent =
+    "工具市场（" + MT.tools.length + " 个）";
+  mtRenderCats();
+  mtRenderGrid();
+  dlg.showModal();
+}
+
+function mtOpen(id) {
+  const t = MT.tools.find((x) => x.id === id);
+  if (!t) return;
+  MT.sel = t;
+  document.getElementById("mt-grid").hidden = true;
+  document.getElementById("mt-search").hidden = true;
+  document.getElementById("mt-cats").hidden = true;
+  document.getElementById("mt-empty").hidden = true;
+  const det = document.getElementById("mt-detail");
+  det.hidden = false;
+  document.getElementById("mt-d-title").textContent = t.display_name || t.id;
+  document.getElementById("mt-d-meta").textContent =
+    (t.id || "") + " v" + (t.version || "1.0")
+    + (t.category ? " · " + t.category : "")
+    + " · 超时上限 " + Math.round((t.timeout_s || 600) / 60) + " 分钟"
+    + (t.description ? " · " + t.description.slice(0, 160) : "");
+  const box = document.getElementById("mt-params");
+  box.textContent = "";
+  (t.params || []).forEach((p) => {
+    const lab = el("label", "field");
+    lab.appendChild(el("span", "field-k", p.label || p.name
+      + (p.required ? "（必填）" : "")));
+    let input;
+    if (p.type === "int" || p.type === "float") {
+      input = el("input", "market-input");
+      input.type = "number";
+      if (p.type === "int") input.step = "1"; else input.step = "any";
+    } else if (p.type === "bool") {
+      input = el("input", "market-input market-check");
+      input.type = "checkbox";
+    } else {
+      input = el("input", "market-input");
+      input.type = "text";
+    }
+    input.id = "mtp-" + p.name;
+    input.dataset.ptype = p.type;
+    input.dataset.pname = p.name;
+    input.value = p.default === undefined || p.default === null ? "" : String(p.default);
+    lab.appendChild(input);
+    if (p.description) lab.appendChild(el("span", "field-hint", p.description));
+    box.appendChild(lab);
+  });
+  const batch = document.getElementById("mt-batch");
+  batch.checked = false;
+  document.getElementById("mt-batch-list").hidden = true;
+  document.getElementById("mt-run").disabled = !t.directly_callable;
+  document.getElementById("mt-run").textContent = t.directly_callable ? "运行" : "这个工具不能直接调用";
+}
+
+function mtCollectParams() {
+  const out = {};
+  document.querySelectorAll("#mt-params [data-pname]").forEach((inp) => {
+    const name = inp.dataset.pname;
+    const type = inp.dataset.ptype;
+    if (type === "bool") { out[name] = inp.checked; return; }
+    const v = inp.value.trim();
+    if (v === "") return;
+    out[name] = (type === "int" || type === "float") ? Number(v) : v;
+  });
+  return out;
+}
+
+async function mtRun() {
+  const t = MT.sel;
+  if (!t) return;
+  const params = mtCollectParams();
+  const body = { params: params };
+  const batchOn = document.getElementById("mt-batch").checked;
+  if (batchOn) {
+    const lines = document.getElementById("mt-batch-list").value
+      .split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!lines.length) { mtMsg("批量模式至少要写一行输入", "bad"); return; }
+    // 每行一个输入：**第一个参数**取这行，其余参数共享表单里的值。
+    const first = (t.params || [])[0];
+    if (!first) { mtMsg("这个工具没有可批量的参数", "bad"); return; }
+    body.inputs = lines.map((line) => {
+      const one = Object.assign({}, params);
+      one[first.name] = line;
+      return one;
+    });
+    body.params = {};
+  }
+  try {
+    const r = await api("POST", "/api/tools/" + encodeURIComponent(t.id) + "/run", body);
+    document.getElementById("market").close();
+    mtMsg("");
+    setMsg(document.getElementById("board-msg"),
+           (r.tasks ? "已排入 " + r.tasks.length + " 个任务" : "已排入队列")
+           + "：可以到任务列表看进度", "ok");
+    await load();
+  } catch (e) {
+    mtMsg("跑不起来：" + (e.message || e), "bad");
+  }
+}
+
 /* 时间戳：'2026-10-16T14:03:22.123' -> '10-16 14:03'。
  * 中间那个 T 是 ISO 格式留下的，不去掉就不是给人看的。 */
 function fmtTime(ts) {
@@ -2965,6 +3151,40 @@ document.getElementById("mode-switch").onclick = e => {
   setComposerMode(b.dataset.mode);
 };
 document.getElementById("new-btn").onclick = () => openComposer();
+document.getElementById("market-btn").onclick = () => openMarket();
+document.getElementById("mt-cancel").onclick = () => document.getElementById("market").close();
+document.getElementById("mt-d-back").onclick = () => {
+  document.getElementById("mt-detail").hidden = true;
+  document.getElementById("mt-grid").hidden = false;
+  document.getElementById("mt-search").hidden = false;
+  document.getElementById("mt-cats").hidden = false;
+  mtRenderGrid();
+};
+document.getElementById("mt-run").onclick = () => mtRun();
+document.getElementById("mt-search").addEventListener("input", (e) => {
+  MT.q = e.target.value || "";
+  mtRenderGrid();
+});
+document.getElementById("mt-batch").addEventListener("change", (e) => {
+  document.getElementById("mt-batch-list").hidden = !e.target.checked;
+});
+document.getElementById("market-btn").onclick = () => openMarket();
+document.getElementById("mt-cancel").onclick = () => document.getElementById("market").close();
+document.getElementById("mt-d-back").onclick = () => {
+  document.getElementById("mt-detail").hidden = true;
+  document.getElementById("mt-grid").hidden = false;
+  document.getElementById("mt-search").hidden = false;
+  document.getElementById("mt-cats").hidden = false;
+  mtRenderGrid();
+};
+document.getElementById("mt-run").onclick = () => mtRun();
+document.getElementById("mt-search").addEventListener("input", (e) => {
+  MT.q = e.target.value || "";
+  mtRenderGrid();
+});
+document.getElementById("mt-batch").addEventListener("change", (e) => {
+  document.getElementById("mt-batch-list").hidden = !e.target.checked;
+});
 document.getElementById("logout-btn").onclick = () => signedOut("已退出");
 document.getElementById("drawer-close").onclick = () => closeDrawer();
 document.getElementById("drawer-full").onclick = () => setDrawerFull(!isDrawerFull());

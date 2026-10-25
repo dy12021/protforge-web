@@ -65,6 +65,33 @@
       <span class="sp-note">分钟</span>
       <span class="sp-note" id="review-timeout-note"></span>
     </div>
+    <!-- 时间阈值。**命令级的上限是平台强制**（pi 的 bash 工具的 timeout
+         没有默认值，模型忘了传就等于命令能跑到天荒地老）；用时复核是
+         「跑得久了起一个 subagent 判合不合理，合理就续跑、不合理才判失败」。 -->
+    <div class="sp-setting">
+      <span class="sp-setting-k">命令额度</span>
+      <input id="cmd-timeout-min" class="review-timeout-input"
+             type="number" min="1" max="1440" step="1" inputmode="numeric"
+             title="模型没申请时，单条命令的默认超时">
+      <span class="sp-note">分钟（默认）</span>
+      <input id="cmd-timeout-max-min" class="review-timeout-input"
+             type="number" min="1" max="1440" step="1" inputmode="numeric"
+             title="模型最多能申请到的超时">
+      <span class="sp-note">分钟（上限）</span>
+      <span class="sp-note" id="cmd-timeout-note"></span>
+    </div>
+    <div class="sp-setting">
+      <span class="sp-setting-k">用时复核</span>
+      <input id="rt-after-min" class="review-timeout-input"
+             type="number" min="5" max="1440" step="1" inputmode="numeric"
+             title="任务跑过这么久就起一次用时复核">
+      <span class="sp-note">分钟后复核</span>
+      <input id="rt-grant-min" class="review-timeout-input"
+             type="number" min="1" max="1440" step="1" inputmode="numeric"
+             title="复核判「合理」之后再给多少时间">
+      <span class="sp-note">分钟后复审</span>
+      <span class="sp-note" id="rt-note"></span>
+    </div>
     <div class="sp-system" id="sp-system" hidden></div>
   </section>
 

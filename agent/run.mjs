@@ -94,9 +94,9 @@ function required(name) {
  */
 const REVIEW_MODE_RAW = (process.env.PROTFORGE_WEB_REVIEW_MODE || '').trim();
 const REVIEW_KIND = REVIEW_MODE_RAW === '1' ? 'memory'
-  : (REVIEW_MODE_RAW === 'memory' || REVIEW_MODE_RAW === 'task' ? REVIEW_MODE_RAW : '');
+  : (['memory', 'task', 'runtime'].includes(REVIEW_MODE_RAW) ? REVIEW_MODE_RAW : '');
 if (REVIEW_MODE_RAW && !REVIEW_KIND) {
-  console.error(`[agent] 致命：未知的复核模式「${REVIEW_MODE_RAW}」（只能是 memory / task）`);
+  console.error(`[agent] 致命：未知的复核模式「${REVIEW_MODE_RAW}」（只能是 memory / task / runtime）`);
   process.exit(2);
 }
 const REVIEW_MODE = !!REVIEW_KIND;
@@ -241,6 +241,40 @@ const REVIEW_RULES_MEMORY = `
 - **不要往长期记忆里新增经验**：经验的第一手来源是干活的计算进程，不是你。
   你的活是整理（查证、删掉失效的、改写过时的），不是积累。
 - 整理完按 brief 里说的写复核记录，然后结束。`;
+
+/**
+ * 用时复核：**在旁边当裁判**，判断一个跑很久的计算是不是还在合理推进。
+ *
+ * 与任务审核的根本区别：它**不判产物好不好**，只判**这个时长合不合理**。
+ * 所以它连产物副本都不用看——它看的是「还在动吗」。
+ */
+const REVIEW_RULES_RUNTIME = `
+## 你的身份与边界
+
+- 你是「自动化计算平台」的**用时复核进程**，权限是**常规权限**：
+  你没有管理员令牌，碰不到管理端点，不许改技能仓库、不许删任务、不许提交 git。
+- 你是**独立的一轮**：你和当初干活的计算进程**不是同一个上下文**，
+  你没看过它怎么想的，只看 brief 里给的事实。
+- 你要做的**只有一件事**：按 brief 里写的要求，判断**这个计算任务的用时是否合理**。
+- **只读**：brief 里指明的那个目录（被看那个任务的工作目录）**只许读，不许写、
+  不许改、不许删**。你是裁判，不是施工队。
+- 你**不要**去重跑那个计算、不要替它改代码、不要替它写产物。
+  你的输出只有一个：结论文件。
+
+## 判不准就不要硬判
+
+- 拿不准就写 \`unclear\`。平台会把它当成「没裁决」，让任务继续跑。
+- **误判成「不合理」的代价是白白判死一个正当的长计算**（几个小时的算力全废），
+  比误判成「合理」严重得多。所以**倾向 unclear**。
+- 但也别一路 unclear 放水：明显在原地打转的，就该说它不合理。
+
+## 结论怎么写
+
+把结论写成一个 JSON 文件（路径在 brief 里）：
+\`\`\`json
+{ "verdict": "reasonable | unreasonable | unclear", "reason": "一句话说清依据" }
+\`\`\`
+写完就结束，不要做别的事。`;
 
 /** 任务审核：只读地看，独立地判。 */
 const REVIEW_RULES_TASK = `
@@ -544,7 +578,8 @@ analyze_bdnf.py 2>&1 | tail」——被截断到 70 字符，经常断在半截�
 /** 把平台规则追加到 pi 自己生成的 system prompt 之后。 */
 function platformRulesExtension() {
   const rules = REVIEW_KIND === 'task' ? REVIEW_RULES_TASK
-    : (REVIEW_KIND === 'memory' ? REVIEW_RULES_MEMORY : PLATFORM_RULES);
+    : (REVIEW_KIND === 'memory' ? REVIEW_RULES_MEMORY
+    : (REVIEW_KIND === 'runtime' ? REVIEW_RULES_RUNTIME : PLATFORM_RULES));
   return (pi) => {
     pi.on('before_agent_start', async (event) => {
       const base = event?.systemPrompt ?? '';

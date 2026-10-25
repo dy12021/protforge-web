@@ -392,7 +392,8 @@ def _kill_tree(pid: int) -> None:
 
 
 def _spawn_review_agent(brief_path: Path, work_dir: Path, timeout: float,
-                        readonly_roots: list[Path]) -> dict:
+                        readonly_roots: list[Path],
+                        mode: str = "task") -> dict:
     """起一个审核进程。
 
     **不给任何令牌**：审核进程不是管理员，也不是某个任务的计算进程。
@@ -401,7 +402,9 @@ def _spawn_review_agent(brief_path: Path, work_dir: Path, timeout: float,
     node = shutil.which("node") or "node"
     script = Path(__file__).resolve().parent.parent / "agent" / "run.mjs"
     env = dict(os.environ)
-    env["PROTFORGE_WEB_REVIEW_MODE"] = "task"
+    # 复核身份：task（审产物满不满足需求）/ runtime（判用时合不合理）。
+    # 两种都是**独立的一轮**，都不是管理员，都拿不到令牌。
+    env["PROTFORGE_WEB_REVIEW_MODE"] = mode
     env["PROTFORGE_WEB_REVIEW_BRIEF_PATH"] = str(brief_path)
     env["PROTFORGE_WORK_DIR"] = str(work_dir)
     env["PROTFORGE_WEB_DATA_ROOT"] = str(db.data_root())

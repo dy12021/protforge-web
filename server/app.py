@@ -53,6 +53,7 @@ import skills_index
 import status_api
 import sse
 import store
+import tool_runner
 
 VERSION = "0.1.0"
 
@@ -604,6 +605,17 @@ class TaskPatch(BaseModel):
     review_mode: str | None = Field(default=None, max_length=16)
 
 
+class ToolRunIn(BaseModel):
+    """手动跑一个工具。**参数按契约校验**，不认识的名字一律拒。
+
+    ``params`` 是按契约填的值（位置参数按 tool.yaml 里的顺序）；
+    ``inputs`` 是批量：一批输入，每一项各自跑一次。
+    """
+    params: dict = Field(default_factory=dict)
+    inputs: list = Field(default_factory=list)
+    brief: str = Field(default="", max_length=4000)
+
+
 class ReviewModeIn(BaseModel):
     """验收方式。取值 human（人工 + 条件判定）/ llm（机器审核）。
 
@@ -896,6 +908,62 @@ def mount_user_search(app: FastAPI, *, prefix: str = "/api",
         return {"users": store.search_users(q)}
 
 
+# ---------------------------------------------------------------- 工具契约
+
+
+def _validate_tool_params(tool: dict, values: dict) -> dict:
+    """按契约校验参数。**不认识的名字一律拒**。
+
+    契约外的参数名写错了，在命令行里会静默变成「用了默认值」——
+    用户以为自己传了，结果跑的是另一回事。宁可报错。
+    """
+    try:
+        return tool_runner.validate_params(tool, values)
+    except tool_runner.ToolParamError as exc:
+        raise PreciseHTTPException(422, str(exc)) from None
+
+
+def _has_param(tool: dict, name: str) -> bool:
+    """这个工具有没有这个参数。"""
+    return any(p.get("name") == name for p in (tool.get("params") or []))
+
+
+def _tool_argv(tool: dict, params: dict) -> list[str]:
+    """把契约参数拼成 argv。**顺序 = 契约里的顺序**。"""
+    try:
+        return tool_runner.build_argv(tool, params)
+    except tool_runner.ToolParamError as exc:
+        raise PreciseHTTPException(422, str(exc)) from None
+
+
+def _create_tool_task(tool: dict, params: dict, user: dict, brief: str,
+                      suffix: str = "") -> dict:
+    """建一个「工具任务」，排队给调度器。"""
+    title = f"[手动] {tool.get('display_name') or tool.get('id')}{suffix}"
+    task = store.create_task(
+        title, brief or "", owner_id=int(user["id"]), actor="human",
+        kind="tool", tool_id=str(tool.get("id") or ""), tool_params=params)
+    tid = int(task["id"])
+    # **产物的落点由平台定死**：共享 outputs 目录下的子目录名必须以
+    # `t<任务号>_` 开头，平台才认它是这一轮的产物；不带的会被判「归属不明」，
+    # 走时间窗兜底 → 未经确认 → **打包被拒**（这一行于是 failed）。
+    # 手动模式没有 agent 教它命名，所以得平台自己来。
+    params = dict(params)
+    if _has_param(tool, "job_name"):
+        given = str(params.get("job_name") or "").strip()
+        if not given.startswith(f"t{tid}_"):
+            base = given or str(tool.get("id") or "job")
+            params["job_name"] = f"t{tid}_{base}"
+        store.update_task(tid, tool_params=params)
+    argv = _tool_argv(tool, params)
+    store.add_event(tid, "created", "human",
+                    f"手动运行工具 {tool.get('display_name') or tool.get('id')}")
+    # argv 落在任务的 brief 里：**命令要能追溯**。
+    store.update_task(tid, brief=brief or f"手动运行 {tool.get('id')}\n"
+                                          + " ".join(argv))
+    return store.get_task(tid, is_admin=True)
+
+
 def create_public_app() -> FastAPI:
     db.init_db()
     app = FastAPI(title="蛋白计算平台", version=VERSION)
@@ -1033,11 +1101,66 @@ def create_public_app() -> FastAPI:
     # 空串 = 继承上一层。所以「全局默认 + 每个任务可覆盖」这句话在数据层
     # 就是三列各自可空，解析在 store.resolve_review_mode 一处做。
 
+    # --- 工具市场 -------------------------------------------------------------
+
+    @app.get("/api/tools")
+    def list_tools(user=Depends(auth.current_user)):
+        """工具市场清单。**扫技能目录得到**——技能仓是另一个仓库，
+        平台只读它，所以「平台里有哪些工具」永远跟着技能仓走。"""
+        try:
+            tools = skills_index.list_tools()
+        except Exception:                                   # noqa: BLE001
+            log.exception("扫工具清单失败")
+            raise PreciseHTTPException(500, "工具清单取不到")
+        return {"tools": tools}
+
+    @app.get("/api/tools/{tool_id}")
+    def tool_detail(tool_id: str, user=Depends(auth.current_user)):
+        """一个工具的详情：参数契约、能不能直接调用、超时档位。"""
+        t = skills_index.get_tool(tool_id)
+        if not t:
+            raise PreciseHTTPException(404, "没有这个工具")
+        return t
+
+    @app.post("/api/tools/{tool_id}/run")
+    def run_tool(tool_id: str, body: ToolRunIn,
+                 user=Depends(auth.current_user)):
+        """手动跑一个工具：**平台直接调那个入口脚本，不经 agent**。
+
+        工具是「固定入口 + 固定契约」——让模型去按要求调用它，等于把确定性的活
+        交给不确定的环节（它可能自己写替代脚本）。所以这里只把参数按契约校验
+        一遍，然后排一个「工具任务」给调度器。
+        """
+        t = skills_index.get_tool(tool_id)
+        if not t:
+            raise PreciseHTTPException(404, "没有这个工具")
+        if not t.get("directly_callable"):
+            raise PreciseHTTPException(
+                422, "这个工具没有可直接调用的入口（它是给 agent 编排用的说明书）")
+
+        # **批量先判**：批量模式下每项自带参数，外层的 params 不参与校验
+        # （否则「只给一批输入、不给公共参数」会被误判成「缺必填参数」）。
+        if body.inputs:
+            created = []
+            for idx, one in enumerate(body.inputs):
+                one_params = _validate_tool_params(t, one if isinstance(one, dict) else {})
+                created.append(_create_tool_task(t, one_params, user,
+                                                 body.brief, suffix=f"#{idx + 1}"))
+            return {"queued": True, "tasks": created}
+
+        params = _validate_tool_params(t, body.params or {})
+        task = _create_tool_task(t, params, user, body.brief)
+        return {"queued": True, "task": task}
+
     @app.get("/api/review-settings")
     def review_settings(user=Depends(auth.current_user)):
         """平台级的默认验收方式。**谁来看这一轮过不过**的默认值。"""
         return {"review_mode": store.get_global_review_mode(),
                 "review_timeout": store.get_review_timeout(),
+                "cmd_timeout_s": store.get_cmd_timeout(),
+                "cmd_timeout_max_s": store.get_cmd_timeout_max(),
+                "runtime_review_after_s": store.get_runtime_review_after(),
+                "runtime_review_grant_s": store.get_runtime_review_grant(),
                 "source": "global"}
 
     @app.put("/api/review-settings")

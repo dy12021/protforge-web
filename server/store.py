@@ -12,6 +12,7 @@
 3. **step 是"当前正在做什么"的单行摘要，不是日志。** 所以 set_step 只写 tasks.step
    一列，不写事件；前端轮询 task.step 即可，不进时间线。
 """
+import json
 import os
 import sqlite3
 
@@ -75,7 +76,8 @@ def _work_dir(task_id: int) -> str:
 # ---------------------------------------------------------------- tasks
 
 def create_task(title: str, brief: str, owner_id: int, actor: str = "human",
-                *, workflow_id=None, workflow_row=None) -> dict:
+                *, workflow_id=None, workflow_row=None,
+                kind: str = "agent", tool_id: str = "", tool_params=None) -> dict:
     """建任务，初始状态恒为 queued。
 
     **不自动写 'created' 事件**——事件流由 API 层负责（用户点了提交才有一条，
@@ -107,9 +109,13 @@ def create_task(title: str, brief: str, owner_id: int, actor: str = "human",
                 """INSERT INTO tasks
                    (title, brief, status, step, owner_id, priority,
                     uploads_dir, output_dir, created_at, updated_at,
-                    workflow_id, workflow_row)
-                   VALUES (?, ?, 'queued', '', ?, 0, '', '', ?, ?, ?, ?)""",
-                (title, brief, int(owner_id), now, now, workflow_id, workflow_row),
+                    workflow_id, workflow_row, kind, tool_id, tool_params)
+                   VALUES (?, ?, 'queued', '', ?, 0, '', '', ?, ?, ?, ?, ?, ?, ?)""",
+                (title, brief, int(owner_id), now, now, workflow_id, workflow_row,
+                 "agent" if kind == "agent" else str(kind),
+                 str(tool_id or ""),
+                 json.dumps(tool_params or {}, ensure_ascii=False)
+                 if tool_params else ""),
             )
             tid = cur.lastrowid
             # 目录只写路径不 mkdir：真建目录是上传/打包那一刻的事，
@@ -184,10 +190,20 @@ def _update(task_id: int, **fields) -> dict:
         # 盘上没有」，所以它得像产物表那样是**一份独立的记录**，
         # 不能只活在事件文本里（事件是给人读的，不是给机器查的）。
         "declared",
+        # **手动模式的三列**（2026-10-25）。tool_params 必须能改：
+        # 建任务之后平台才知道任务号，产物的落点（t<任务号>_ 前缀）
+        # 是那时候才定下来的。
+        "kind", "tool_id", "tool_params",
     }
     bad = set(fields) - allowed
     if bad:
         raise Invalid(f"不能更新这些字段：{', '.join(sorted(bad))}")
+    # **tool_params 存的是 JSON**：直接绑 dict 会让 sqlite 抛
+    # "type 'dict' is not supported"。在这里统一转掉。
+    if isinstance(fields.get("tool_params"), (dict, list)):
+        fields = dict(fields)
+        fields["tool_params"] = json.dumps(fields["tool_params"],
+                                          ensure_ascii=False)
     cols = ", ".join(f"{k} = ?" for k in fields)
     c = db.connect()
     try:
@@ -372,6 +388,15 @@ def get_global_review_mode() -> str:
 #: 审核超时（秒）存在 settings 表里的键名。
 REVIEW_TIMEOUT_KEY = "review_timeout"
 
+#: **命令级**超时（秒）：模型没申请时的默认额度。
+CMD_TIMEOUT_KEY = "cmd_timeout_s"
+#: **命令级**超时的通用上限（秒）：模型最多能申请到多少。
+CMD_TIMEOUT_MAX_KEY = "cmd_timeout_max_s"
+#: 任务跑过这么久就起一次**用时复核**（秒）。
+RUNTIME_REVIEW_AFTER_KEY = "runtime_review_after_s"
+#: 复核判「合理」之后**再给**多少时间（秒）。
+RUNTIME_REVIEW_GRANT_KEY = "runtime_review_grant_s"
+
 #: 审核超时的默认值（秒）。**30 分钟**：真实批次里一行有 210+ 个产物，
 #: 审核进程要一个个看、还要联网查判据，15 分钟会被砍在半路。
 REVIEW_TIMEOUT_DEFAULT = 1800.0
@@ -403,6 +428,62 @@ def set_review_timeout(seconds: float) -> float:
     v = max(REVIEW_TIMEOUT_MIN, min(float(seconds), REVIEW_TIMEOUT_MAX))
     set_setting(REVIEW_TIMEOUT_KEY, str(int(v)))
     return v
+
+
+# ---------------------------------------------------------------- 时间阈值
+
+def _get_num(key: str, default: float, lo: float, hi: float) -> float:
+    """读一个数值设置。**存坏了就退回默认值**——不是一个坏数字毁掉整台机器。"""
+    raw = get_setting(key, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(lo, min(v, hi))
+
+
+def _set_num(key: str, value: float, lo: float, hi: float) -> float:
+    v = max(lo, min(float(value), hi))
+    set_setting(key, str(int(v)))
+    return v
+
+
+def get_cmd_timeout(default: float = 600.0) -> float:
+    """单条命令的默认超时（秒）。"""
+    return _get_num(CMD_TIMEOUT_KEY, default, 30.0, 86400.0)
+
+
+def set_cmd_timeout(seconds: float) -> float:
+    return _set_num(CMD_TIMEOUT_KEY, seconds, 30.0, 86400.0)
+
+
+def get_cmd_timeout_max(default: float = 1800.0) -> float:
+    """单条命令的通用上限（秒）。模型最多能申请到这么多。"""
+    return _get_num(CMD_TIMEOUT_MAX_KEY, default, 60.0, 86400.0)
+
+
+def set_cmd_timeout_max(seconds: float) -> float:
+    return _set_num(CMD_TIMEOUT_MAX_KEY, seconds, 60.0, 86400.0)
+
+
+def get_runtime_review_after(default: float = 2700.0) -> float:
+    """任务跑过这么久就起一次用时复核（秒）。"""
+    return _get_num(RUNTIME_REVIEW_AFTER_KEY, default, 300.0, 86400.0)
+
+
+def set_runtime_review_after(seconds: float) -> float:
+    return _set_num(RUNTIME_REVIEW_AFTER_KEY, seconds, 300.0, 86400.0)
+
+
+def get_runtime_review_grant(default: float = 2700.0) -> float:
+    """复核判「合理」之后再给多少时间（秒）。"""
+    return _get_num(RUNTIME_REVIEW_GRANT_KEY, default, 60.0, 86400.0)
+
+
+def set_runtime_review_grant(seconds: float) -> float:
+    return _set_num(RUNTIME_REVIEW_GRANT_KEY, seconds, 60.0, 86400.0)
 
 
 def resolve_review_mode(task: dict) -> tuple[str, str]:

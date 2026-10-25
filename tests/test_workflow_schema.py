@@ -42,15 +42,18 @@ CREATE INDEX idx_tasks_owner ON tasks(owner_id, status);
 
 #: **靠 ALTER TABLE ADD COLUMN 补出来的列**（迁移库会把它们排在末尾）。
 #: 前三列是工作流那轮加的，后三列是 2026-10-23 的验收那轮加的
-#: （acceptance / declared / followup），最后一列是同一天的机器审核那轮
-#: （review_mode）。
+#: （acceptance / declared / followup），再后面是同一天的机器审核那轮
+#: （review_mode），最后三列是 2026-10-25 的手动模式那轮
+#: （kind / tool_id / tool_params）。
 NEW_TASK_COLUMNS = {"workflow_id", "workflow_row", "workflow_archived",
-                    "acceptance", "declared", "followup", "review_mode"}
+                    "acceptance", "declared", "followup", "review_mode",
+                    "kind", "tool_id", "tool_params"}
 
 #: 迁移库末尾的列，**顺序就是 _MISSING_TASK_COLUMNS 里的顺序**
 #: （ALTER TABLE 只能追加，所以它们全排在最后）。
 MIGRATED_TAIL = ["workflow_id", "workflow_row", "workflow_archived",
-                 "acceptance", "declared", "followup", "review_mode"]
+                 "acceptance", "declared", "followup", "review_mode",
+                 "kind", "tool_id", "tool_params"]
 
 
 def _make_legacy(path: Path) -> None:

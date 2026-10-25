@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node run.mjs",
-    "test": "node --test guards.test.mjs"
+    "test": "node --test guards.test.mjs guards.timeout.test.mjs guards.audit.test.mjs guards.dotdot.test.mjs"
   },
   "license": "MIT",
   "dependencies": {
