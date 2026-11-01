@@ -138,13 +138,13 @@ def test_set_model_fills_the_platform_provider(env, tid, admin_tok):
     app.state.dispatcher = fake
 
     r = c.post(f"/api/internal/admin/rpc/{tid}",
-               json={"command": "set_model", "model": "MiniMax-M3.1-Flash-Preview"},
+               json={"command": "set_model", "model": "MiniMax-M3.1-Flash"},
                headers=bearer(admin_tok))
 
     assert r.status_code == 200, r.text
     assert fake.sent[0][1] == {"type": "set_model",
                                "provider": dispatcher.LLM_PROVIDER_ID,
-                               "modelId": "MiniMax-M3.1-Flash-Preview"}
+                               "modelId": "MiniMax-M3.1-Flash"}
 
 
 def test_set_model_with_empty_name_is_refused(env, tid, admin_tok):

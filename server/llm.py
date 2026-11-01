@@ -32,7 +32,7 @@ LLM_PROVIDER_ID = "protforge-llm"
 # 默认值与 llm-quant 的 [llm] 段一致——那是本机上已经跑通过的同一套端点。
 _LLM_DEFAULTS = {
     LLM_BASE_URL_ENV: "https://api.minimax.cn/v1",
-    LLM_MODEL_ENV: "MiniMax-M3.1-Flash-Preview",
+    LLM_MODEL_ENV: "MiniMax-M3.1-Flash",
     LLM_KEY_ENV_ENV: "MINIMAX_API_KEY",
     LLM_CTX_ENV: "1000000",
     LLM_MAXTOK_ENV: "8192",
