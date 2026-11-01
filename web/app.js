@@ -209,7 +209,8 @@ const state = {
 const TOKEN_KEY = "protforge.token";
 
 function token() { return localStorage.getItem(TOKEN_KEY) || ""; }
-function setToken(v) { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); }
+let sessionVersion = 0;
+function setToken(v) { sessionVersion += 1; if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); }
 
 /* base 是**源前缀**，不含 /api。所有调用处传的都是 "/api/xxx" 完整路径，
  * 这里再拼一次 "/api" 会变成 /api/api/xxx —— 整块面板的接口全部 404，
@@ -241,20 +242,36 @@ async function errFrom(r) {
   return new Error(msg || ("请求失败（HTTP " + r.status + "）"));
 }
 
+function requestSession() { return { version: sessionVersion, token: token() }; }
+function checkSession(session) {
+  if (session.version !== sessionVersion || session.token !== token()) {
+    const error = new Error("会话已切换，忽略旧请求");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
 async function api(method, path, body) {
-  const opt = { method, headers: authHeaders() };
-  if (body !== undefined && body !== null) {
-    opt.headers["Content-Type"] = "application/json";
-    opt.body = JSON.stringify(body);
+  const session = requestSession();
+  try {
+    const opt = { method, headers: authHeaders() };
+    if (body !== undefined && body !== null) {
+      opt.headers["Content-Type"] = "application/json";
+      opt.body = JSON.stringify(body);
+    }
+    const r = await fetch(apiBase() + path, opt);
+    checkSession(session);
+    if (!r.ok) {
+      const e = await errFrom(r);
+      e.status = r.status;
+      throw e;
+    }
+    if (r.status === 204) return null;
+    return await r.json();
+  } finally {
+    // Also discard network and decoding errors belonging to an old session.
+    checkSession(session);
   }
-  const r = await fetch(apiBase() + path, opt);
-  if (!r.ok) {
-    const e = await errFrom(r);
-    e.status = r.status;                 // 401 要走重新登录，404/405 要走能力降级
-    throw e;
-  }
-  if (r.status === 204) return null;
-  return r.json();
 }
 
 // ---------------------------------------------------------------- 小工具
@@ -326,7 +343,8 @@ function mtFiltered() {
 }
 
 function mtCard(t) {
-  const c = el("div", "mcard");
+  const c = el("button", "mcard");
+  c.type = "button";
   const head = el("div", "mcard-head");
   head.appendChild(el("span", "mcard-name", t.display_name || t.id));
   if (t.batch) head.appendChild(el("span", "mcard-badge", "batch"));
@@ -364,23 +382,34 @@ function mtRenderGrid() {
   list.forEach((t) => grid.appendChild(mtCard(t)));
 }
 
+let marketLoadSeq = 0;
 async function openMarket() {
+  const seq = ++marketLoadSeq;
   const dlg = document.getElementById("market");
+  if (!dlg.open) dlg.showModal();
   document.getElementById("mt-detail").hidden = true;
   document.getElementById("mt-grid").hidden = false;
+  document.getElementById("mt-grid").textContent = "";
+  document.getElementById("mt-empty").hidden = true;
   document.getElementById("mt-search").hidden = false;
   document.getElementById("mt-cats").hidden = false;
+  document.getElementById("mt-retry").hidden = true;
+  document.getElementById("mt-grid").setAttribute("aria-busy", "true");
+  mtMsg("正在读取工具清单…");
   try {
     await loadTools();
+    if (seq !== marketLoadSeq || !dlg.open) return;
+    mtMsg("");
+    document.getElementById("mt-title").textContent = "工具市场（" + MT.tools.length + " 个）";
+    mtRenderCats();
+    mtRenderGrid();
   } catch (e) {
-    mtMsg("工具清单取不到：" + (e.message || e), "bad");
-    return;
+    if (e.name === "AbortError" || seq !== marketLoadSeq || !dlg.open) return;
+    mtMsg("工具清单取不到：" + e.message, "bad");
+    document.getElementById("mt-retry").hidden = false;
+  } finally {
+    if (seq === marketLoadSeq) document.getElementById("mt-grid").setAttribute("aria-busy", "false");
   }
-  document.getElementById("mt-title").textContent =
-    "工具市场（" + MT.tools.length + " 个）";
-  mtRenderCats();
-  mtRenderGrid();
-  dlg.showModal();
 }
 
 function mtOpen(id) {
@@ -458,6 +487,7 @@ async function loadToolDoc(t) {
     box.textContent = d.doc || "（这个工具没有文档）";
     if (sum) sum.textContent = "详细文档 · " + (d.skill || t.id);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     box.textContent = "文档取不到：" + (e.message || e);
   }
 }
@@ -500,6 +530,7 @@ async function mtFillParams() {
     const pbox = document.getElementById("mt-params");
     if (pbox && pbox.scrollIntoView) pbox.scrollIntoView({ block: "nearest" });
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     mtMsg("填不出来：" + (e.message || e), "bad",
           document.getElementById("mt-fill-msg"));
   } finally {
@@ -549,6 +580,7 @@ async function mtRun() {
            + "：可以到任务列表看进度", "ok");
     await load();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     mtMsg("跑不起来：" + (e.message || e), "bad");
   }
 }
@@ -848,6 +880,8 @@ function applyView() {
   document.getElementById("board").hidden = view === "workflow";
   document.querySelectorAll("#view-switch .seg-btn").forEach(b =>
     b.classList.toggle("is-on", b.dataset.view === view));
+  document.querySelectorAll("#view-switch .seg-btn").forEach(b =>
+    b.setAttribute("aria-pressed", String(b.dataset.view === view)));
   render();
   renderWorkflows();
   renderFilterNote();
@@ -862,6 +896,74 @@ function renderFilterNote() {
   if (view !== "task") parts.push(w + " 个工作流");
   const note = document.getElementById("filter-note");
   note.textContent = parts.length ? parts.join(" · ") : "";
+  document.getElementById("filter-reset").disabled = !(state.filter.q || state.filter.status || state.filter.activeOnly || view !== "all");
+  renderWorkspaceEmpty();
+}
+
+const workspaceUI = { tasksReady: false, tasksError: false, workflowsReady: false, workflowError: false, refreshing: false };
+
+function resetFilters() {
+  clearTimeout(qTimer);
+  state.filter = { ...state.filter, q: "", status: "", activeOnly: false, view: "all" };
+  document.getElementById("q").value = "";
+  document.getElementById("status-filter").value = "";
+  document.getElementById("only-active").checked = false;
+  applyView();
+}
+
+function renderWorkspaceEmpty() {
+  const ready = !!state.me && workspaceUI.tasksReady && workspaceUI.workflowsReady && !workspaceUI.workflowError;
+  const view = state.filter.view;
+  const tasks = view === "workflow" ? 0 : filtered().length;
+  const workflows = view === "task" ? 0 : filteredWorkflows().length;
+  const empty = ready && tasks + workflows === 0;
+  document.getElementById("board").hidden = view === "workflow" || (ready && tasks === 0);
+  document.getElementById("wf-zone").hidden = view === "task" || (ready && workflows === 0);
+  document.getElementById("workspace-empty").hidden = !empty;
+  if (!empty) return;
+  const filtering = !!(state.filter.q || state.filter.status || state.filter.activeOnly);
+  const hasData = state.items.length + state.workflows.length > 0;
+  document.getElementById("empty-title").textContent = filtering ? "没有找到匹配的结果"
+    : hasData ? "这个视图还没有内容" : "从第一个计算任务开始";
+  document.getElementById("empty-copy").textContent = filtering
+    ? "换一个关键词或放宽状态筛选，再试一次。"
+    : "写下计算目标，或上传表格逐行处理，进度和结果都会出现在这里。";
+  document.getElementById("empty-create").hidden = filtering;
+  document.getElementById("empty-reset").hidden = !filtering && !hasData;
+}
+
+function showSyncState(text, failed = false) {
+  document.getElementById("sync-state").textContent = text;
+  document.getElementById("sync-state").className = failed ? "is-error" : "";
+  if (!workspaceUI.refreshing) document.getElementById("refresh-btn").textContent = failed ? "重试" : "刷新";
+}
+
+async function refreshWorkspace() {
+  if (workspaceUI.refreshing) return;
+  workspaceUI.refreshing = true;
+  const session = requestSession();
+  const button = document.getElementById("refresh-btn");
+  button.disabled = true;
+  button.textContent = "刷新中…";
+  showSyncState("正在更新…");
+  let failed = false;
+  try {
+    if (!state.me) await boot();
+    else {
+      await Promise.all([load(), loadWorkflows()]);
+      hideMsg(document.getElementById("board-msg"));
+      loadStatus().catch(() => {});
+    }
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    failed = true;
+    showBoardError(error);
+  } finally {
+    workspaceUI.refreshing = false;
+    button.disabled = false;
+    button.textContent = failed ? "重试" : "刷新";
+    if (session.version === sessionVersion && state.me && !failed) showSyncState("数据已同步");
+  }
 }
 
 /* ---------------------------------------------------------------- 数据加载 */
@@ -873,10 +975,24 @@ async function load() {
   // 服务端返回的是 {"tasks": [...]}，**不是**裸数组。少拆这一层的话
   // applyItems 拿到的是对象，items.map 直接抛 "items.map is not a function"，
   // 看板上一张卡片都渲染不出来——而页面骨架是静态 HTML，看着只是"空空如也"。
-  const got = await api("GET", "/api/tasks");
+  document.getElementById("board").setAttribute("aria-busy", "true");
+  let got;
+  try { got = await api("GET", "/api/tasks"); }
+  catch (error) {
+    if (error.name === "AbortError") throw error;
+    if (seq !== loadSeq) return;
+    workspaceUI.tasksError = true;
+    throw error;
+  }
+  finally { if (seq === loadSeq) document.getElementById("board").setAttribute("aria-busy", "false"); }
   if (seq !== loadSeq) return;             // 已经有更新的请求在飞，丢掉这次
+  workspaceUI.tasksError = false;
+  workspaceUI.tasksReady = true;
   applyItems(Array.isArray(got) ? got : (got.tasks || []));
-  hideMsg(document.getElementById("board-msg"));
+  document.getElementById("last-sync").textContent = "上次更新 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  if (!workspaceUI.refreshing && !workspaceUI.workflowError) showSyncState(workspaceUI.workflowsReady ? "数据已同步" : "正在读取工作流…");
+  renderFilterNote();
+  if (!workspaceUI.workflowError) hideMsg(document.getElementById("board-msg"));
 }
 
 function applyItems(items) {
@@ -899,7 +1015,9 @@ function applyItems(items) {
 function reload() { load().catch(showBoardError); }
 
 function showBoardError(err) {
+  if (err && err.name === "AbortError") return;
   if (err && err.status === 401) return signedOut("登录已过期，请重新登录");
+  showSyncState(workspaceUI.tasksReady ? "更新失败，已保留上次数据" : "连接失败，请重试", true);
   setMsg(document.getElementById("board-msg"), (err && err.message) || "读不到数据", "bad");
 }
 
@@ -957,7 +1075,8 @@ async function readFrames(body, taskId, ctl) {
   let got = false;
   for (;;) {
     const r = await reader.read();
-    if (r.done) break;
+    if (r.done || (ctl && ctl.stop)) break;
+    if (ctl && ctl.session) checkSession(ctl.session);
     buf += dec.decode(r.value, { stream: true }).replace(/\r\n/g, "\n");
     let i;
     while ((i = buf.indexOf("\n\n")) >= 0) {
@@ -975,7 +1094,8 @@ async function readFrames(body, taskId, ctl) {
 }
 
 async function startStream(id) {
-  const ctl = { stop: false, ac: new AbortController(), lastId: 0 };
+  const session = requestSession();
+  const ctl = { stop: false, ac: new AbortController(), lastId: 0, session };
   state.streams.set(id, ctl);
   while (!ctl.stop) {
     try {
@@ -983,11 +1103,13 @@ async function startStream(id) {
         headers: authHeaders(ctl.lastId),
         signal: ctl.ac.signal,
       });
+      checkSession(session);
+      if (ctl.stop) return;
       if (r.status === 401) { signedOut("登录已过期，请重新登录"); return; }
       if (!r.ok || !r.body) throw new Error("实时通道不可用");
       await readFrames(r.body, id, ctl);
     } catch (e) {
-      if (ctl.stop) return;
+      if (ctl.stop || e.name === "AbortError") return;
     }
     if (ctl.stop) return;
     // 正常断开也要退避：服务端秒断的话，不 sleep 就是一条打死服务器的紧循环
@@ -1006,6 +1128,7 @@ function stopStream(id) {
 /* 终态任务没有实时流可听，但抽屉要时间线：开一次性的补读，从头拿，
  * 读几秒就掐断（服务端也可能一直挂着不发结束帧）。 */
 async function catchUpHistory(id) {
+  const session = requestSession();
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 5000);
   try {
@@ -1013,10 +1136,12 @@ async function catchUpHistory(id) {
       headers: authHeaders(0),
       signal: ac.signal,
     });
+    checkSession(session);
     if (r.status === 401) { signedOut("登录已过期，请重新登录"); return; }
     if (!r.ok || !r.body) return;
-    await readFrames(r.body, id, null);
+    await readFrames(r.body, id, { session, lastId: 0 });
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     /* 一次性补读：中止或断开都算正常结束 */
   } finally {
     clearTimeout(timer);
@@ -1050,6 +1175,7 @@ function scheduleRefresh(id) {
       if (state.openId === id) redrawDrawerIfIdle(t);
       syncStreams();
     } catch (e) {
+      if (e && e.name === "AbortError") return;
       if (e && e.status === 401) signedOut("登录已过期，请重新登录");
     }
   }, 400));
@@ -1097,6 +1223,7 @@ async function setTaskReviewMode(t, mode) {
     drawDrawer(t.id, state.byId.get(t.id));
     setDrawerMsg("验收方式已改", "ok");
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setDrawerMsg(e.message || "改不动验收方式", "bad");
     drawDrawer(t.id, state.byId.get(t.id));
   }
@@ -1114,6 +1241,7 @@ async function setWorkflowReviewMode(w, mode) {
     }
     await load();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setDrawerMsg(e.message || "改不动这一批的验收方式", "bad");
   }
 }
@@ -1149,6 +1277,7 @@ async function requestLlmReview(t) {
     const nt = state.byId.get(t.id);
     if (nt && state.openId === t.id) drawDrawer(t.id, nt);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setDrawerMsg(e.message || "机器审核没排上", "bad");
   }
 }
@@ -1167,6 +1296,7 @@ async function doAccept(t) {
     setDrawerMsg( "已验收：这一轮的结果算交付完成", "ok");
     await load();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setDrawerMsg( e.message || "验收失败", "bad");
   }
 }
@@ -1254,6 +1384,7 @@ async function doReviewSubmit() {
       setMsg(document.getElementById("board-msg"), text, "ok");
     }
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setDrawerMsg( e.message || "操作失败", "bad");
   } finally {
     btn.disabled = false;
@@ -1380,7 +1511,11 @@ function patchFailed(e, id) {
 
 function drawerMsgHost() { return document.getElementById("drawer-msg"); }
 
+let drawerLoadSeq = 0;
+let drawerReturnFocus = null;
 async function openDrawer(id) {
+  const seq = ++drawerLoadSeq;
+  if (document.getElementById("drawer").hidden) drawerReturnFocus = document.activeElement;
   state.openId = id;
   state.editing = false;
   /* 换任务就把上一条提示清掉——提示是「对刚才那个任务说的」，
@@ -1390,16 +1525,29 @@ async function openDrawer(id) {
   d.hidden = false;
   const body = document.getElementById("drawer-body");
   body.textContent = "";
+  body.append(el("p", "loading-copy", "正在读取任务详情…"));
+  d.setAttribute("aria-busy", "true");
+  document.getElementById("drawer-close").focus();
   let t = state.byId.get(id);
   try {
     const got = await api("GET", "/api/tasks/" + id);
+    if (seq !== drawerLoadSeq || state.openId !== id) return;
     t = detailTask(got, "打开详情");
     state.byId.set(id, t);
     rememberReview(id, got);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (seq !== drawerLoadSeq || state.openId !== id) return;
     if (e && e.status === 401) { signedOut("登录已过期，请重新登录"); return; }
+    body.textContent = "";
+    const retry = el("button", "secondary", "重新读取详情");
+    retry.type = "button";
+    retry.onclick = () => openDrawer(id);
+    body.append(retry);
     body.append(el("p", "drawer-error", "打不开：#" + id + " " + (e.message || "")));
     return;
+  } finally {
+    if (seq === drawerLoadSeq) d.setAttribute("aria-busy", "false");
   }
   if (state.openId !== id) return;           // 期间用户已经点了别的卡
   drawDrawer(id, t);
@@ -1477,6 +1625,7 @@ function drawDrawer(id, t) {
           setDrawerMsg( "需求说明已保存", "ok");
           done(saved.brief == null ? "" : saved.brief);
         } catch (e) {
+          if (e && e.name === "AbortError") return;
           s.disabled = false;
           if (!patchFailed(e, id)) setDrawerMsg( e.message, "bad");
         }
@@ -1513,6 +1662,7 @@ function drawDrawer(id, t) {
           setDrawerMsg( "标题已保存", "ok");
           done(saved.title == null ? "" : saved.title);
         } catch (e) {
+          if (e && e.name === "AbortError") return;
           s.disabled = false;
           if (!patchFailed(e, id)) setDrawerMsg( e.message, "bad");
         }
@@ -1793,6 +1943,7 @@ function abortBtn(t) {
       const nt = state.byId.get(t.id);
       if (nt && state.openId === t.id) drawDrawer(t.id, nt);
     } catch (e) {
+      if (e && e.name === "AbortError") return;
       b.disabled = false;
       setDrawerMsg( e.message, "bad");
     }
@@ -1830,6 +1981,7 @@ function downloadBtn(t) {
       setTimeout(() => URL.revokeObjectURL(url), 20000);
       setDrawerMsg( "已开始下载 " + a.download, "ok");
     } catch (e) {
+      if (e && e.name === "AbortError") return;
       setDrawerMsg( e.message, "bad");
     } finally {
       b.disabled = false;
@@ -1857,6 +2009,7 @@ async function deleteTask(t) {
     setMsg(document.getElementById("board-msg"), "已删除「" + (t.title || "") + "」", "ok");
     await load();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     if (e && (e.status === 404 || e.status === 405)) {
       state.canDelete = false;
       setMsg(document.getElementById("board-msg"), "服务端未开放删除", "warn");
@@ -1910,6 +2063,10 @@ function confirmAction(spec) {
 }
 
 function closeDrawer() {
+  drawerLoadSeq += 1;
+  document.getElementById("drawer").setAttribute("aria-busy", "false");
+  if (drawerReturnFocus && drawerReturnFocus.isConnected) drawerReturnFocus.focus();
+  drawerReturnFocus = null;
   document.getElementById("drawer").hidden = true;
   state.openId = null;
   state.editing = false;
@@ -1969,13 +2126,24 @@ function filteredWorkflows() {
   });
 }
 
+let workflowLoadSeq = 0;
 async function loadWorkflows() {
-  const got = await api("GET", "/api/workflows");
+  const seq = ++workflowLoadSeq;
+  let got;
+  try { got = await api("GET", "/api/workflows"); }
+  catch (error) {
+    if (seq === workflowLoadSeq && error.name !== "AbortError") workspaceUI.workflowError = true;
+    throw error;
+  }
+  if (seq !== workflowLoadSeq) return;
   const list = Array.isArray(got) ? got : (got.workflows || []);
+  workspaceUI.workflowError = false;
+  workspaceUI.workflowsReady = true;
   state.workflows = list;
   state.wfById = new Map(list.map(w => [Number(w.id), w]));
   renderWorkflows();
   renderFilterNote();
+  if (!workspaceUI.refreshing && workspaceUI.tasksReady && !workspaceUI.tasksError) showSyncState("数据已同步");
 }
 
 function renderWorkflows() {
@@ -2220,6 +2388,7 @@ function wfControlBtn(id, action, label) {
       await refreshOpenWorkflow(id);
       setMsg(document.getElementById("board-msg"), "已" + actionLabel(action), "ok");
     } catch (e) {
+      if (e && e.name === "AbortError") return;
       b.disabled = false;
       setMsg(document.getElementById("board-msg"), e.message || "操作失败", "bad");
     }
@@ -2251,6 +2420,7 @@ async function refreshOpenWorkflow(id) {
     const d = await api("GET", "/api/workflows/" + id);
     state.wfDetail.set(id, d);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     /* 读不到就保持上一次的样子，不把卡片清空。 */
   }
   /* 状态端点是**可选**的（还没上线时 404）：读不到就不显示预计时间，
@@ -2259,6 +2429,7 @@ async function refreshOpenWorkflow(id) {
     const st = await api("GET", "/api/status/workflow/" + id);
     state.wfStatus.set(id, st);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     state.wfStatus.delete(id);
   }
   const node = state.wfCards.get(id);
@@ -2391,6 +2562,7 @@ async function retryTask(taskId, rowNo, wfId) {
       "第 " + rowNo + " 行已重新排队，它会等当前这行跑完再开始", "good");
     if (wfId != null) refreshOpenWorkflow(wfId);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setMsg(document.getElementById("board-msg"),
       "重跑失败：" + (e.message || ""), "bad");
   }
@@ -2446,6 +2618,7 @@ async function openShare(id) {
     const dlg = document.getElementById("share");
     if (!dlg.open) dlg.showModal();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setMsg(document.getElementById("board-msg"),
       e.message || "打不开共享面板", "bad");
   }
@@ -2583,6 +2756,7 @@ async function searchShareUsers(q, host) {
     const got = await api("GET", "/api/users?q=" + encodeURIComponent(q || ""));
     users = got.users || [];
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     host.append(el("li", "share-empty", "搜账号失败：" + (e.message || "")));
     return;
   }
@@ -2652,6 +2826,7 @@ async function doAddShare(u) {
     setShareMsg("已共享给 " + u.username, "good");
     await loadWorkflows();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setShareMsg(e.message || "共享失败", "bad");
   }
 }
@@ -2665,6 +2840,7 @@ async function doRemoveShare(s) {
     setShareMsg("已取消与 " + (s.username || "") + " 的共享", "good");
     await loadWorkflows();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setShareMsg(e.message || "取消共享失败", "bad");
   }
 }
@@ -2679,6 +2855,7 @@ async function doTransfer(u) {
       "已把工作流转给 " + u.username, "good");
     await loadWorkflows();
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     shareCtx.mode = "browse";
     renderShare();
     setShareMsg(e.message || "转让失败", "bad");
@@ -2708,6 +2885,7 @@ async function acceptWorkflowRows(wfId) {
     await loadWorkflows();
     await refreshOpenWorkflow(wfId);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setMsg(document.getElementById("board-msg"), e.message || "验收失败", "bad");
   }
 }
@@ -2729,6 +2907,7 @@ async function loadStatus() {
   try {
     ov = await api("GET", "/api/status/overview");
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     if (e && e.status === 401) { signedOut("登录已过期，请重新登录"); return; }
     ov = null;
   }
@@ -2738,6 +2917,7 @@ async function loadStatus() {
   try {
     sys = await api("GET", "/api/status/system");
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     sys = null;                       // 403 / 404 都按「拿不到」处理
   }
   renderStatusSystem(sys);
@@ -2801,6 +2981,8 @@ function renderStatusOverview(ov, admin) {
 
 function renderStatusSystem(sys) {
   const host = document.getElementById("sp-system");
+  const details = host.closest(".system-details");
+  if (details) details.hidden = false;
   host.textContent = "";
   if (!sys) {
     host.hidden = false;
@@ -2854,8 +3036,10 @@ function composerMode() {
 }
 
 function setComposerMode(mode) {
+  document.getElementById("c-error").hidden = true;
   document.querySelectorAll("#mode-switch .seg-btn").forEach(b =>
-    b.classList.toggle("is-on", b.dataset.mode === mode));
+    { b.classList.toggle("is-on", b.dataset.mode === mode);
+      b.setAttribute("aria-pressed", String(b.dataset.mode === mode)); });
   const isTask = mode === "task";
   /* 工作流那一侧要塞一张表（列的用途 + 提示词模板），32rem 宽根本转不开——
    * 列名下拉框被挤成两列，看着就还是「毛坯」。给它宽一点。 */
@@ -2900,6 +3084,7 @@ async function openComposerForWorkflow(id) {
   try {
     d = await api("GET", "/api/workflows/" + id);
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     setMsg(document.getElementById("board-msg"), e.message || "打不开这个工作流", "bad");
     return;
   }
@@ -3053,17 +3238,25 @@ function wfMissingConfig() {
 /* 上传表格。FormData 自己带 boundary，**不能**手写 Content-Type，
  * 否则浏览器不会补 boundary，服务端那边 multipart 解析直接失败。 */
 async function uploadWorkflowFile() {
+  const button = document.getElementById("c-wf-upload");
+  if (button.disabled) return;
+  const session = requestSession();
   const f = document.getElementById("c-wf-file").files[0];
   const note = document.getElementById("c-wf-note");
   if (!f) { note.textContent = "先选一个 xlsx 表格。"; return; }
+  const caption = button.textContent;
+  button.disabled = true;
+  button.textContent = "上传中…";
   note.textContent = "上传中…";
   const fd = new FormData();
   fd.append("file", f);
   try {
     const r = await fetch(apiBase() + "/api/workflows/upload",
       { method: "POST", headers: authHeaders(), body: fd });
+    checkSession(session);
     if (!r.ok) throw await errFrom(r);
     const d = await r.json();
+    checkSession(session);
     state.wfDraft = d;
     state.wfEdit = null;
     state.wfCols = (d.headers || []).map((h, i) => ({
@@ -3074,7 +3267,11 @@ async function uploadWorkflowFile() {
     setComposerMode("workflow");
     renderWfCols();
   } catch (e) {
+    if (e.name === "AbortError") return;
     note.textContent = "上传失败：" + (e.message || "");
+  } finally {
+    button.disabled = false;
+    button.textContent = caption;
   }
 }
 
@@ -3107,7 +3304,13 @@ document.getElementById("sh-cancel").onclick = () => {
 document.getElementById("composer-form").addEventListener("submit", async e => {
   e.preventDefault();
   const save = document.getElementById("c-save");
+  if (save.disabled) return;
+  const caption = save.textContent;
   save.disabled = true;
+  save.textContent = "正在提交…";
+  document.getElementById("composer").setAttribute("aria-busy", "true");
+  document.getElementById("c-error").hidden = true;
+  document.querySelectorAll("#mode-switch .seg-btn").forEach(b => { b.disabled = true; });
   try {
     if (composerMode() === "task") {
       const created = detailTask(
@@ -3137,10 +3340,20 @@ document.getElementById("composer-form").addEventListener("submit", async e => {
     setMsg(document.getElementById("board-msg"),
       state.wfEdit ? "工作流配置已保存" : "工作流已提交，逐行开跑", "ok");
   } catch (err) {
+    if (err && err.name === "AbortError") return;
     if (err && err.status === 401) signedOut("登录已过期，请重新登录");
-    else setMsg(document.getElementById("board-msg"), err.message || "提交失败", "bad");
+    else {
+      const error = document.getElementById("c-error");
+      error.textContent = err.message || "提交失败，请重试。";
+      error.hidden = false;
+      error.tabIndex = -1;
+      error.focus();
+    }
   } finally {
     save.disabled = false;
+    save.textContent = caption;
+    document.getElementById("composer").setAttribute("aria-busy", "false");
+    document.querySelectorAll("#mode-switch .seg-btn").forEach(b => { b.disabled = false; });
   }
 });
 
@@ -3159,6 +3372,8 @@ function showLogin(msg) {
 
 function signedOut(msg) {
   setToken("");
+  refreshTimers.forEach(timer => clearTimeout(timer));
+  refreshTimers.clear();
   state.me = null;                 // 身份没了：兜底轮询与重试都以它为闸，不清就一直空转
   state.streams.forEach((ctl, id) => stopStream(id));
   state.streams.clear();
@@ -3175,7 +3390,15 @@ function signedOut(msg) {
   document.getElementById("who").textContent = "";
   document.getElementById("sp-metrics").textContent = "";
   document.getElementById("sp-system").hidden = true;
-  showLogin(msg || "请登录");
+  const systemDetails = document.getElementById("sp-system").closest(".system-details");
+  if (systemDetails) { systemDetails.hidden = true; systemDetails.open = false; }
+  workspaceUI.workflowError = false;
+  workspaceUI.tasksError = false;
+  workspaceUI.tasksReady = false;
+  workspaceUI.workflowsReady = false;
+  document.getElementById("workspace-empty").hidden = true;
+  showSyncState("登录后查看任务");
+  showLogin(msg === "请登录" || msg === "已退出" ? "" : (msg || ""));
 }
 
 document.getElementById("login-form").addEventListener("submit", async e => {
@@ -3185,6 +3408,7 @@ document.getElementById("login-form").addEventListener("submit", async e => {
   const btn = document.getElementById("login-btn");
   const err = document.getElementById("login-error");
   btn.disabled = true;
+  btn.textContent = "登录中…";
   err.hidden = true;
   try {
     const got = await api("POST", "/api/auth/login", {
@@ -3196,10 +3420,12 @@ document.getElementById("login-form").addEventListener("submit", async e => {
     document.getElementById("login").close();
     await boot();
   } catch (ex) {
+    if (ex && ex.name === "AbortError") return;
     err.textContent = ex.message || "登录失败";
     err.hidden = false;
   } finally {
     btn.disabled = false;
+    btn.textContent = "登录";
   }
 });
 
@@ -3234,6 +3460,20 @@ document.getElementById("mode-switch").onclick = e => {
 };
 document.getElementById("new-btn").onclick = () => openComposer();
 document.getElementById("market-btn").onclick = () => openMarket();
+document.getElementById("refresh-btn").onclick = refreshWorkspace;
+document.getElementById("filter-reset").onclick = resetFilters;
+document.getElementById("empty-reset").onclick = resetFilters;
+document.getElementById("empty-create").onclick = () => openComposer();
+document.getElementById("market-close").onclick = () => document.getElementById("market").close();
+document.getElementById("mt-retry").onclick = openMarket;
+document.getElementById("password-toggle").onclick = () => {
+  const password = document.getElementById("l-pass");
+  const visible = password.type !== "text";
+  password.type = visible ? "text" : "password";
+  const button = document.getElementById("password-toggle");
+  button.textContent = visible ? "隐藏密码" : "显示密码";
+  button.setAttribute("aria-pressed", String(visible));
+};
 document.getElementById("mt-cancel").onclick = () => document.getElementById("market").close();
 document.getElementById("mt-d-back").onclick = () => {
   document.getElementById("mt-detail").hidden = true;
@@ -3282,7 +3522,7 @@ setInterval(() => {
   if (!state.me) return;          // 还没通过 /api/me 确认身份（含没登录）就别空转
   if (document.visibilityState !== "visible") return;
   reload();
-  loadWorkflows().catch(() => {});
+  loadWorkflows().catch(showBoardError);
   state.wfOpen.forEach(id => refreshOpenWorkflow(id));
 }, 10000);
 
@@ -3312,14 +3552,15 @@ async function boot() {
       (who.username || "") + (who.role === "admin" ? "（管理员）" : "");
     await load();
     /* 工作流读不到不该挡住看板：接口 404 时只是没有工作流这一块。 */
-    await loadWorkflows().catch(() => {});
+    await loadWorkflows().catch(showBoardError);
     await loadStatus().catch(() => {});
   } catch (e) {
+    if (e && e.name === "AbortError") return;
     if (e && e.status === 401) {
       // 有过令牌才叫"过期"；一进来就没有是"还没登录"，提示语不该混成一句
       signedOut(token() ? "登录已过期，请重新登录" : "请登录");
     } else {
-      setMsg(document.getElementById("board-msg"), (e && e.message) || "连不上服务", "bad");
+      showBoardError(e);
     }
   }
   applyView();

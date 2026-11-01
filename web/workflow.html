@@ -11,7 +11,7 @@
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="workflow-page">
 <header class="toolbar">
   <a class="who" href="index.html">← 回到计算任务看板</a>
   <h1>工作流</h1>
@@ -21,16 +21,23 @@
 
 <!-- 全局提示条：上传失败、保存被服务端驳回、令牌过期都落在这里。
      不能塞进某一栏里——那一栏关着的时候用户看不见。 -->
-<div id="wf-msg" class="board-msg" hidden></div>
+<div id="wf-msg" class="board-msg" role="status" hidden></div>
 
-<main>
+<main class="workflow-main">
+  <div class="page-feedback" id="wf-loading" role="status" hidden>正在读取工作流…</div>
+  <div class="recovery-actions">
+    <button id="wf-retry" class="secondary" type="button" hidden>重新加载</button>
+    <a href="index.html" class="secondary" id="wf-login" hidden>返回看板登录</a>
+  </div>
   <!-- 列表 -->
   <section id="wf-list" hidden>
-    <div class="toolbar">
+    <div class="toolbar upload-panel">
+      <div class="upload-intro"><h2>批量计算，从一张表格开始</h2><p>每行一个计算任务。上传后配置列与模板，再确认开跑。</p></div>
       <input type="file" id="wf-file" accept=".xlsx" aria-label="选一个 xlsx 表格">
       <button id="wf-upload" class="primary" type="button">上传表格</button>
-      <span class="who" id="wf-upload-state"></span>
+      <span class="who" id="wf-upload-state" role="status"></span>
     </div>
+    <p class="zone-empty" id="wf-list-empty" hidden>还没有工作流。选择一个 xlsx 表格，开始第一批计算。</p>
     <div id="wf-cards"></div>
   </section>
 
@@ -82,7 +89,7 @@
       </div>
 
       <div class="toolbar">
-        <span class="who">提示词模板（列绑定的变量写成两个大括号包起来，例如 {{seq}}）</span>
+        <label class="who" for="wf-template">提示词模板（列绑定的变量写成两个大括号包起来，例如 {{seq}}）</label>
       </div>
       <div class="toolbar">
         <textarea id="wf-template" rows="4" style="flex:1 1 40rem"
@@ -139,7 +146,7 @@
       <button id="wf-task-toggle" class="secondary" type="button">看任务表</button>
     </div>
     <div class="wf-table-wrap" id="wf-rows-wrap">
-      <table class="wf-table">
+      <table class="wf-table" aria-label="工作流数据与列配置">
         <thead><tr id="wf-head"></tr></thead>
         <tbody id="wf-body"></tbody>
       </table>
@@ -148,7 +155,7 @@
     <!-- 任务表：一行一个**已经跑起来**的任务。没跑的不列（用户原话：
          「可以不展开还没运行的」）。点「详情」在下面展开只读详情。 -->
     <div class="wf-table-wrap" id="wf-task-table-wrap" hidden>
-      <table class="wf-table">
+      <table class="wf-table" aria-label="已运行的行任务">
         <thead><tr id="wf-task-head"></tr></thead>
         <tbody id="wf-task-body"></tbody>
       </table>
@@ -160,6 +167,13 @@
 
     <div class="toolbar" id="wf-preview-bar">
       <span class="who">第 <span id="wf-preview-row">1</span> 行渲染出来的提示词</span>
+      <span class="toolbar-gap"></span>
+      <button class="secondary" type="button" id="wf-preview-prev">上一行</button>
+      <label class="wf-field-line" for="wf-preview-index">数据行
+        <input id="wf-preview-index" type="number" min="1" step="1" value="1" inputmode="numeric">
+      </label>
+      <button class="secondary" type="button" id="wf-preview-go">预览</button>
+      <button class="secondary" type="button" id="wf-preview-next">下一行</button>
     </div>
     <pre id="wf-preview"></pre>
   </section>

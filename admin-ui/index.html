@@ -22,19 +22,20 @@
     <span class="who" id="who"></span>
     <span class="toolbar-gap"></span>
     <span class="clock" id="clock"></span>
+    <span class="sync-note" id="sync-state" role="status">正在连接…</span>
     <button class="secondary" id="refresh-btn" type="button">刷新</button>
     <button class="secondary" id="logout-btn" type="button">退出</button>
   </header>
 
-  <nav class="tabs" id="tabs" role="tablist">
-    <button class="tab is-on" data-tab="live" role="tab" type="button">在跑的</button>
-    <button class="tab" data-tab="pending" role="tab" type="button">
+  <nav class="tabs" id="tabs" role="tablist" aria-label="值班台区域">
+    <button class="tab is-on" data-tab="live" id="tab-live" role="tab" aria-controls="pane-live" aria-selected="true" tabindex="0" type="button">在跑的</button>
+    <button class="tab" data-tab="pending" id="tab-pending" role="tab" aria-controls="pane-pending" aria-selected="false" tabindex="-1" type="button">
       待确认产物<span class="badge" id="badge-pending" hidden>0</span>
     </button>
-    <button class="tab" data-tab="tasks" role="tab" type="button">全部任务</button>
-    <button class="tab" data-tab="audit" role="tab" type="button">审计日志</button>
-    <button class="tab" data-tab="workflows" role="tab" type="button">工作流</button>
-    <button class="tab" data-tab="users" role="tab" type="button">用户</button>
+    <button class="tab" data-tab="tasks" id="tab-tasks" role="tab" aria-controls="pane-tasks" aria-selected="false" tabindex="-1" type="button">全部任务</button>
+    <button class="tab" data-tab="audit" id="tab-audit" role="tab" aria-controls="pane-audit" aria-selected="false" tabindex="-1" type="button">审计日志</button>
+    <button class="tab" data-tab="workflows" id="tab-workflows" role="tab" aria-controls="pane-workflows" aria-selected="false" tabindex="-1" type="button">工作流</button>
+    <button class="tab" data-tab="users" id="tab-users" role="tab" aria-controls="pane-users" aria-selected="false" tabindex="-1" type="button">用户</button>
   </nav>
   <!-- 状态面板：管理员看得到系统指标与全局速度。**默认只读**——
        它是给人看现状的，不是给人填的。 -->
@@ -47,9 +48,11 @@
     <!-- 验收方式默认。**这是平台级设置**，所以入口在值班台（管理员）：
          没单独设过的任务都按它来，任务与工作流可以各自覆盖。
          放在状态面板里是因为它本来就是「平台现状」的一部分。 -->
+    <details class="admin-preferences">
+      <summary>平台设置 · 验收与运行时限</summary>
     <div class="sp-setting">
       <span class="sp-setting-k">验收方式默认</span>
-      <select id="review-mode-default" class="review-mode-select">
+      <select id="review-mode-default" aria-label="默认验收方式" class="review-mode-select">
         <option value="human">人工 + 条件判定</option>
         <option value="llm">机器审核</option>
       </select>
@@ -60,7 +63,7 @@
          留在 pending 等人）。所以这里能调。 -->
     <div class="sp-setting">
       <span class="sp-setting-k">审核超时</span>
-      <input id="review-timeout-min" class="review-timeout-input"
+      <input id="review-timeout-min" aria-label="审核超时，分钟" class="review-timeout-input"
              type="number" min="1" max="240" step="1" inputmode="numeric">
       <span class="sp-note">分钟</span>
       <span class="sp-note" id="review-timeout-note"></span>
@@ -70,11 +73,11 @@
          「跑得久了起一个 subagent 判合不合理，合理就续跑、不合理才判失败」。 -->
     <div class="sp-setting">
       <span class="sp-setting-k">命令额度</span>
-      <input id="cmd-timeout-min" class="review-timeout-input"
+      <input id="cmd-timeout-min" aria-label="默认命令额度，分钟" class="review-timeout-input"
              type="number" min="1" max="1440" step="1" inputmode="numeric"
              title="模型没申请时，单条命令的默认超时">
       <span class="sp-note">分钟（默认）</span>
-      <input id="cmd-timeout-max-min" class="review-timeout-input"
+      <input id="cmd-timeout-max-min" aria-label="命令额度上限，分钟" class="review-timeout-input"
              type="number" min="1" max="1440" step="1" inputmode="numeric"
              title="模型最多能申请到的超时">
       <span class="sp-note">分钟（上限）</span>
@@ -82,27 +85,31 @@
     </div>
     <div class="sp-setting">
       <span class="sp-setting-k">用时复核</span>
-      <input id="rt-after-min" class="review-timeout-input"
+      <input id="rt-after-min" aria-label="首次用时复核，分钟" class="review-timeout-input"
              type="number" min="5" max="1440" step="1" inputmode="numeric"
              title="任务跑过这么久就起一次用时复核">
       <span class="sp-note">分钟后复核</span>
-      <input id="rt-grant-min" class="review-timeout-input"
+      <input id="rt-grant-min" aria-label="复核后增加时长，分钟" class="review-timeout-input"
              type="number" min="1" max="1440" step="1" inputmode="numeric"
              title="复核判「合理」之后再给多少时间">
       <span class="sp-note">分钟后复审</span>
       <span class="sp-note" id="rt-note"></span>
     </div>
-    <div class="sp-system" id="sp-system" hidden></div>
+    </details>
+    <details class="system-details" hidden>
+      <summary>系统资源</summary>
+      <div class="sp-system" id="sp-system" hidden></div>
+    </details>
   </section>
 
   <!-- 全局提示条。值班台的这块比用户面板宽：内部通道连不上、登录过期
        这类问题必须一眼可见，否则下面四个区域全部静默失效。 -->
-  <div id="board-msg" class="board-msg" hidden></div>
+  <div id="board-msg" class="board-msg" role="status" hidden></div>
 
   <main class="deck">
     <!-- ============================ 1 · 在跑的 ============================
          固定一排实时卡片，每张：当前步骤 + 中止 + 干预框。 -->
-    <section class="pane" id="pane-live" data-pane="live">
+    <section class="pane" id="pane-live" data-pane="live" role="tabpanel" aria-labelledby="tab-live" tabindex="0">
       <div class="pane-head">
         <h2 class="pane-h">在跑的计算任务</h2>
         <span class="pane-sub" id="live-sub"></span>
@@ -114,7 +121,7 @@
     <!-- ==================== 4 · 时间窗产物确认区 =========================
          §8.2：verified=0 的产物**可见但不可下载**，要在这里转正。
          没有它，用户会看到一批永远点不下来的产物。 -->
-    <section class="pane" id="pane-pending" data-pane="pending" hidden>
+    <section class="pane" id="pane-pending" data-pane="pending" role="tabpanel" aria-labelledby="tab-pending" tabindex="0" hidden>
       <div class="pane-head">
         <h2 class="pane-h">待确认的时间窗产物</h2>
         <span class="pane-sub" id="pending-sub"></span>
@@ -129,7 +136,7 @@
     </section>
 
     <!-- ========================= 3 · 全部任务 =========================== -->
-    <section class="pane" id="pane-tasks" data-pane="tasks" hidden>
+    <section class="pane" id="pane-tasks" data-pane="tasks" role="tabpanel" aria-labelledby="tab-tasks" tabindex="0" hidden>
       <div class="pane-head">
         <h2 class="pane-h">全部计算任务</h2>
         <span class="pane-sub" id="tasks-sub"></span>
@@ -158,7 +165,7 @@
     <!-- ======================== 3 · 审计日志 ============================
          agent 每一次 bash 调用：命令原文、退出码、耗时。
          这是事后追责「它到底跑了什么」的唯一凭据，所以必须能导出。 -->
-    <section class="pane" id="pane-audit" data-pane="audit" hidden>
+    <section class="pane" id="pane-audit" data-pane="audit" role="tabpanel" aria-labelledby="tab-audit" tabindex="0" hidden>
       <div class="pane-head">
         <h2 class="pane-h">审计日志</h2>
         <span class="pane-sub" id="audit-sub"></span>
@@ -191,7 +198,7 @@
          但「谁把工作流共享给了谁、主人是谁」只有工作流这一层知道——任务里
          存的是行任务，主人是行任务的归属。所以这里补一张表，
          并让管理员能代替 owner 做共享 / 转让。 -->
-    <section class="pane" id="pane-workflows" data-pane="workflows" hidden>
+    <section class="pane" id="pane-workflows" data-pane="workflows" role="tabpanel" aria-labelledby="tab-workflows" tabindex="0" hidden>
       <div class="pane-head">
         <h2 class="pane-h">工作流</h2>
         <span class="pane-sub" id="workflows-sub"></span>
@@ -217,7 +224,7 @@
     <!-- ========================== 6 · 反思 ================================ -->
 
     <!-- ========================== 5 · 用户 ============================== -->
-    <section class="pane" id="pane-users" data-pane="users" hidden>
+    <section class="pane" id="pane-users" data-pane="users" role="tabpanel" aria-labelledby="tab-users" tabindex="0" hidden>
       <div class="pane-head">
         <h2 class="pane-h">用户</h2>
         <span class="pane-sub" id="users-sub"></span>
@@ -256,13 +263,14 @@
   </main>
 
   <!-- 登录。面板也走 Bearer（不放 Cookie），令牌在 localStorage。 -->
-  <dialog class="login" id="login">
+  <dialog class="login" id="login" aria-labelledby="login-title">
     <form class="login-inner" id="login-form" method="dialog">
-      <h2 class="login-title">自动化计算平台 · 值班台</h2>
+      <h2 class="login-title" id="login-title">自动化计算平台 · 值班台</h2>
       <p class="login-lead">只对本机开放，需要管理员账号。</p>
       <label class="field"><span>账号</span><input id="l-user" required autocomplete="username"></label>
       <label class="field"><span>密码</span><input id="l-pass" required type="password" autocomplete="current-password"></label>
-      <p class="login-error" id="login-error" hidden></p>
+      <button class="password-toggle" id="password-toggle" type="button" aria-controls="l-pass" aria-pressed="false">显示密码</button>
+      <p class="login-error" id="login-error" role="alert" hidden></p>
       <div class="composer-actions">
         <button class="primary" type="submit" id="login-btn">登录</button>
       </div>
@@ -274,7 +282,7 @@
        输入框，复用静态节点就得记得清干净，而忘了清的症状是上一次的
        重置密码框留在改状态表里——不报错，只是看错了值）。
        <dialog> 是复用节点，所以收尾必须幂等并解绑监听。 -->
-  <dialog class="confirm" id="confirm"></dialog>
+  <dialog class="confirm" id="confirm" aria-label="确认操作"></dialog>
 
   <script src="app.js"></script>
 </body>

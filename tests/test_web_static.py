@@ -131,6 +131,10 @@ def test_hidden_attribute_is_forced_to_display_none():
         "缺全局 [hidden] { display: none } 兜底规则"
     )
     toggled = [
+        ".market-detail",
+        ".market-grid",
+        ".market-cats",
+        ".system-details",
         ".eb-edit",        # 只读 <-> 编辑 两态的输入容器
         ".eb-view",        # 只读视图（编辑时让位）
         ".card-step",      # running 卡片的当前步骤行
@@ -418,8 +422,11 @@ def test_every_dom_id_the_script_touches_exists_in_the_html(
     missing = used - have - made
     assert not missing, f"{js_name} 引用了不存在的 id：{sorted(missing)}"
     # 反过来也钉一下：HTML 上的控件没人引用，多半是只写了壳忘了绑事件
-    assert not (have - used), \
-        f"{html_name} 里有没人用的 id：{sorted(have - used)}"
+    referenced = set()
+    for refs in re.findall(r'(?:aria-labelledby|aria-describedby|aria-controls|for)="([^"]+)"', html):
+        referenced.update(refs.split())
+    assert not (have - used - referenced), \
+        f"{html_name} 里有没人用的 id：{sorted(have - used - referenced)}"
 
 
 # --- 工作流页（规格 8.2 / 8.3 / 8.4）-----------------------------------

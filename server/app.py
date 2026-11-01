@@ -38,7 +38,7 @@ from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import artifacts
@@ -415,6 +415,31 @@ def _row_packages(workflow_id: int) -> list[tuple[dict, Path]]:
         if real.is_file():
             out.append((row, real))
     return out
+
+
+@contextlib.contextmanager
+def _temporary_download_dir():
+    """Own the directory until a response has accepted cleanup responsibility."""
+    directory = Path(tempfile.mkdtemp(prefix="wf-pkgs-"))
+    try:
+        yield directory
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+class _TemporaryDownloadResponse(FileResponse):
+    """Release generated ZIPs even when sending fails or the client disconnects."""
+
+    def __init__(self, *args, tempdir: Path, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tempdir = tempdir
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await run_in_threadpool(shutil.rmtree, self.tempdir, True)
 
 
 def _zip_entry_name(text: str) -> str:
@@ -1653,50 +1678,49 @@ def create_public_app() -> FastAPI:
             raise PreciseHTTPException(404, "这一批还没有可下载的产物包")
         total = sum(p.stat().st_size for _, p in items)
 
-        tmpdir = Path(tempfile.mkdtemp(prefix="wf-pkgs-"))
-        free = shutil.disk_usage(tmpdir).free
-        if total > free:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise PreciseHTTPException(
-                507, f"临时磁盘装不下这一批的产物包（需要 {total // 1048576} MB，"
-                     f"只剩 {free // 1048576} MB）。可以先只下几行的，或把临时目录挪到数据盘。")
-        out_zip = tmpdir / f"{_zip_entry_name(wf['name'])}-产物包.zip"
-        # 每行的文件名：第 N 行 + 源表里的关键列值（编号），免得下载完
-        # 一堆「第1行.zip」「第2行.zip」还得自己对着表认。
-        import workflow as wfmod
-        source = Path(wf["source_path"])
-        view = wfmod.read_source(source, header_row=int(wf["header_row"]))
-        key_col = int(wf["key_col"] or 0)
-        # 文件名里的标识信息：关键列的值 + **这一行各 slot 的值**。
-        # slot 就是用户在表里填的那几列（种属、靶标名那些）——只给「第3行_17」
-        # 的话，61 个包下完用户还得自己对着表认；带上 slot 值就能一眼看出
-        # 哪个包是哪个靶标。
-        slot_cols = sorted(
-            (c for c in store.list_workflow_columns(workflow_id)
-             if c["role"] in ("input", "context") and c.get("slot")),
-            key=lambda c: int(c["col_index"]))
-        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_STORED,
-                             allowZip64=True) as zf:
-            for row, path in items:
-                idx = int(row.get("workflow_row") or 0)
-                values: dict = {}
-                try:
-                    values = wfmod.row_values(source, view, idx)
-                except Exception:       # noqa: BLE001 - 读不到就只用行号
-                    values = {}
-                key = str(values.get(key_col, "") or "").strip()
-                name = f"第{idx + 1}行"
-                if key:
-                    name += "_" + _zip_entry_name(key)
-                for c in slot_cols:
-                    v = str(values.get(int(c["col_index"]), "") or "").strip()
-                    if v:
-                        name += "_" + _zip_entry_name(v)
-                zf.write(path, arcname=name[:80] + ".zip")
-        # 传完就删：临时目录留着就是垃圾（几十 GB 的包放在那里没人会知道）。
-        return FileResponse(out_zip, filename=out_zip.name,
-                            media_type="application/zip",
-                            background=BackgroundTask(shutil.rmtree, tmpdir, True))
+        with _temporary_download_dir() as tmpdir:
+            free = shutil.disk_usage(tmpdir).free
+            if total > free:
+                raise PreciseHTTPException(
+                    507, f"临时磁盘装不下这一批的产物包（需要 {total // 1048576} MB，"
+                         f"只剩 {free // 1048576} MB）。可以先只下几行的，或把临时目录挪到数据盘。")
+            out_zip = tmpdir / f"{_zip_entry_name(wf['name'])}-产物包.zip"
+            # 每行的文件名：第 N 行 + 源表里的关键列值（编号），免得下载完
+            # 一堆「第1行.zip」「第2行.zip」还得自己对着表认。
+            import workflow as wfmod
+            source = Path(wf["source_path"])
+            view = wfmod.read_source(source, header_row=int(wf["header_row"]))
+            key_col = int(wf["key_col"] or 0)
+            # 文件名里的标识信息：关键列的值 + **这一行各 slot 的值**。
+            # slot 就是用户在表里填的那几列（种属、靶标名那些）——只给「第3行_17」
+            # 的话，61 个包下完用户还得自己对着表认；带上 slot 值就能一眼看出
+            # 哪个包是哪个靶标。
+            slot_cols = sorted(
+                (c for c in store.list_workflow_columns(workflow_id)
+                 if c["role"] in ("input", "context") and c.get("slot")),
+                key=lambda c: int(c["col_index"]))
+            with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_STORED,
+                                 allowZip64=True) as zf:
+                for row, path in items:
+                    idx = int(row.get("workflow_row") or 0)
+                    values: dict = {}
+                    try:
+                        values = wfmod.row_values(source, view, idx)
+                    except Exception:       # noqa: BLE001 - 读不到就只用行号
+                        values = {}
+                    key = str(values.get(key_col, "") or "").strip()
+                    name = f"第{idx + 1}行"
+                    if key:
+                        name += "_" + _zip_entry_name(key)
+                    for c in slot_cols:
+                        v = str(values.get(int(c["col_index"]), "") or "").strip()
+                        if v:
+                            name += "_" + _zip_entry_name(v)
+                    zf.write(path, arcname=name[:80] + ".zip")
+            # 传完就删：临时目录留着就是垃圾（几十 GB 的包放在那里没人会知道）。
+            return _TemporaryDownloadResponse(
+                out_zip, filename=out_zip.name, media_type="application/zip",
+                tempdir=tmpdir)
 
     @app.delete("/api/workflows/{workflow_id}")
     def delete_workflow(workflow_id: int, user=Depends(auth.current_user)):
@@ -1743,7 +1767,8 @@ def create_public_app() -> FastAPI:
     def user_ui():
         if not (WEB_DIR / "index.html").is_file():
             raise PreciseHTTPException(404, "用户面板前端文件缺失")
-        return FileResponse(WEB_DIR / "index.html", media_type="text/html")
+        return FileResponse(WEB_DIR / "index.html", media_type="text/html",
+                            headers={"Cache-Control": "no-cache"})
 
     @app.get("/favicon.ico")
     def user_favicon():

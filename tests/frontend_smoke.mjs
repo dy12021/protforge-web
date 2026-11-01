@@ -24,6 +24,8 @@
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import vm from 'node:vm';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /** 一个"什么都行"的桩：任何属性都是可调用的桩，任何赋值都接受。 */
 function makeStub(label = 'stub') {
@@ -80,7 +82,10 @@ function makeEl(tag, id, doc) {
         type, preventDefault() {}, stopPropagation() {}, ...ev,
       }));
     },
-    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    attributes: {},
+    setAttribute(name, value) { node.attributes[name] = String(value); },
+    getAttribute(name) { return node.attributes[name] ?? null; },
+    removeAttribute(name) { delete node.attributes[name]; },
     // querySelector 必须给回一个元素：buildCols() 靠它拿 .col-count，
     // 给 null 的话 render() 第一行就炸——那是桩的锅，不是前端的锅。
     querySelector(sel) {
@@ -634,7 +639,7 @@ async function smoke(file) {
   }
 
   return {
-    errors, calls, byId, sandbox,
+    errors, calls, byId, sandbox, context,
     cols: boardColumns(byId),
     expectCols: isWeb ? (sandbox.COLUMNS || []).length : null,
   };
@@ -698,6 +703,9 @@ function findInput(root) {
  */
 
 
+export { smoke };
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 const files = process.argv.slice(2);
 if (!files.length) {
   console.error('用法：node tests/frontend_smoke.mjs <app.js> [...]');
@@ -769,3 +777,5 @@ for (const f of files) {
   }
 }
 process.exit(bad ? 1 : 0);
+
+}

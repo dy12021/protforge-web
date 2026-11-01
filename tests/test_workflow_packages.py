@@ -35,6 +35,72 @@ import store
 GOOD = "password-123"
 
 
+@pytest.mark.parametrize("failure", ["source", "zip", "response", "disk"])
+def test_failed_download_cleans_temp_directory(client, owner, wf_with_packages,
+                                             monkeypatch, tmp_path, failure):
+    allocated = tmp_path / "download-temp"
+    allocated.mkdir()
+    monkeypatch.setattr(svc.tempfile, "mkdtemp", lambda **kw: str(allocated))
+
+    def fail(*args, **kwargs):
+        raise OSError("injected download failure")
+
+    if failure == "source":
+        import workflow
+        monkeypatch.setattr(workflow, "read_source", fail)
+    elif failure == "zip":
+        monkeypatch.setattr(zipfile.ZipFile, "write", fail)
+    elif failure == "response":
+        monkeypatch.setattr(svc, "_TemporaryDownloadResponse", fail)
+    else:
+        from collections import namedtuple
+        usage = namedtuple("usage", "total used free")
+        monkeypatch.setattr(svc.shutil, "disk_usage", lambda path: usage(1, 1, 0))
+
+    endpoint = next(r.endpoint for r in client.app.routes
+                    if getattr(r, "path", "") == "/api/workflows/{workflow_id}/packages")
+    expected = svc.PreciseHTTPException if failure == "disk" else OSError
+    with pytest.raises(expected):
+        endpoint(wf_with_packages["wid"], user={"id": owner[1], "role": "user"})
+    assert not allocated.exists()
+
+
+def test_successful_download_cleans_temp_directory(client, owner, wf_with_packages,
+                                                 monkeypatch, tmp_path):
+    allocated = tmp_path / "download-temp"
+    allocated.mkdir()
+    monkeypatch.setattr(svc.tempfile, "mkdtemp", lambda **kw: str(allocated))
+    response = client.get(f"/api/workflows/{wf_with_packages['wid']}/packages",
+                          headers=owner[0])
+    assert response.status_code == 200
+    assert zipfile.is_zipfile(io.BytesIO(response.content))
+    assert not allocated.exists()
+
+
+def test_failed_transmission_cleans_temp_directory(client, owner, wf_with_packages,
+                                                 monkeypatch, tmp_path):
+    import asyncio
+
+    allocated = tmp_path / "download-temp"
+    allocated.mkdir()
+    monkeypatch.setattr(svc.tempfile, "mkdtemp", lambda **kw: str(allocated))
+    endpoint = next(r.endpoint for r in client.app.routes
+                    if getattr(r, "path", "") == "/api/workflows/{workflow_id}/packages")
+    response = endpoint(wf_with_packages["wid"], user={"id": owner[1], "role": "user"})
+    assert allocated.exists()
+
+    async def send(message):
+        raise OSError("client disconnected")
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    with pytest.raises(OSError, match="client disconnected"):
+        asyncio.run(response({"type": "http", "method": "GET", "headers": []},
+                             receive, send))
+    assert not allocated.exists()
+
+
 # ---------------------------------------------------------------- 夹具
 
 @pytest.fixture()

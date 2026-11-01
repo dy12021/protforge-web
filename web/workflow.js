@@ -37,7 +37,9 @@ function authHeaders() {
 async function errFrom(r) {
   const d = await r.json().catch(() => null);
   const msg = d && typeof d.detail === "string" ? d.detail : null;
-  return new Error(msg || ("请求失败（HTTP " + r.status + "）"));
+  const error = new Error(msg || ("请求失败（HTTP " + r.status + "）"));
+  error.status = r.status;
+  return error;
 }
 
 async function api(method, path, body) {
@@ -63,13 +65,33 @@ function say(text) {
 /** 任何一步出错都写进提示条。静默失败是这个项目最难查的一类：
  *  点一下没反应、日志里也没有，用户只会当成「后端没返回数据」。 */
 async function guard(label, fn) {
+  say("");
+  $("#wf-retry").hidden = true;
+  $("#wf-login").hidden = true;
   try {
     const v = await fn();
-    say("");
     return v;
   } catch (e) {
+    if (e.name === "AbortError") return null;
     say(label + "：" + (e && e.message ? e.message : String(e)));
+    $("#wf-retry").hidden = false;
+    $("#wf-login").hidden = e.status !== 401;
     return null;
+  }
+}
+
+async function runAction(button, label, fn) {
+  if (button.disabled) return;
+  const text = button.textContent;
+  button.disabled = true;
+  button.textContent = label + "中…";
+  button.setAttribute("aria-busy", "true");
+  try { return await guard(label, fn); }
+  finally {
+    button.disabled = false;
+    button.textContent = text;
+    button.setAttribute("aria-busy", "false");
+    if (lastDetail) renderLiveDetail(lastDetail);
   }
 }
 
@@ -127,6 +149,23 @@ function isFailedRow(row, skips) {
 }
 
 let wfId = null;
+let viewVersion = 0;
+let previewVersion = 0;
+let taskVersion = 0;
+let activePoll = null;
+function currentView() { return { version: viewVersion, id: wfId }; }
+function isCurrentView(view) { return view.version === viewVersion && view.id === wfId; }
+function enterView(id) {
+  stopPolling();
+  viewVersion += 1;
+  wfId = id;
+  $("#wf-list").hidden = false;
+  $("#wf-detail").hidden = true;
+  taskDetailId = null;
+  const host = $("#wf-task-detail");
+  if (host) host.hidden = true;
+  return currentView();
+}
 let wfSheet = "";
 /** 工作流名字：批量下载时用它拼下载文件名（「产物包_研发失败项目汇总表.zip」）。 */
 let wfName = "";
@@ -213,8 +252,14 @@ function renderSteps() {
       + (i === stepNow ? " is-now" : "")
       + (i > reach ? " is-locked" : "")
       + (jump ? " is-jump" : "");
-    li.textContent = `${i + 1} ${label}`;
-    if (jump) li.addEventListener("click", () => gotoStep(i));
+    if (i === stepNow) li.setAttribute("aria-current", "step");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "wf-step-button";
+    button.textContent = `${i + 1} ${label}`;
+    button.disabled = !jump;
+    if (jump) button.addEventListener("click", () => gotoStep(i));
+    li.appendChild(button);
     box.appendChild(li);
   });
 }
@@ -223,6 +268,8 @@ function renderSteps() {
 function gotoStep(i) {
   stepNow = Math.max(0, Math.min(WF_STEPS.length - 1, i));
   showStep();
+  STEP_PANES[stepNow].tabIndex = -1;
+  STEP_PANES[stepNow].focus();
 }
 
 /* 三块面板各对应一步。**逐个列出来**而不是 `#wf-pane-${i}` 拼出来：
@@ -273,10 +320,15 @@ async function boot() {
 }
 
 async function loadList() {
-  const d = await api("GET", "/api/workflows");
-  stopPolling();
+  const view = enterView(null);
+  $("#wf-loading").hidden = false;
+  let d;
+  try { d = await api("GET", "/api/workflows"); }
+  finally { if (isCurrentView(view)) $("#wf-loading").hidden = true; }
+  if (!isCurrentView(view)) return;
   $("#wf-list").hidden = false;
   $("#wf-detail").hidden = true;
+  $("#wf-list-empty").hidden = d.workflows.length !== 0;
   const box = $("#wf-cards");
   box.innerHTML = "";
   for (const wf of d.workflows) {
@@ -324,29 +376,22 @@ async function loadList() {
     el.querySelector(".card-time").textContent =
       (wf.abort_requested ? "已请求中止" : "")
       + (wf.writeback_pending ? " · 结果表待补写" : "");
-    el.addEventListener("click", () => guard("打开工作流", () => openDetail(wf.id)));
+    el.tabIndex = 0;
+    el.setAttribute("role", "button");
+    el.setAttribute("aria-label", wf.name + "，打开工作流");
+    const open = () => guard("打开工作流", () => openDetail(wf.id));
+    el.addEventListener("click", open);
+    el.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    });
     box.appendChild(el);
   }
 }
 
 /* ---------------------------------------------------------------- 详情 */
 
-async function openDetail(id) {
-  wfId = id;
-  const d = await api("GET", `/api/workflows/${id}`);
-  $("#wf-list").hidden = true;
-  $("#wf-detail").hidden = false;
-  const wf = d.workflow;
-  wfSheet = wf.sheet || "";
-  wfName = wf.name || "";
-  lastDetail = d;
-  picked = -1;
-  $("#wf-name").textContent = wf.name;
-  $("#wf-sheet").textContent = wfSheet ? "工作表 " + wfSheet : "";
-  $("#wf-upload-receipt").textContent =
-    `${wf.name} · ${wfSheet ? "工作表 " + wfSheet : "第一个工作表"} · `
-    + `${Number(wf.total_rows) || 0} 行数据（表头不算）。`
-    + "要换表就回全部工作流那一页重新上传，那会另建一个工作流。";
+function renderLiveDetail(d) {
+  const wf = d.workflow || {};
   const done = Number(wf.cursor) || 0;
   const total = Number(wf.total_rows) || 0;
   $("#wf-progress-text").textContent =
@@ -362,8 +407,6 @@ async function openDetail(id) {
   failedBox.textContent = failed > 0 ? `失败 ${failed} 行` : "没有失败行";
   failedBox.className = failed > 0 ? "who wf-failed is-bad" : "who";
 
-  $("#wf-template").value = wf.prompt_template || "";
-  $("#wf-writeback").checked = !!Number(wf.writeback);
 
   // 下载入口的判据是**服务端算的 result_ready**（有没有一张已经生成的结果表），
   // 不是 status === "finished"。后者是 M-1 死路的后半段：中止之后工作流停在
@@ -371,7 +414,7 @@ async function openDetail(id) {
   // 用户点完中止既看不到也拿不到，只能再点一次「继续」把批次接着跑下去。
   // 规格 7.1 要的是「随时能下载**当前进度**」——有一份就够下。
   $("#wf-download").hidden = !wf.result_ready;
-  $("#wf-download").href = `/api/workflows/${id}/result.xlsx`;
+  $("#wf-download").href = `/api/workflows/${wf.id}/result.xlsx`;
   // 批量产物包：件数与总大小由服务端算，**没有包就不给入口**（点下去必然 404）。
   const pk = $("#wf-packages");
   pk.hidden = !d.packages_count;
@@ -386,6 +429,36 @@ async function openDetail(id) {
   $("#wf-pause").disabled = wf.status !== "running";
   $("#wf-resume").disabled = wf.status !== "paused";
   $("#wf-abort").disabled = wf.status === "draft";
+  $("#wf-pause").hidden = wf.status !== "running";
+  $("#wf-resume").hidden = wf.status !== "paused";
+  $("#wf-abort").hidden = !["running", "paused"].includes(wf.status);
+  updatePreviewControls(Number(wf.total_rows) || 0);
+
+}
+
+async function openDetail(id) {
+  const view = enterView(id);
+  $("#wf-loading").hidden = false;
+  let d;
+  try { d = await api("GET", `/api/workflows/${id}`); }
+  finally { if (isCurrentView(view)) $("#wf-loading").hidden = true; }
+  if (!isCurrentView(view)) return;
+  $("#wf-list").hidden = true;
+  $("#wf-detail").hidden = false;
+  const wf = d.workflow;
+  wfSheet = wf.sheet || "";
+  wfName = wf.name || "";
+  lastDetail = d;
+  picked = -1;
+  $("#wf-name").textContent = wf.name;
+  $("#wf-sheet").textContent = wfSheet ? "工作表 " + wfSheet : "";
+  $("#wf-upload-receipt").textContent =
+    `${wf.name} · ${wfSheet ? "工作表 " + wfSheet : "第一个工作表"} · `
+    + `${Number(wf.total_rows) || 0} 行数据（表头不算）。`
+    + "要换表就回全部工作流那一页重新上传，那会另建一个工作流。";
+  renderLiveDetail(d);
+  $("#wf-template").value = wf.prompt_template || "";
+  $("#wf-writeback").checked = !!Number(wf.writeback);
 
   colsModel = (d.columns || []).map((c) => ({
     col_index: Number(c.col_index),
@@ -400,6 +473,7 @@ async function openDetail(id) {
   stepNow = stepByState();
   showStep();
   closeColPick();
+  $("#wf-back").focus();
   startPolling();
   await loadPreview(0);
 }
@@ -418,20 +492,25 @@ function renderHead() {
     th.className = "wf-th";
     th.dataset.col = String(col.col_index);
     th.title = "点这格改这一列的角色";
-    th.textContent = col.header || "列" + (col.col_index + 1);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "wf-col-button";
+    button.setAttribute("aria-label", "配置第 " + (col.col_index + 1) + " 列：" + (col.header || "无表头"));
+    button.textContent = col.header || "列" + (col.col_index + 1);
     const tag = document.createElement("span");
     tag.className = "wf-role-tag";
     tag.dataset.role = col.role;
     tag.textContent = ROLE_LABEL[col.role] || col.role;
-    th.appendChild(tag);
-    th.addEventListener("click", () => openColPick(i));
+    button.appendChild(tag);
+    button.addEventListener("click", () => openColPick(i));
+    th.appendChild(button);
     head.appendChild(th);
   });
 }
 
 /** 打开某一列的角色弹层。**误触不改任何东西**：点表头只是把弹层打开，
     只有在弹层里点了一个角色才会写进列模型；「取消」直接关掉，什么都不变。 */
-function openColPick(i) {
+function openColPick(i, focus = true) {
   const col = colsModel[i];
   if (!col) return;
   picked = i;
@@ -440,19 +519,28 @@ function openColPick(i) {
     `第 ${col.col_index + 1} 列「${col.header || "无表头"}」用作什么`;
   for (const b of $("#wf-roles").children) {
     b.className = "wf-role" + (b.dataset.role === col.role ? " is-on" : "");
+    b.setAttribute("aria-pressed", String(b.dataset.role === col.role));
   }
   const slot = $("#wf-slot");
   slot.hidden = !(col.role === "input" || col.role === "context");
+  const slotLabel = slot.closest("label");
+  if (slotLabel) slotLabel.hidden = slot.hidden;
   slot.value = col.slot || "";
   const field = $("#wf-field");
   field.hidden = col.role !== "output";
+  const fieldLabel = field.closest("label");
+  if (fieldLabel) fieldLabel.hidden = field.hidden;
   field.value = col.field || OUTPUT_FIELDS[1];
+  if (focus) $("#wf-colpick-close").focus();
 }
 
 /** 关弹层。改了角色的话把焦点还给刚才那一列表头。 */
 function closeColPick() {
+  const column = picked;
   picked = -1;
   $("#wf-colpick").hidden = true;
+  const button = $("#wf-head").querySelectorAll("button")[column];
+  if (button) button.focus();
 }
 
 /** 换角色。变量名与结果字段跟着一起换——服务端只认整体替换的列组，
@@ -465,7 +553,7 @@ function setRole(role) {
   if (role !== "output") col.field = "";
   if (role === "output" && !col.field) col.field = OUTPUT_FIELDS[1];
   renderHead();
-  openColPick(picked);
+  openColPick(picked, false);
   showStep();
   renderHere();
 }
@@ -500,7 +588,13 @@ function renderRows(d) {
     shown++;
     const tr = document.createElement("tr");
     tr.dataset.row = String(row.workflow_row);
-    tr.addEventListener("click", () => guard("预览这一行", () => loadPreview(row.workflow_row)));
+    const preview = () => guard("预览这一行", () => loadPreview(row.workflow_row));
+    tr.tabIndex = 0;
+    tr.setAttribute("aria-label", "预览第 " + (Number(row.workflow_row) + 1) + " 行");
+    tr.addEventListener("click", preview);
+    tr.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); preview(); }
+    });
     const num = document.createElement("th");
     num.className = "wf-rownum";
     num.textContent = String(row.workflow_row + 1);
@@ -535,9 +629,29 @@ function renderRows(d) {
  *  **提示词不在这里渲染**：/preview 渲染的是服务端**存好的**那一份，
  *  而规格 8.2 要的是「改完立刻预览」——还没保存的改动它压根看不见。
  *  所以这里只取值，渲染交给本地那条 renderHere。 */
+function updatePreviewControls(total = Number((lastDetail || {}).workflow?.total_rows) || 0) {
+  $("#wf-preview-index").max = String(total || 1);
+  $("#wf-preview-prev").disabled = curRow <= 0;
+  $("#wf-preview-next").disabled = total === 0 || curRow >= total - 1;
+}
+
+async function previewRow(rowIndex) {
+  const total = Number((lastDetail || {}).workflow?.total_rows) || 0;
+  if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= total) {
+    say("请输入 1 到 " + total + " 之间的数据行号。");
+    return;
+  }
+  await guard("读取行预览", () => loadPreview(rowIndex));
+}
+
 async function loadPreview(rowIndex) {
+  const view = currentView();
+  const seq = ++previewVersion;
   const d = await api("GET", `/api/workflows/${wfId}/preview?row=${rowIndex}`);
+  if (!isCurrentView(view) || seq !== previewVersion) return;
   curRow = rowIndex;
+  $("#wf-preview-index").value = String(rowIndex + 1);
+  updatePreviewControls();
   $("#wf-preview-row").textContent = rowIndex + 1;
   previewValues = (d.values || {})[wfSheet] || {};
   for (const tr of $("#wf-body").children) {
@@ -698,9 +812,13 @@ function renderTaskTable(d) {
 
 /** 只读的任务详情：需求说明 / 当前步骤 / 结果 / 失败原因 / 产物 / 时间线。 */
 async function showTaskDetail(taskId) {
+  taskDetailId = taskId;
+  const view = currentView();
+  const seq = ++taskVersion;
   const host = $("#wf-task-detail");
   if (!host) return;
   const d = await api("GET", `/api/tasks/${taskId}`);
+  if (!isCurrentView(view) || seq !== taskVersion) return;
   const t = d.task || {};
   taskDetailId = taskId;
   host.hidden = false;
@@ -709,7 +827,7 @@ async function showTaskDetail(taskId) {
   close.type = "button";
   close.className = "secondary";
   close.textContent = "收起";
-  close.onclick = () => { host.hidden = true; taskDetailId = null; };
+  close.onclick = () => { host.hidden = true; taskDetailId = null; taskVersion += 1; };
   host.appendChild(close);
   const h = document.createElement("h4");
   h.textContent = t.title || ("任务 #" + taskId);
@@ -794,26 +912,20 @@ function setTaskView(on) {
  */
 async function refreshLive() {
   if (wfId == null) return;
+  const view = currentView();
+  if (activePoll && isCurrentView(activePoll)) return;
+  activePoll = view;
   try {
-    const d = await api("GET", `/api/workflows/${wfId}`);
+    const d = await api("GET", `/api/workflows/${view.id}`);
+    if (!isCurrentView(view)) return;
     lastDetail = d;
-    const wf = d.workflow || {};
-    const prog = $("#wf-progress-text");
-    if (prog) {
-      prog.textContent = `${Number(wf.cursor) || 0} / ${Number(wf.total_rows) || 0}`
-        + (wf.abort_requested ? " · 已请求中止" : "");
-    }
-    const skips = skipSet(d);
-    const failed = (d.rows || []).filter((r) => r && r.id && isFailedRow(r, skips)).length;
-    const fb = $("#wf-failed");
-    if (fb) {
-      fb.textContent = failed > 0 ? `失败 ${failed} 行` : "没有失败行";
-      fb.className = failed > 0 ? "who wf-failed is-bad" : "who";
-    }
+    renderLiveDetail(d);
     renderTaskTable(d);
     if (taskDetailId) await showTaskDetail(taskDetailId);
   } catch (e) {
-    // 轮询失败不弹提示条：它每 10 秒一次，弹一次就刷屏。
+    // Background refresh keeps the last successful display on transient errors.
+  } finally {
+    if (activePoll === view) activePoll = null;
   }
 }
 
@@ -829,6 +941,7 @@ function stopPolling() {
 /* ---------------------------------------------------------------- 动作 */
 
 async function saveMapping() {
+  const view = currentView();
   await api("POST", "/api/workflows", {
     workflow_id: wfId,
     prompt_template: $("#wf-template").value,
@@ -837,12 +950,13 @@ async function saveMapping() {
     // result.xlsx——一个后端不读的勾选框比没有这个框更危险。
     writeback: $("#wf-writeback").checked,
   });
-  await openDetail(wfId);
+  if (isCurrentView(view)) await openDetail(view.id);
 }
 
 async function control(action) {
+  const view = currentView();
   await api("POST", `/api/workflows/${wfId}/${action}`);
-  await openDetail(wfId);
+  if (isCurrentView(view)) await openDetail(view.id);
 }
 
 /* 下载结果表走 fetch + blob，**不是**让 <a> 直接导航过去。
@@ -953,13 +1067,23 @@ for (const f of OUTPUT_FIELDS) {
   $("#wf-field").appendChild(o);
 }
 
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("#wf-colpick").hidden) { e.preventDefault(); closeColPick(); }
+});
+$("#wf-preview-prev").addEventListener("click", () => previewRow(curRow - 1));
+$("#wf-preview-next").addEventListener("click", () => previewRow(curRow + 1));
+$("#wf-preview-go").addEventListener("click", () => previewRow(Number($("#wf-preview-index").value) - 1));
+$("#wf-preview-index").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); previewRow(Number(e.target.value) - 1); }
+});
+$("#wf-retry").addEventListener("click", () => guard("重新读取", () => wfId == null ? loadList() : openDetail(wfId)));
 $("#wf-back").addEventListener("click", () => guard("返回列表", loadList));
 $("#wf-prev").addEventListener("click", () => gotoStep(stepNow - 1));
 $("#wf-next").addEventListener("click", () => gotoStep(stepNow + 1));
-$("#wf-save").addEventListener("click", () => guard("保存映射", saveMapping));
-$("#wf-start").addEventListener("click", () => guard("开始", () => control("start")));
-$("#wf-pause").addEventListener("click", () => guard("暂停", () => control("pause")));
-$("#wf-resume").addEventListener("click", () => guard("继续", () => control("resume")));
+$("#wf-save").addEventListener("click", () => runAction($("#wf-save"), "保存映射", saveMapping));
+$("#wf-start").addEventListener("click", () => runAction($("#wf-start"), "开始", () => control("start")));
+$("#wf-pause").addEventListener("click", () => runAction($("#wf-pause"), "暂停", () => control("pause")));
+$("#wf-resume").addEventListener("click", () => runAction($("#wf-resume"), "继续", () => control("resume")));
 /* 切筛选只是重绘：不该打接口，更不该顺手改任何一行任务的状态。 */
 $("#wf-only-failed").addEventListener("change", () => {
   if (lastDetail) renderRows(lastDetail);
@@ -1016,22 +1140,27 @@ $("#wf-abort").addEventListener("click", () => {
 });
 
 $("#wf-upload").addEventListener("click", async () => {
+  if ($("#wf-upload").disabled) return;
   const f = $("#wf-file").files[0];
   if (!f) { say("先选一个 xlsx 表格。"); return; }
+  if (!f.name.toLowerCase().endsWith(".xlsx")) { say("请选择 .xlsx 格式的表格。"); return; }
   $("#wf-upload-state").textContent = "上传中…";
   // FormData 自己带 boundary，**不能**手写 Content-Type，
   // 否则浏览器不会补 boundary，服务端那边 multipart 解析直接失败。
   const fd = new FormData();
   fd.append("file", f);
-  await guard("上传表格", async () => {
+  const result = await runAction($("#wf-upload"), "上传表格", async () => {
     const r = await fetch(apiBase() + "/api/workflows/upload",
                            { method: "POST", headers: authHeaders(), body: fd });
-    if (!r.ok) throw await errFrom(r);
+    if (!r.ok) { $("#wf-upload-state").textContent = "上传失败，可以重新选择表格后再试。"; throw await errFrom(r); }
     const d = await r.json();
     $("#wf-upload-state").textContent =
       `${f.name} 共 ${d.row_count} 行，去配列映射和模板再开始`;
     await loadList();
   });
+  if (result === null && $("#wf-upload-state").textContent === "上传中…") {
+    $("#wf-upload-state").textContent = "上传失败，请重试。";
+  }
 });
 
 boot();

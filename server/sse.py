@@ -142,9 +142,8 @@ async def stream(task_id: int, request, last_seen: int = 0) -> AsyncIterator[str
     等待用 `wait_for(wake.wait(), POLL_SECONDS)`：总线叫醒就立刻醒，没人叫
     就三秒后自己醒一次再扫。两个条件合成一个等待，不需要 select 或定时器。
 
-    先 clear 再 wait 不会漏：clear 与上一个扫描之间没有 await 点，而
-    notify() 是从别的线程把 `set` 排进事件循环的，真正执行必然发生在下一次
-    await 之后——也就是 clear 之后。
+    扫描前清除唤醒标记：发送帧期间可能让出事件循环，期间收到的通知
+    必须保留。满批立即补下一批，追平后才等待。
     """
     cursor = max(0, int(last_seen or 0))
     key, wake = bus.subscribe()
@@ -153,6 +152,7 @@ async def stream(task_id: int, request, last_seen: int = 0) -> AsyncIterator[str
         while True:
             if await request.is_disconnected():
                 return
+            wake.clear()
             rows = store.list_events(task_id, after_id=cursor, limit=BURST)
             for row in rows:
                 cid = int(row["id"])
@@ -165,7 +165,10 @@ async def stream(task_id: int, request, last_seen: int = 0) -> AsyncIterator[str
                 if now - last_beat >= KEEPALIVE_SECONDS:
                     last_beat = now
                     yield KEEPALIVE
-            wake.clear()
+            if len(rows) >= BURST:
+                # Drain persisted backlog without paying a poll interval per batch.
+                await asyncio.sleep(0)
+                continue
             try:
                 await asyncio.wait_for(wake.wait(), timeout=POLL_SECONDS)
             except TimeoutError:

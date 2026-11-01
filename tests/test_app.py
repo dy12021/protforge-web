@@ -78,14 +78,14 @@ def _serve(application):
 @pytest.fixture
 def public():
     with _serve(svc.create_public_app()) as base:
-        with httpx.Client(base_url=base, timeout=30) as c:
+        with httpx.Client(base_url=base, timeout=30, trust_env=False) as c:
             yield c
 
 
 @pytest.fixture
 def internal():
     with _serve(svc.create_internal_app()) as base:
-        with httpx.Client(base_url=base, timeout=30) as c:
+        with httpx.Client(base_url=base, timeout=30, trust_env=False) as c:
             yield c
 
 

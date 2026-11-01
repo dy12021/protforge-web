@@ -13,7 +13,7 @@
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="user-console">
   <header class="toolbar">
     <h1>自动化计算平台</h1>
     <span class="toolbar-gap"></span>
@@ -22,6 +22,17 @@
     <button id="new-btn" class="primary" type="button">＋ 提交计算任务</button>
     <button id="logout-btn" class="secondary" type="button">退出</button>
   </header>
+
+  <section class="workspace-head" aria-label="工作区">
+    <div>
+      <h2>计算工作台</h2>
+      <p>提交计算、跟踪进度，在一个地方管理结果。</p>
+    </div>
+    <div class="sync-controls">
+      <div class="sync-copy"><span id="sync-state" role="status">正在连接…</span><time id="last-sync"></time></div>
+      <button id="refresh-btn" class="secondary" type="button">刷新</button>
+    </div>
+  </section>
 
   <!-- 筛选条：视图范围（全部 / 普通任务 / 工作流）+ 状态 + 关键字。
        工作流不再是另一个页面，所以「看哪一类」是**看板内的一个开关**，
@@ -35,8 +46,9 @@
     <input id="q" type="search" placeholder="搜索标题、需求、当前步骤或表格名" autocomplete="off" aria-label="搜索">
     <select id="status-filter" aria-label="状态筛选"><option value="">全部状态</option></select>
     <label class="toggle"><input id="only-active" type="checkbox"> 只看在跑的</label>
+    <button id="filter-reset" class="secondary" type="button" disabled>重置筛选</button>
     <span class="toolbar-gap"></span>
-    <span id="filter-note" class="who"></span>
+    <span id="filter-note" class="who" role="status"></span>
   </div>
 
   <!-- 状态面板：平台整体的量。**默认只读**——它是给人看现状的，不是给人填的。
@@ -49,12 +61,25 @@
     <div class="sp-metrics" id="sp-metrics"></div>
     <!-- 系统指标（CPU / 内存 / GPU / 磁盘）只对管理员渲染。
          普通用户**根本不发那个请求**——不是发完再藏起来。 -->
-    <div class="sp-system" id="sp-system" hidden></div>
+    <details class="system-details" hidden>
+      <summary>系统资源</summary>
+      <div class="sp-system" id="sp-system" hidden></div>
+    </details>
   </section>
 
   <!-- 只读提示条：服务没起来 / 登录过期这类全局问题落在这里，
        不能塞进抽屉或某个卡片里——抽屉关着的时候用户看不见。 -->
-  <div id="board-msg" class="board-msg" hidden></div>
+  <div id="board-msg" class="board-msg" role="status" hidden></div>
+
+  <section class="empty-state" id="workspace-empty" hidden aria-labelledby="empty-title">
+    <span class="empty-symbol" aria-hidden="true">＋</span>
+    <h2 id="empty-title">从第一个计算任务开始</h2>
+    <p id="empty-copy">写下计算目标，或上传表格逐行处理，进度和结果都会出现在这里。</p>
+    <div class="empty-actions">
+      <button id="empty-create" class="primary" type="button">提交计算任务</button>
+      <button id="empty-reset" class="secondary" type="button" hidden>清除筛选</button>
+    </div>
+  </section>
 
   <!-- 工作流区：工作流以**主卡片**的形式出现，展开后是行列表。
        以前它是另一个页面（workflow.html），现在与计算任务同处一块看板。 -->
@@ -68,12 +93,12 @@
   </section>
 
   <!-- 计算任务看板：五站主链 + 失败。 -->
-  <main class="board" id="board"></main>
+  <main class="board" id="board" aria-label="计算任务看板" aria-busy="true"></main>
 
   <!-- 提交计算任务 / 新建工作流 / 修改工作流：**同一个对话框**。
        两种模式按字段切换，不是另开一个界面。
        <dialog> 原生自带 Esc 关闭与焦点约束。 -->
-  <dialog class="composer" id="composer">
+  <dialog class="composer" id="composer" aria-labelledby="c-title-h">
     <form class="composer-inner" id="composer-form" method="dialog">
       <h2 class="composer-title" id="c-title-h">提交计算任务</h2>
       <div class="seg seg-mode" id="mode-switch" role="group" aria-label="提交方式">
@@ -125,6 +150,7 @@
         </label>
       </div>
 
+      <p id="c-error" class="login-error" role="alert" hidden></p>
       <div class="composer-actions">
         <button class="secondary" type="button" id="c-cancel">算了</button>
         <button class="primary" type="submit" id="c-save">提交</button>
@@ -139,21 +165,25 @@
   <!-- 工具市场。**直接调工具**：选一个、按契约填参数、平台就跑它——
        不经 agent（确定性的活别交给不确定的环节：agent 可能自己写替代脚本，
        2026-10-24 那条跑了 4 小时 42 分的 O(n²) 碰撞消解就是这么来的）。 -->
-  <dialog class="composer market" id="market">
+  <dialog class="composer market" id="market" aria-labelledby="mt-title">
     <div class="composer-inner">
-      <h2 class="composer-title" id="mt-title">工具市场</h2>
+      <div class="dialog-heading">
+        <h2 class="composer-title" id="mt-title">工具市场</h2>
+        <button class="secondary" id="market-close" type="button" aria-label="关闭工具市场">关闭</button>
+      </div>
       <p class="composer-lead">
         按契约填参数，平台直接调用那个入口脚本。<b>不经 agent</b>——
         跑出来的就是那个工具的结果，不会自己发明别的算法。
       </p>
       <div class="market-bar">
         <input id="mt-search" class="market-search" type="search"
-               placeholder="搜工具名或分类">
+               placeholder="搜工具名或分类" aria-label="搜索工具">
         <span id="mt-cats" class="market-cats"></span>
       </div>
       <div class="market-grid" id="mt-grid"></div>
       <p class="zone-empty" id="mt-empty" hidden>没有匹配的工具。</p>
-      <p class="market-msg" id="mt-msg" hidden></p>
+      <p class="market-msg" id="mt-msg" role="status" hidden></p>
+      <button class="secondary" id="mt-retry" type="button" hidden>重新加载工具</button>
 
       <div class="market-detail" id="mt-detail" hidden>
         <div class="market-detail-head">
@@ -197,7 +227,7 @@
     </div>
   </dialog>
 
-  <dialog class="share" id="share">
+  <dialog class="share" id="share" aria-labelledby="sh-title">
     <div class="share-inner">
       <h2 class="share-title" id="sh-title">共享工作流</h2>
       <p class="share-lead" id="sh-lead"></p>
@@ -211,7 +241,7 @@
   <!-- 打回 / 续跑。**要一句话的输入**，所以另开一张表而不是套那张两步确认表
      （确认表里没有输入框，塞进去就变成「确认之前先在静态文案里打字」）。
      「续跑」是同一个任务接着干：上一轮的产物留在工作目录里，模型接着改。 -->
-  <dialog class="review" id="review">
+  <dialog class="review" id="review" aria-labelledby="rv-title">
     <div class="review-inner">
       <h2 class="review-title" id="rv-title">补充要求</h2>
       <p class="review-lead" id="rv-lead"></p>
@@ -229,9 +259,9 @@
 
   <!-- 登录。token 存 localStorage 并走 Authorization 头（不放 Cookie，
        浏览器不会自动附加自定义头，天然免 CSRF）。 -->
-  <dialog class="login" id="login">
+  <dialog class="login" id="login" aria-labelledby="login-title">
     <form class="login-inner" id="login-form" method="dialog">
-      <h2 class="login-title">自动化计算平台</h2>
+      <h2 class="login-title" id="login-title">自动化计算平台</h2>
       <p class="login-lead">用公司发的账号登录。</p>
       <label class="field">
         <span>账号</span>
@@ -241,7 +271,8 @@
         <span>密码</span>
         <input id="l-pass" required type="password" autocomplete="current-password">
       </label>
-      <p class="login-error" id="login-error" hidden></p>
+      <button class="password-toggle" id="password-toggle" type="button" aria-controls="l-pass" aria-pressed="false">显示密码</button>
+      <p class="login-error" id="login-error" role="alert" hidden></p>
       <div class="composer-actions">
         <button class="primary" type="submit" id="login-btn">登录</button>
       </div>
@@ -250,7 +281,7 @@
 
   <!-- 两步确认。中止计算任务、以及删除计算任务都走这张表。
        <dialog> 是复用节点，所以 app.js 里的收尾必须幂等并解绑监听。 -->
-  <dialog class="confirm" id="confirm">
+  <dialog class="confirm" id="confirm" aria-labelledby="confirm-title">
     <div class="confirm-inner">
       <h2 class="confirm-title" id="confirm-title"></h2>
       <p class="confirm-lead" id="confirm-lead"></p>
@@ -264,7 +295,7 @@
 
   <!-- 抽屉：点卡片开。**默认只读**——详情是给人读的，不是给人填的。
        每个区块标题右侧有小字「编辑」才进编辑态，存完回只读。 -->
-  <aside class="drawer" id="drawer" hidden>
+  <aside class="drawer" id="drawer" hidden role="region" aria-label="计算任务详情">
     <div class="drawer-inner">
       <div class="drawer-bar">
         <button class="drawer-icon" id="drawer-full" type="button"
