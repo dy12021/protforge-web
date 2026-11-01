@@ -422,6 +422,17 @@ function renderLiveDetail(d) {
     ? `下载全部产物包（${d.packages_count} 个 · ${fmtBytes(d.packages_bytes)}）`
     : "下载全部产物包";
 
+  // 批量重跑/续跑：**没有对应的行就不给入口**（点了必然是 422）。
+  // 行数是服务端算的——前端自己数会漏掉「用户跳过的行不算崩溃行」这条。
+  const bulk = d.bulk || {};
+  const br = $("#wf-bulk-retry");
+  const bc = $("#wf-bulk-continue");
+  br.hidden = !(bulk.retry_count > 0);
+  br.textContent = `批量重跑崩溃行（${bulk.retry_count || 0} 行）`;
+  bc.hidden = !(bulk.continue_count > 0);
+  bc.textContent = `批量续跑被否决行（${bulk.continue_count || 0} 行）`;
+  $("#wf-bulk-note").hidden = bc.hidden;
+
   // 动作按状态开关：跑完了再点开始没有意义，422/静默空转都不好看。
   // 「继续」只在 paused 可点——它在别的状态下要么 422 要么是空转，
   // 而缺了这颗按钮的话，用户点了暂停就在界面上再也回不去了。
@@ -1138,6 +1149,96 @@ $("#wf-abort").addEventListener("click", () => {
   abortArmed = false;
   guard("中止整批", () => control("abort"));
 });
+
+/* ---------------------------------------------------------------- 批量重跑/续跑
+ *
+ * 两颗按钮都**先给影响面、再让人确认**：
+ *
+ *   重跑（崩溃行）  = 从零重来。结果包与结论清掉，算力重烧一遍；
+ *                     工作目录里的文件留着，所以两次运行的产物会混在一起。
+ *   续跑（被否决行）= 带着上一轮接着干。产物留着，每一行的提示词里带上
+ *                     **它自己的**审核理由 + 人写的统一补充要求。
+ *
+ * 第一步只把影响面写进提示条、并把按钮变成「再点一下就…」；第二步才真的
+ * 发请求。跟中止整批同一套范式（不用原生确认框：样式不受控，一关输入就没了）。
+ */
+let bulkArmed = null;
+
+function bulkRowsLabel(rows) {
+  const nums = (rows || []).map((r) => r.row);
+  if (!nums.length) return "";
+  if (nums.length <= 8) return "第 " + nums.join("、") + " 行";
+  return "第 " + nums.slice(0, 5).join("、") + " … " + nums[nums.length - 1]
+    + " 行（共 " + nums.length + " 行）";
+}
+
+function bulkBtn(kind) {
+  return kind === "retry" ? $("#wf-bulk-retry") : $("#wf-bulk-continue");
+}
+
+function bulkRows(kind) {
+  const b = (lastDetail && lastDetail.bulk) || {};
+  return b[kind] || [];
+}
+
+function armBulk(kind) {
+  const rows = bulkRows(kind);
+  if (!rows.length) { say("没有符合条件的行。"); return; }
+  const btn = bulkBtn(kind);
+  const label = kind === "retry" ? "批量重跑崩溃行" : "批量续跑被否决行";
+  if (bulkArmed && bulkArmed.kind === kind) {
+    /* 第二下：确认。 */
+    clearTimeout(bulkArmed.timer);
+    bulkArmed = null;
+    btn.className = "secondary";
+    btn.textContent = label + "（" + rows.length + " 行）";
+    runBulk(kind, rows);
+    return;
+  }
+  const note = ($("#wf-bulk-note").value || "").trim();
+  let msg;
+  if (kind === "retry") {
+    msg = "将重跑 " + rows.length + " 行（" + bulkRowsLabel(rows) + "）："
+      + "每一行的结果包与结论会清掉，算力重新烧一遍；工作目录里的文件留着，"
+      + "所以两次运行的产物会混在一起。5 秒内再点一次确认。";
+  } else {
+    msg = "将续跑 " + rows.length + " 行（" + bulkRowsLabel(rows) + "）："
+      + "每一行会带上它自己的审核理由"
+      + (note ? "和你写的补充要求" : "") + " 再跑一遍，上一轮的产物保留。"
+      + "5 秒内再点一次确认。";
+  }
+  say(msg);
+  btn.className = "danger";
+  btn.textContent = "再点一下就"
+    + (kind === "retry" ? "重跑" : "续跑") + " " + rows.length + " 行";
+  bulkArmed = { kind, timer: setTimeout(() => {
+    bulkArmed = null;
+    btn.className = "secondary";
+    btn.textContent = label + "（" + rows.length + " 行）";
+  }, 5000) };
+}
+
+async function runBulk(kind, rows) {
+  const btn = bulkBtn(kind);
+  const label = kind === "retry" ? "批量重跑" : "批量续跑";
+  const path = kind === "retry" ? "retry-failed" : "continue-rejected";
+  const body = kind === "continue"
+    ? { note: ($("#wf-bulk-note").value || "").trim() } : {};
+  await runAction(btn, label, async () => {
+    const d = await api("POST", `/api/workflows/${wfId}/rows/${path}`, body);
+    let msg = label + "完成：" + d.count + " 行已重新排队。";
+    if (d.workflow_status === "paused") {
+      msg += "工作流当前是暂停状态，点「继续」之后它们才开始跑。";
+    } else if (d.workflow_reopened) {
+      msg += "工作流已重新开始，跑完最后一行会自动结束。";
+    }
+    say(msg);
+    await openDetail(wfId);
+  });
+}
+
+$("#wf-bulk-retry").addEventListener("click", () => armBulk("retry"));
+$("#wf-bulk-continue").addEventListener("click", () => armBulk("continue"));
 
 $("#wf-upload").addEventListener("click", async () => {
   if ($("#wf-upload").disabled) return;

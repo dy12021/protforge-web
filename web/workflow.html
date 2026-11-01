@@ -132,6 +132,20 @@
       <button id="wf-packages" class="secondary" type="button" hidden>下载全部产物包</button>
     </div>
 
+    <!-- 批量重跑/续跑。**两颗按钮都先给影响面、再让人确认**：
+         批量重跑清掉的是这一批的结果包，还要重烧一遍算力，误点的代价很大。
+         行数是服务端算的——「用户跳过的行」在库里也是 failed，但用户的意思
+         是「这行别跑」，把它算进崩溃行去重跑等于推翻用户的决定。 -->
+    <div class="toolbar">
+      <span class="who">批量处理</span>
+      <button id="wf-bulk-retry" class="secondary" type="button" hidden>批量重跑崩溃行</button>
+      <button id="wf-bulk-continue" class="secondary" type="button" hidden>批量续跑被否决行</button>
+      <!-- 续跑要求只有一个输入框：它套给每一行。每一行还会自动带上
+           **它自己的**审核理由（一批被否决的行问题各不相同）。 -->
+      <input id="wf-bulk-note" class="wf-bulk-note" type="text" maxlength="2000"
+             placeholder="续跑时的统一补充要求（可选，会套给每一行）" hidden>
+    </div>
+
     <!-- 表格预览：点任意一行，下面显示那一行渲染出来的提示词。
          表头粘顶、行号列、当前行高亮、状态色点的样式都挂在 .wf-table 上。
          点表头选列角色也发生在这张表上。 -->

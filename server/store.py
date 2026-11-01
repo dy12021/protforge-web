@@ -1681,6 +1681,43 @@ def workflow_has_running_rows(workflow_id: int) -> bool:
         c.close()
 
 
+def workflow_bulk_targets(workflow_id: int, kind: str) -> list[dict]:
+    """批量重跑/续跑的目标行。
+
+    ``kind='retry'``    → **崩溃行**：``status='failed'``
+    ``kind='continue'`` → **被否决行**：``status='done'`` 且
+    ``acceptance='rejected'``（机器审核判不通过 / 人工打回）
+
+    两条路**互不重叠**：崩溃行没有可带的东西（重跑是从零重来），
+    被否决行有产物也有审核理由（续跑才是对的）。混在一起处理的结果是
+    给崩溃行「续跑」把半成品当上下文带进去，或给被否决行「重跑」把
+    审核理由清掉、白跑一遍。
+
+    **「用户跳过的行」不算崩溃行**：跳过在库里也是 failed（补偿任务
+    建出来就是终态，VALID_STATUSES 里没有 skipped），但用户的本意是
+    「这行别跑」——把它算进崩溃行去重跑，等于推翻用户的决定。
+    """
+    if kind not in ("retry", "continue"):
+        raise Invalid("未知的批量操作")
+    c = db.connect()
+    try:
+        if kind == "retry":
+            sql = ("SELECT * FROM tasks WHERE workflow_id = ?"
+                   " AND status = 'failed' ORDER BY workflow_row")
+        else:
+            sql = ("SELECT * FROM tasks WHERE workflow_id = ?"
+                   " AND status = 'done' AND acceptance = 'rejected'"
+                   " ORDER BY workflow_row")
+        rows = [dict(r) for r in c.execute(sql, (int(workflow_id),))]
+    finally:
+        c.close()
+    if kind == "retry":
+        skips = {int(x) for x in list_workflow_skips(workflow_id)}
+        rows = [r for r in rows
+                if int(r.get("workflow_row") or 0) not in skips]
+    return rows
+
+
 def workflow_queued_rows(workflow_id: int) -> list[dict]:
     """闸门④：要认领的 queued 行任务。管理员重跑产生的就在这里。"""
     c = db.connect()

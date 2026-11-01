@@ -334,6 +334,118 @@ def _purge_reflection_files(task_id: int) -> None:
                       reflection.proposals_dir() / name)
 
 
+# ---------------------------------------------------------------- 批量重跑/续跑
+#
+# 两条路各管各的：
+#
+#   重跑（崩溃行）  = 从零重来。清结果包、清结论、清收口标记，算力重烧。
+#   续跑（被否决行）= 带着上一轮接着干。产物留着，提示词里带上它自己的
+#                     审核理由 + 人写的补充要求。
+#
+# **为什么必须分开**：崩溃行没有可带的东西（没产物、只有一句错误），
+# 被否决行有产物也有审核理由。混着做，给崩溃行「续跑」等于把半成品
+# 当上下文带进去；给被否决行「重跑」等于把审核理由清掉、白跑一遍。
+
+
+def _bulk_retry_row(task_id: int, actor: str = "human") -> None:
+    """把一行放回队列重跑。
+
+    语义与单任务「重跑」**完全一致**，所以抽成一处：两处各写一遍，
+    迟早有一处漏掉某个标记，而漏掉的后果是静默的——新一轮的结果
+    写不回结果表（archived 没清），或者第二轮的 finish 被 422 拒掉。
+
+    产物文件**不删**：产物表按 (task_id, path) 去重，新一轮的 discover
+    会把同一个目录更新回来。代价是两次运行的产物混在一起——
+    所以批量重跑必须先给影响面、再让人确认。
+    """
+    store.update_task(task_id, done_at=None, step="", error="",
+                      package_path="", summary="")
+    store.clear_finished(task_id)
+    store.update_task(task_id, workflow_archived=0)
+    store.set_status(task_id, "queued", actor=actor, message="批量重跑这一遍")
+
+
+def _bulk_continue_note(task: dict, note: str) -> str:
+    """批量续跑时这一行的补充要求 = **它自己的**审核理由 + 人的统一要求。
+
+    **每一行带自己的理由**：一批被否决的行问题各不相同（有的缺表位、
+    有的产物不对），统一一句话套给二十行等于什么都没说。
+    """
+    parts: list[str] = []
+    reason = ""
+    try:
+        latest = store.latest_task_review(int(task["id"]))
+        reason = str((latest or {}).get("reason") or "").strip()
+    except Exception:                                  # noqa: BLE001
+        reason = ""
+    if reason:
+        parts.append("上一轮没通过验收，理由如下，请照这个改：\n"
+                     + reason[:1500])
+    n = (note or "").strip()
+    if n:
+        parts.append(n)
+    if not parts:
+        parts.append("按上一轮的验收意见修正后重做这一版。")
+    return "\n\n".join(parts)
+
+
+def _reopen_workflow(workflow_id: int) -> bool:
+    """把 finished 的工作流改回 running，好让重投的行能被放行。
+
+    调度器的闸门①是「工作流不是 running 就不放行」——finished 的工作流
+    一行都不会跑，重投的行会一直躺在队列里。
+
+    **只改 finished**：paused 是用户主动停的，不能替他决定继续跑；
+    draft 还没开始。改完之后调度器跑完最后一行会自己再置回 finished。
+
+    **顺序很重要**：先把行排进队列、再改状态。反过来的话，中间那一瞬
+    调度器看到「running 但没有 queued 行、cursor 已经到底」，会直接把
+    工作流判成 finished —— 然后刚排进去的行永远不会被认领。
+    """
+    wf = store.get_workflow(workflow_id)
+    if str(wf.get("status")) != "finished":
+        return False
+    store.update_workflow(workflow_id, status="running", abort_requested=0)
+    return True
+
+
+def _bulk_plan(workflow_id: int) -> dict:
+    """批量重跑/续跑的**影响面**：会动哪些行、各是什么理由。
+
+    **两个数都要给**：一个都没有的时候界面不该给按钮（点了必然 422）；
+    有的时候要把行号和理由写出来——用户要知道自己动的到底是哪几行。
+    """
+    def pack(rows: list[dict], with_reason: bool) -> list[dict]:
+        out = []
+        for r in rows:
+            item = {
+                "task_id": int(r["id"]),
+                "row": int(r.get("workflow_row") or 0) + 1,
+                "title": r.get("title") or "",
+                "error": (r.get("error") or "").strip()[:400],
+                "summary": (r.get("summary") or "").strip()[:400],
+            }
+            if with_reason:
+                reason = ""
+                try:
+                    latest = store.latest_task_review(int(r["id"]))
+                    reason = str((latest or {}).get("reason") or "").strip()
+                except Exception:                      # noqa: BLE001
+                    reason = ""
+                item["reason"] = reason[:600]
+            out.append(item)
+        return out
+
+    retry_rows = store.workflow_bulk_targets(workflow_id, "retry")
+    cont_rows = store.workflow_bulk_targets(workflow_id, "continue")
+    return {
+        "retry": pack(retry_rows, False),
+        "continue": pack(cont_rows, True),
+        "retry_count": len(retry_rows),
+        "continue_count": len(cont_rows),
+    }
+
+
 # ---------------------------------------------------------------- 工作流
 
 # 控制动作白名单。**必须显式校验，不能靠类型标注**：action 是路径参数（用户可控
@@ -793,6 +905,15 @@ class WorkflowAcceptIn(BaseModel):
 
 class SkipIn(BaseModel):
     reason: str = Field(default="", max_length=400)
+
+
+class BulkRowsIn(BaseModel):
+    """批量重跑/续跑。
+
+    ``note`` 是**续跑**时的统一补充要求，会套给每一行（每一行还会带上
+    它自己的审核理由）。重跑不用它——重跑是从零重来，不带上一轮的东西。
+    """
+    note: str = Field(default="", max_length=8000)
 
 
 # ---------------------------------------------------------------- 内部令牌
@@ -1518,7 +1639,11 @@ def create_public_app() -> FastAPI:
                 # **产物包件数与总大小**：前端据此显示「N 个 · X MB」并决定
                 # 要不要给下载入口。少了它，用户只能先点进去才知道有没有东西可下。
                 "packages_count": len(pkgs),
-                "packages_bytes": sum(p.stat().st_size for _, p in pkgs)}
+                "packages_bytes": sum(p.stat().st_size for _, p in pkgs),
+                # 批量重跑/续跑的影响面：前端据此给按钮、显示行数，
+                # 并把「会动哪几行」写进确认提示。**服务端算的**——
+                # 前端自己数一遍会漏掉「用户跳过的行不算崩溃行」这条。
+                "bulk": _bulk_plan(workflow_id)}
 
     @app.post("/api/workflows/{workflow_id}/accept")
     def accept_workflow_rows(workflow_id: int, body: WorkflowAcceptIn,
@@ -1547,6 +1672,69 @@ def create_public_app() -> FastAPI:
         sse.notify()
         return {"accepted": [int(r["id"]) for r in pending],
                 "count": len(pending)}
+
+    @app.get("/api/workflows/{workflow_id}/bulk-plan")
+    def bulk_plan(workflow_id: int, user=Depends(auth.current_user)):
+        """批量重跑/续跑的**影响面**：先看会动哪些行，再决定动不动。
+
+        **纯读**，所以管理员对别人的工作流也看得见（值班台要看得见
+        「这批有二十行崩了」）——但真正的执行是控制类端点，只认 owner。
+        """
+        is_admin = user["role"] == "admin"
+        store.get_workflow_for(workflow_id, user["id"], is_admin=is_admin,
+                                allow_admin=True)
+        return {"plan": _bulk_plan(workflow_id),
+                "workflow_status": store.get_workflow(workflow_id).get("status")}
+
+    @app.post("/api/workflows/{workflow_id}/rows/retry-failed")
+    def bulk_retry_failed(workflow_id: int, body: BulkRowsIn,
+                          user=Depends(auth.current_user)):
+        """批量重跑**崩溃的行**。
+
+        **破坏性**：每一行的结果包与结论会清掉，算力重新烧一遍；
+        工作目录里的文件留着，所以两次运行的产物会混在一起。
+        界面必须先给影响面、再让人确认。
+
+        **控制类端点**：管理员对别人的工作流一律 404（跟 start / pause /
+        resume / abort 同一口径）——一次误点就是几十小时的算力。
+        """
+        store.get_workflow_for(workflow_id, user["id"])
+        rows = store.workflow_bulk_targets(workflow_id, "retry")
+        if not rows:
+            return {"retried": [], "count": 0, "workflow_reopened": False,
+                    "workflow_status": store.get_workflow(workflow_id).get("status")}
+        for row in rows:
+            _bulk_retry_row(int(row["id"]))
+        reopened = _reopen_workflow(workflow_id)
+        sse.notify()
+        return {"retried": [int(r["id"]) for r in rows], "count": len(rows),
+                "workflow_reopened": reopened,
+                "workflow_status": store.get_workflow(workflow_id).get("status")}
+
+    @app.post("/api/workflows/{workflow_id}/rows/continue-rejected")
+    def bulk_continue_rejected(workflow_id: int, body: BulkRowsIn,
+                               user=Depends(auth.current_user)):
+        """批量续跑**被否决的行**（机器审核判不通过的那些）。
+
+        每一行的新一轮提示词里会自动带上**它自己的**审核理由，再加上
+        人写的统一补充要求。上一轮的产物保留。
+        """
+        store.get_workflow_for(workflow_id, user["id"])
+        rows = store.workflow_bulk_targets(workflow_id, "continue")
+        if not rows:
+            return {"continued": [], "count": 0, "workflow_reopened": False,
+                    "workflow_status": store.get_workflow(workflow_id).get("status")}
+        for row in rows:
+            note = _bulk_continue_note(row, body.note)
+            try:
+                review.continue_task(int(row["id"]), note, actor="human")
+            except review.ReviewError as exc:
+                raise PreciseHTTPException(422, str(exc)) from exc
+        reopened = _reopen_workflow(workflow_id)
+        sse.notify()
+        return {"continued": [int(r["id"]) for r in rows], "count": len(rows),
+                "workflow_reopened": reopened,
+                "workflow_status": store.get_workflow(workflow_id).get("status")}
 
     @app.get("/api/workflows/{workflow_id}/preview")
     def preview_workflow(workflow_id: int,

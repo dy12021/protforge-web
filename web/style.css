@@ -1323,6 +1323,10 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .system-details summary { color:var(--fg-dim); font-size:.78rem; cursor:pointer; min-height:28px; }
 
 #wf-preview-index { width:5rem; min-width:0; padding:.4rem; border:1px solid var(--border); border-radius:var(--r-sm); background:var(--card); }
+/* 批量续跑的「统一补充要求」输入框。**只有一颗**：它套给每一行，
+   每一行还会自动带上自己的审核理由。 */
+.wf-bulk-note { flex:1 1 18rem; min-width:0; padding:.4rem .5rem; font:inherit; font-size:.82rem; border:1px solid var(--border); border-radius:var(--r-sm); background:var(--card); color:var(--fg); }
+.wf-bulk-note:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
 @media (max-width:759px) { .workflow-main .toolbar > * { order:0; } }
 
 .wf-field-line[hidden] { display:none; }
