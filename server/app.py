@@ -47,6 +47,7 @@ import db
 import dispatcher
 import guards
 import janitor
+import ledger
 import reflection
 import review
 import skills_index
@@ -1845,6 +1846,32 @@ def create_public_app() -> FastAPI:
                             media_type=("application/vnd.openxmlformats-"
                                         "officedocument.spreadsheetml.sheet"))
 
+    @app.get("/api/workflows/{workflow_id}/ledger.xlsx")
+    def download_ledger(workflow_id: int, user=Depends(auth.current_user)):
+        """下载**运行台账**：这一批每一行的状态、验收、耗时、产物数、审核理由。
+
+        与结果表**行号对齐**——同一个「第 42 行」在两张表里说的是同一件事。
+
+        结果表是科学结果（这个靶标算出了什么）；台账是运行情况
+        （哪行崩了、为什么、跑了多久、审没审）。两者一起给才完整。
+        """
+        is_admin = user["role"] == "admin"
+        store.get_workflow_for(workflow_id, user["id"], is_admin=is_admin,
+                                allow_admin=True)
+        rows = ledger.build_rows(workflow_id)
+        with _temporary_download_dir() as tmpdir:
+            # **先写字节再落盘**：openpyxl 存盘失败时它自己那个 ZipFile 不会关闭，
+            # 文件被锁着，Windows 上删不掉，而临时目录的清理用的是
+            # rmtree(ignore_errors=True)——那个失败会被静默吞掉，
+            # 临时目录就留在磁盘上了。
+            path = tmpdir / "运行台账.xlsx"
+            path.write_bytes(ledger.build_xlsx_bytes(rows))
+            return _TemporaryDownloadResponse(
+                path, filename="运行台账.xlsx",
+                media_type=("application/vnd.openxmlformats-"
+                            "officedocument.spreadsheetml.sheet"),
+                tempdir=tmpdir)
+
     @app.get("/api/workflows/{workflow_id}/packages")
     def download_workflow_packages(workflow_id: int,
                                     user=Depends(auth.current_user)):
@@ -1872,7 +1899,7 @@ def create_public_app() -> FastAPI:
                 raise PreciseHTTPException(
                     507, f"临时磁盘装不下这一批的产物包（需要 {total // 1048576} MB，"
                          f"只剩 {free // 1048576} MB）。可以先只下几行的，或把临时目录挪到数据盘。")
-            out_zip = tmpdir / f"{_zip_entry_name(wf['name'])}-产物包.zip"
+            out_zip = tmpdir / f"{_zip_entry_name(wf['name'])}-交付包.zip"
             # 每行的文件名：第 N 行 + 源表里的关键列值（编号），免得下载完
             # 一堆「第1行.zip」「第2行.zip」还得自己对着表认。
             import workflow as wfmod
@@ -1887,23 +1914,34 @@ def create_public_app() -> FastAPI:
                 (c for c in store.list_workflow_columns(workflow_id)
                  if c["role"] in ("input", "context") and c.get("slot")),
                 key=lambda c: int(c["col_index"]))
+            # **逐行的编号与靶标**：一次读表给全批共用。
+            # 原来这里逐行调 workflow.row_values（每行开一次工作簿），
+            # 61 行就是 61 次 openpyxl 读盘。
+            labels = ledger.source_labels(workflow_id)
+            # **交付说明 / 逐行索引 / 运行台账 / 机器审核结论**：
+            # 结果表只是科学结果。交付给别人时还要说清「哪行崩了、为什么、
+            # 整批跑成什么样、审过没审过」——这四份文件就是那部分。
+            ledger_rows = ledger.build_rows(workflow_id)
             with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_STORED,
                                  allowZip64=True) as zf:
+                zf.writestr("00-交付说明.md",
+                            ledger.build_readme(workflow_id, ledger_rows))
+                # UTF-8 带 BOM：Excel 双击直接开不乱码。
+                zf.writestr("01-逐行索引.csv",
+                            "\ufeff" + ledger.build_index_csv(ledger_rows))
+                zf.writestr("02-运行台账.xlsx",
+                            ledger.build_xlsx_bytes(ledger_rows))
+                zf.writestr("03-机器审核结论.md",
+                            ledger.build_review_conclusions(workflow_id,
+                                                           ledger_rows))
                 for row, path in items:
                     idx = int(row.get("workflow_row") or 0)
-                    values: dict = {}
-                    try:
-                        values = wfmod.row_values(source, view, idx)
-                    except Exception:       # noqa: BLE001 - 读不到就只用行号
-                        values = {}
-                    key = str(values.get(key_col, "") or "").strip()
+                    lab = labels.get(idx) or {"key": "", "slots": []}
                     name = f"第{idx + 1}行"
-                    if key:
-                        name += "_" + _zip_entry_name(key)
-                    for c in slot_cols:
-                        v = str(values.get(int(c["col_index"]), "") or "").strip()
-                        if v:
-                            name += "_" + _zip_entry_name(v)
+                    if lab["key"]:
+                        name += "_" + _zip_entry_name(lab["key"])
+                    for v in lab["slots"]:
+                        name += "_" + _zip_entry_name(v)
                     zf.write(path, arcname=name[:80] + ".zip")
             # 传完就删：临时目录留着就是垃圾（几十 GB 的包放在那里没人会知道）。
             return _TemporaryDownloadResponse(

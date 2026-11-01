@@ -163,8 +163,18 @@ def wf_with_packages(owner, tmp_path):
 
 # ---------------------------------------------------------------- 围栏
 
+#: 交付包里除各行产物包之外，固定带的四份说明。
+DELIVERY_DOCS = ["00-交付说明.md", "01-逐行索引.csv",
+                 "02-运行台账.xlsx", "03-机器审核结论.md"]
+
+
 def test_bulk_download_contains_one_zip_per_row(client, owner, wf_with_packages):
-    """每行一个子文件，文件名带行号与源表里的编号。"""
+    """每行一个子文件，文件名带行号与源表里的编号。
+
+    **外加四份说明**：交付给别人时，光有产物包不够——对方还要知道
+    「哪一行崩了、为什么、整批跑成什么样、审过没审过」。那四份文件
+    就是那部分。
+    """
     headers, _ = owner
     wid = wf_with_packages["wid"]
     r = client.get(f"/api/workflows/{wid}/packages", headers=headers)
@@ -172,11 +182,37 @@ def test_bulk_download_contains_one_zip_per_row(client, owner, wf_with_packages)
     assert "attachment" in r.headers.get("content-disposition", "")
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         names = sorted(zf.namelist())
-        assert names == ["第1行_KR0001.zip", "第2行_KR0002.zip"], names
+        assert names == sorted(DELIVERY_DOCS + ["第1行_KR0001.zip",
+                                                "第2行_KR0002.zip"]), names
         # 里面装的是**那一行自己的包**，不是空壳
         with zf.open("第1行_KR0001.zip") as inner:
             with zipfile.ZipFile(io.BytesIO(inner.read())) as izf:
                 assert izf.read("summary.txt").decode() == "第 1 行的结果"
+
+
+def test_delivery_package_carries_a_readme_index_and_ledger(client, owner,
+                                                            wf_with_packages):
+    """四份说明**都要有内容**，不能是空壳。"""
+    headers, _ = owner
+    wid = wf_with_packages["wid"]
+    r = client.get(f"/api/workflows/{wid}/packages", headers=headers)
+    assert r.status_code == 200, r.text
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        readme = zf.read("00-交付说明.md").decode("utf-8")
+        assert "交付说明" in readme
+        assert "里面有什么" in readme, "说明里要列出这个包里有什么"
+
+        index = zf.read("01-逐行索引.csv").decode("utf-8-sig")
+        assert index.startswith("行号,"), index[:80]
+        assert "第 1 行" in index or "1," in index, index[:200]
+
+        # 台账是真 xlsx：能打开、有表头
+        import io as _io
+        with zipfile.ZipFile(_io.BytesIO(zf.read("02-运行台账.xlsx"))) as inner:
+            assert "xl/workbook.xml" in inner.namelist(), inner.namelist()
+
+        concl = zf.read("03-机器审核结论.md").decode("utf-8")
+        assert "机器审核结论" in concl
 
 
 def test_bulk_download_404_when_there_is_no_package(client, owner, tmp_path):
@@ -225,7 +261,7 @@ def test_bulk_download_ignores_another_tasks_package(client, owner,
     assert r.status_code == 200, r.text
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         names = sorted(zf.namelist())
-    assert names == ["第1行_KR0001.zip"], names
+    assert [n for n in names if n.endswith(".zip")] == ["第1行_KR0001.zip"], names
 
 
 def test_bulk_download_is_owner_scoped(client, owner, wf_with_packages):
@@ -275,7 +311,8 @@ def test_entry_name_carries_the_slot_values(client, owner, tmp_path):
     assert r.status_code == 200, r.text
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         names = zf.namelist()
-    assert len(names) == 1, names
-    assert "Cystatin C" in names[0], names
-    assert "Human" in names[0], names
-    assert names[0].startswith("第1行_"), names
+    zips = [n for n in names if n.endswith(".zip")]
+    assert len(zips) == 1, names
+    assert "Cystatin C" in zips[0], names
+    assert "Human" in zips[0], names
+    assert zips[0].startswith("第1行_"), names

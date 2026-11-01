@@ -419,8 +419,12 @@ function renderLiveDetail(d) {
   const pk = $("#wf-packages");
   pk.hidden = !d.packages_count;
   pk.textContent = d.packages_count
-    ? `下载全部产物包（${d.packages_count} 个 · ${fmtBytes(d.packages_bytes)}）`
-    : "下载全部产物包";
+    ? `下载交付包（${d.packages_count} 个产物包 · ${fmtBytes(d.packages_bytes)}）`
+    : "下载交付包";
+  // 台账**总是能导**：崩在计算阶段的行没有产物包，但恰恰是最需要看台账的。
+  const lg = $("#wf-ledger");
+  lg.hidden = false;
+  lg.href = `/api/workflows/${wf.id}/ledger.xlsx`;
 
   // 批量重跑/续跑：**没有对应的行就不给入口**（点了必然是 422）。
   // 行数是服务端算的——前端自己数会漏掉「用户跳过的行不算崩溃行」这条。
@@ -1051,7 +1055,31 @@ $("#wf-download").addEventListener("click", (e) => {
 
 $("#wf-packages").addEventListener("click", (e) => {
   e.preventDefault();
-  guard("下载全部产物包", downloadPackages);
+  guard("下载交付包", downloadPackages);
+});
+
+/** 下载运行台账。**走 fetch + blob**：令牌在 localStorage 里，
+ *  <a href> 的导航请求不会带 Authorization 头（web/app.js 同一口径），
+ *  点了只会拿到一个 401 的 JSON，页面还不报错——看着像「没反应」。 */
+async function downloadLedger() {
+  const r = await fetch(apiBase() + `/api/workflows/${wfId}/ledger.xlsx`,
+                        { headers: authHeaders() });
+  if (!r.ok) throw await errFrom(r);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "运行台账.xlsx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 20000);
+  say("已下载运行台账");
+}
+
+$("#wf-ledger").addEventListener("click", (e) => {
+  e.preventDefault();
+  guard("下载运行台账", downloadLedger);
 });
 
 $("#wf-task-toggle").addEventListener("click", (e) => {
@@ -1204,7 +1232,7 @@ function armBulk(kind) {
   } else {
     msg = "将续跑 " + rows.length + " 行（" + bulkRowsLabel(rows) + "）："
       + "每一行会带上它自己的审核理由"
-      + (note ? "和你写的补充要求" : "") + " 再跑一遍，上一轮的产物保留。"
+      + (note ? "和你写的补充要求" : "") + "，再跑一遍；上一轮的产物保留。"
       + "5 秒内再点一次确认。";
   }
   say(msg);
